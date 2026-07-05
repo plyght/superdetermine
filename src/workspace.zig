@@ -3,9 +3,10 @@ const oid = @import("oid.zig");
 const object = @import("object.zig");
 const Store = @import("store.zig").Store;
 const ignore = @import("ignore.zig");
+const idx = @import("index.zig");
 const Oid = oid.Oid;
 
-fn scan(store: *Store, work_dir: std.Io.Dir) ![]object.TreeEntry {
+fn scan(store: *Store, work_dir: std.Io.Dir, cache: ?*const idx.Index, fresh: ?*idx.Index) ![]object.TreeEntry {
     const io = store.io;
     const alloc = store.alloc;
 
@@ -28,17 +29,26 @@ fn scan(store: *Store, work_dir: std.Io.Dir) ![]object.TreeEntry {
             },
             .file => {
                 if (ignores.isIgnored(entry.path, false)) continue;
-                const data = try work_dir.readFileAlloc(io, entry.path, alloc, .unlimited);
-                defer alloc.free(data);
-                const blob = try store.writeFileContent(data);
                 const st = work_dir.statFile(io, entry.path, .{}) catch null;
+                var blob: ?Oid = null;
+                if (cache) |c| if (st) |s| {
+                    if (c.lookup(entry.path, s)) |cached| {
+                        if (store.has(cached)) blob = cached;
+                    }
+                };
+                if (blob == null) {
+                    const data = try work_dir.readFileAlloc(io, entry.path, alloc, .unlimited);
+                    defer alloc.free(data);
+                    blob = try store.writeFileContent(data);
+                }
+                if (fresh) |f| if (st) |s| try f.put(entry.path, s, blob.?);
                 const exec = if (st) |s| (s.permissions.toMode() & 0o111) != 0 else false;
                 const path = try alloc.dupe(u8, entry.path);
                 errdefer alloc.free(path);
                 try entries.append(alloc, .{
                     .mode = if (exec) .executable else .regular,
                     .path = path,
-                    .blob = blob,
+                    .blob = blob.?,
                 });
             },
             .sym_link => {
@@ -71,8 +81,14 @@ fn freeEntries(alloc: std.mem.Allocator, entries: []object.TreeEntry) void {
 pub fn snapshot(store: *Store, work_dir: std.Io.Dir, author: []const u8, message: []const u8, timestamp: i64) !Oid {
     const alloc = store.alloc;
 
-    const entries = try scan(store, work_dir);
+    var cache = try idx.Index.load(store, alloc);
+    defer cache.deinit();
+    var fresh = idx.Index.empty(alloc);
+    defer fresh.deinit();
+
+    const entries = try scan(store, work_dir, &cache, &fresh);
     defer freeEntries(alloc, entries);
+    fresh.save(store) catch {};
 
     const tree_oid = try store.writeTree(.{ .entries = entries });
 
@@ -116,8 +132,14 @@ pub const StatusEntry = struct {
 };
 
 pub fn status(store: *Store, work_dir: std.Io.Dir, alloc: std.mem.Allocator) ![]StatusEntry {
-    const work_entries = try scan(store, work_dir);
+    var cache = try idx.Index.load(store, store.alloc);
+    defer cache.deinit();
+    var fresh = idx.Index.empty(store.alloc);
+    defer fresh.deinit();
+
+    const work_entries = try scan(store, work_dir, &cache, &fresh);
     defer freeEntries(store.alloc, work_entries);
+    fresh.save(store) catch {};
 
     var head_map = std.StringHashMap(Oid).init(alloc);
     defer head_map.deinit();

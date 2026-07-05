@@ -17,6 +17,10 @@ const provenance = @import("provenance.zig");
 const attribution = @import("attribution.zig");
 const agentscan = @import("agentscan.zig");
 const update = @import("update.zig");
+const gc = @import("gc.zig");
+const blame = @import("blame.zig");
+const completions = @import("completions.zig");
+const absorb = @import("absorb.zig");
 
 const Oid = oid.Oid;
 const Store = store.Store;
@@ -43,6 +47,10 @@ const usage =
     \\
     \\  restore <file>  discard local edits to one file (from last save)
     \\  merge <branch>  merge another branch into the current one
+    \\  resolve <file>  mark a conflicted file resolved (--abort to bail out)
+    \\  revert [change] undo a change as a new change (default: the last one)
+    \\  absorb          fold working edits into the changes they belong to
+    \\  blame <file>    per-line authorship, incl. agent/prompt provenance
     \\  provenance      show which agent/prompt produced each change (opt-in)
     \\  why <file>      who last authored a file — human or which agent
     \\
@@ -63,9 +71,13 @@ const usage =
     \\  push [remote] [branch] | pull [remote]   (remote defaults to origin)
     \\
     \\  init            create a guardrail repo here
+    \\  gc [--dry-run]  reclaim space from unreachable objects
     \\  config [--global] <key> [value]   get/set config (identity, defaults)
+    \\  completions <fish|zsh|bash>       print shell completion script
     \\  update [--nightly]   update gr to the latest release (or nightly build)
     \\  version | help
+    \\
+    \\  (status and log accept --json for scripting)
     \\
 ;
 
@@ -112,11 +124,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (eq(cmd, "describe") or eq(cmd, "desc")) {
         try cmdDescribe(io, alloc, w, rest);
     } else if (eq(cmd, "status") or eq(cmd, "st")) {
-        try cmdStatus(io, alloc, w);
+        try cmdStatus(io, alloc, w, rest);
     } else if (eq(cmd, "diff")) {
         try cmdDiff(io, alloc, w);
     } else if (eq(cmd, "log")) {
-        try cmdLog(io, alloc, w);
+        try cmdLog(io, alloc, w, rest);
     } else if (eq(cmd, "branch") or eq(cmd, "branches")) {
         try cmdBranch(io, alloc, w);
     } else if (eq(cmd, "new")) {
@@ -157,6 +169,18 @@ pub fn main(init: std.process.Init) !void {
         try cmdWhy(io, alloc, w, rest);
     } else if (eq(cmd, "provenance")) {
         try cmdProvenance(io, alloc, w);
+    } else if (eq(cmd, "blame")) {
+        try cmdBlame(io, alloc, w, rest);
+    } else if (eq(cmd, "resolve")) {
+        try cmdResolve(io, alloc, w, rest);
+    } else if (eq(cmd, "revert")) {
+        try cmdRevert(io, alloc, w, rest);
+    } else if (eq(cmd, "absorb")) {
+        try cmdAbsorb(io, alloc, w);
+    } else if (eq(cmd, "gc")) {
+        try cmdGc(io, alloc, w, rest);
+    } else if (eq(cmd, "completions")) {
+        try cmdCompletions(w, rest);
     } else {
         try w.print("unknown command: {s}\n\n", .{cmd});
         try w.writeAll(usage);
@@ -258,6 +282,163 @@ fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void 
         if (r.entry.agent.len != 0) try w.print("  [{s}]", .{r.entry.agent});
         try w.print("\n    {s}\n", .{r.entry.prompt});
     }
+}
+
+fn cmdBlame(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: gr blame <file>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    try blame.run(&s, alloc, w, rest[0]);
+}
+
+fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    if (hasFlag(rest, "--abort")) {
+        merge.abort(&s, alloc, work) catch |e| switch (e) {
+            error.NoMergeInProgress => {
+                try w.writeAll("no merge in progress\n");
+                return;
+            },
+            else => return e,
+        };
+        try w.writeAll("merge aborted — working tree restored\n");
+        return;
+    }
+    if (rest.len < 1) {
+        const rem = try merge.remainingConflicts(&s, alloc);
+        defer {
+            for (rem) |p| alloc.free(p);
+            alloc.free(rem);
+        }
+        if (rem.len == 0) {
+            try w.writeAll("no merge in progress\n");
+            return;
+        }
+        try w.writeAll("usage: gr resolve <file>   (or --abort)\nunresolved:\n");
+        for (rem) |p| try w.print("  ! {s}\n", .{p});
+        return;
+    }
+    merge.markResolved(&s, alloc, work, rest[0]) catch |e| switch (e) {
+        error.StillConflicted => {
+            try w.print("{s} still has conflict markers — fix them first\n", .{rest[0]});
+            return;
+        },
+        error.NoMergeInProgress => {
+            try w.writeAll("no merge in progress\n");
+            return;
+        },
+        else => return e,
+    };
+    const rem = try merge.remainingConflicts(&s, alloc);
+    defer {
+        for (rem) |p| alloc.free(p);
+        alloc.free(rem);
+    }
+    if (rem.len == 0) {
+        try w.print("resolved {s} — all conflicts cleared, now `gr save`\n", .{rest[0]});
+    } else {
+        try w.print("resolved {s} — {d} conflict(s) left\n", .{ rest[0], rem.len });
+    }
+}
+
+fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const tip = s.readRef(branch) catch {
+        try w.writeAll("nothing to revert — no changes yet\n");
+        return;
+    };
+    const head_change = try s.readChange(tip);
+    defer object.freeChange(alloc, head_change);
+
+    // Target tree: an explicit change hex, else the parent of HEAD (undo last).
+    var target_tree: Oid = undefined;
+    var target_desc: []const u8 = "";
+    if (rest.len >= 1 and !std.mem.startsWith(u8, rest[0], "-")) {
+        const target_oid = Oid.fromHex(rest[0]) catch {
+            try w.print("not a change id: {s}\n", .{rest[0]});
+            return;
+        };
+        const tc = s.readChange(target_oid) catch {
+            try w.print("no such change: {s}\n", .{rest[0]});
+            return;
+        };
+        defer object.freeChange(alloc, tc);
+        target_tree = tc.tree;
+        target_desc = rest[0];
+    } else if (head_change.parents.len != 0) {
+        const parent = try s.readChange(head_change.parents[0]);
+        defer object.freeChange(alloc, parent);
+        target_tree = parent.tree;
+    } else {
+        try w.writeAll("nothing before the first change to revert to\n");
+        return;
+    }
+
+    var work = try openWork(io);
+    defer work.close(io);
+
+    // Clean-checkout the target tree: drop currently-tracked files that the
+    // target does not have, then materialize the target's files.
+    const cur_tree = try s.readTree(head_change.tree);
+    defer object.freeTree(alloc, cur_tree);
+    const tgt = try s.readTree(target_tree);
+    defer object.freeTree(alloc, tgt);
+    var keep = std.StringHashMap(void).init(alloc);
+    defer keep.deinit();
+    for (tgt.entries) |e| try keep.put(e.path, {});
+    for (cur_tree.entries) |e| {
+        if (!keep.contains(e.path)) work.deleteFile(io, e.path) catch {};
+    }
+    try workspace.materialize(&s, target_tree, work);
+
+    const author = try config.author(&s, alloc);
+    defer alloc.free(author);
+    var msg_buf: [96]u8 = undefined;
+    const msg = if (target_desc.len != 0)
+        std.fmt.bufPrint(&msg_buf, "revert to {s}", .{target_desc}) catch "revert"
+    else
+        "revert last change";
+    const prev = s.readRef(branch) catch Oid.zero();
+    const change = try workspace.snapshot(&s, work, author, msg, nowSeconds(io));
+    oplog.record(&s, .{ .kind = .other, .branch = branch, .prev = prev, .new = change, .timestamp = nowSeconds(io) }) catch {};
+    var buf: [Oid.len * 2]u8 = undefined;
+    try w.print("reverted — new change {s}\n", .{shortHex(change, &buf)});
+}
+
+fn cmdAbsorb(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+    try absorb.run(&s, alloc, work, w);
+}
+
+fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const dry_run = hasFlag(rest, "--dry-run") or hasFlag(rest, "-n");
+    try gc.run(&s, alloc, w, dry_run);
+}
+
+fn cmdCompletions(w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: gr completions <fish|zsh|bash>\n");
+        return;
+    }
+    completions.run(rest[0], w) catch |e| switch (e) {
+        error.UnknownShell => {},
+        else => return e,
+    };
 }
 
 fn cmdWhy(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -402,7 +583,26 @@ fn cmdDescribe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []
     try w.print("described {s}\n", .{shortHex(new_oid, &buf)});
 }
 
-fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+fn hasFlag(rest: []const []const u8, name: []const u8) bool {
+    for (rest) |a| if (eq(a, name)) return true;
+    return false;
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
+    };
+    try w.writeByte('"');
+}
+
+fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const json = hasFlag(rest, "--json");
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     var work = try openWork(io);
@@ -412,8 +612,41 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         for (entries) |e| alloc.free(e.path);
         alloc.free(entries);
     }
+    const conflicts = try merge.remainingConflicts(&s, alloc);
+    defer {
+        for (conflicts) |p| alloc.free(p);
+        alloc.free(conflicts);
+    }
+
+    if (json) {
+        try w.writeAll("{\"changes\":[");
+        for (entries, 0..) |e, i| {
+            if (i != 0) try w.writeByte(',');
+            const kind = switch (e.kind) {
+                .added => "added",
+                .modified => "modified",
+                .deleted => "deleted",
+            };
+            try w.print("{{\"kind\":\"{s}\",\"path\":", .{kind});
+            try writeJsonString(w, e.path);
+            try w.writeByte('}');
+        }
+        try w.writeAll("],\"conflicts\":[");
+        for (conflicts, 0..) |p, i| {
+            if (i != 0) try w.writeByte(',');
+            try writeJsonString(w, p);
+        }
+        try w.writeAll("]}\n");
+        return;
+    }
+
+    if (conflicts.len != 0) {
+        try w.print("merge in progress — {d} unresolved conflict(s):\n", .{conflicts.len});
+        for (conflicts) |p| try w.print("  ! {s}\n", .{p});
+        try w.writeAll("fix the markers then `gr resolve <file>`, or `gr resolve --abort`\n");
+    }
     if (entries.len == 0) {
-        try w.writeAll("clean — nothing to save\n");
+        if (conflicts.len == 0) try w.writeAll("clean — nothing to save\n");
         return;
     }
     for (entries) |e| {
@@ -490,29 +723,52 @@ fn isBinary(data: []const u8) bool {
     return std.mem.indexOfScalar(u8, data[0..n], 0) != null;
 }
 
-fn cmdLog(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+fn cmdLog(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const json = hasFlag(rest, "--json");
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     const branch = try s.headBranch();
     defer alloc.free(branch);
     var cur: Oid = s.readRef(branch) catch {
-        try w.writeAll("no changes yet\n");
+        if (json) try w.writeAll("[]\n") else try w.writeAll("no changes yet\n");
         return;
     };
+    if (json) try w.writeByte('[');
+    var first = true;
     while (!cur.isZero()) {
         const change = try s.readChange(cur);
         defer object.freeChange(alloc, change);
         var buf: [Oid.len * 2]u8 = undefined;
-        const msg = if (change.message.len == 0) "(no message)" else change.message;
-        try w.print("{s}  {s}\n    {s}\n", .{ shortHex(cur, &buf), change.author, msg });
-        if (try provenance.get(&s, alloc, cur)) |p| {
-            defer provenance.freeEntry(alloc, p);
-            if (p.agent.len != 0) try w.print("    ↳ agent: {s}\n", .{p.agent});
-            if (p.prompt.len != 0) try w.print("    ↳ prompt: {s}\n", .{p.prompt});
+        var hex: [Oid.len * 2]u8 = undefined;
+        _ = cur.toHex(&hex);
+        if (json) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("{{\"id\":\"{s}\",\"author\":", .{hex});
+            try writeJsonString(w, change.author);
+            try w.print(",\"timestamp\":{d},\"message\":", .{change.timestamp});
+            try writeJsonString(w, change.message);
+            if (try provenance.get(&s, alloc, cur)) |p| {
+                defer provenance.freeEntry(alloc, p);
+                try w.writeAll(",\"agent\":");
+                try writeJsonString(w, p.agent);
+                try w.writeAll(",\"prompt\":");
+                try writeJsonString(w, p.prompt);
+            }
+            try w.writeByte('}');
+        } else {
+            const msg = if (change.message.len == 0) "(no message)" else change.message;
+            try w.print("{s}  {s}\n    {s}\n", .{ shortHex(cur, &buf), change.author, msg });
+            if (try provenance.get(&s, alloc, cur)) |p| {
+                defer provenance.freeEntry(alloc, p);
+                if (p.agent.len != 0) try w.print("    ↳ agent: {s}\n", .{p.agent});
+                if (p.prompt.len != 0) try w.print("    ↳ prompt: {s}\n", .{p.prompt});
+            }
         }
         if (change.parents.len == 0) break;
         cur = change.parents[0];
     }
+    if (json) try w.writeAll("]\n");
 }
 
 fn cmdBranch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -657,9 +913,10 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     if (result.conflicts.len == 0) {
         try w.print("merged {s} into {s} — clean\n", .{ rest[0], into });
     } else {
+        merge.saveState(&s, rest[0], before, result.conflicts) catch {};
         try w.print("merged {s} into {s} with {d} conflict(s):\n", .{ rest[0], into, result.conflicts.len });
         for (result.conflicts) |p| try w.print("  ! {s}\n", .{p});
-        try w.writeAll("resolve the marked files, then `gr save`\n");
+        try w.writeAll("fix the markers, then `gr resolve <file>` each — or `gr resolve --abort`\n");
     }
 }
 
@@ -937,4 +1194,9 @@ test {
     _ = attribution;
     _ = agentscan;
     _ = update;
+    _ = gc;
+    _ = blame;
+    _ = completions;
+    _ = absorb;
+    _ = @import("index.zig");
 }

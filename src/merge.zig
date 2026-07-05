@@ -368,6 +368,131 @@ pub fn merge(store: *Store, alloc: std.mem.Allocator, into_branch: []const u8, f
     return result;
 }
 
+const workspace = @import("workspace.zig");
+
+const merge_state_path = "MERGE_STATE";
+
+pub const MergeState = struct {
+    from_branch: []u8,
+    pre_merge: Oid,
+    conflicts: [][]u8,
+};
+
+pub fn saveState(store: *Store, from_branch: []const u8, pre_merge: Oid, conflicts: []const []const u8) !void {
+    const alloc = store.alloc;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buf.appendSlice(alloc, from_branch);
+    try buf.append(alloc, '\n');
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = pre_merge.toHex(&hex);
+    try buf.appendSlice(alloc, &hex);
+    try buf.append(alloc, '\n');
+    for (conflicts) |c| {
+        try buf.appendSlice(alloc, c);
+        try buf.append(alloc, '\n');
+    }
+    try store.root.writeFile(store.io, .{ .sub_path = merge_state_path, .data = buf.items });
+}
+
+pub fn loadState(store: *Store, alloc: std.mem.Allocator) !?MergeState {
+    const data = store.root.readFileAlloc(store.io, merge_state_path, alloc, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    const from_line = lines.next() orelse return error.InvalidMergeState;
+    const oid_line = lines.next() orelse return error.InvalidMergeState;
+
+    const from_branch = try alloc.dupe(u8, from_line);
+    errdefer alloc.free(from_branch);
+    const pre_merge = Oid.fromHex(oid_line) catch return error.InvalidMergeState;
+
+    var conflicts: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (conflicts.items) |p| alloc.free(p);
+        conflicts.deinit(alloc);
+    }
+    while (lines.next()) |l| {
+        if (l.len == 0) continue;
+        try conflicts.append(alloc, try alloc.dupe(u8, l));
+    }
+
+    return .{
+        .from_branch = from_branch,
+        .pre_merge = pre_merge,
+        .conflicts = try conflicts.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeState(alloc: std.mem.Allocator, s: MergeState) void {
+    alloc.free(s.from_branch);
+    for (s.conflicts) |p| alloc.free(p);
+    alloc.free(s.conflicts);
+}
+
+pub fn clearState(store: *Store) !void {
+    store.root.deleteFile(store.io, merge_state_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+pub fn hasConflictMarkers(data: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, "<<<<<<<")) return true;
+        if (std.mem.startsWith(u8, l, ">>>>>>>")) return true;
+        if (std.mem.startsWith(u8, l, "=======")) return true;
+    }
+    return false;
+}
+
+pub fn markResolved(store: *Store, alloc: std.mem.Allocator, work_dir: std.Io.Dir, path: []const u8) !void {
+    const data = try work_dir.readFileAlloc(store.io, path, alloc, .unlimited);
+    defer alloc.free(data);
+    if (hasConflictMarkers(data)) return error.StillConflicted;
+
+    const state = (try loadState(store, alloc)) orelse return error.NoMergeInProgress;
+    defer freeState(alloc, state);
+
+    var kept: std.ArrayList([]const u8) = .empty;
+    defer kept.deinit(alloc);
+    for (state.conflicts) |c| {
+        if (!std.mem.eql(u8, c, path)) try kept.append(alloc, c);
+    }
+
+    if (kept.items.len == 0) {
+        try clearState(store);
+    } else {
+        try saveState(store, state.from_branch, state.pre_merge, kept.items);
+    }
+}
+
+pub fn remainingConflicts(store: *Store, alloc: std.mem.Allocator) ![][]u8 {
+    const state = (try loadState(store, alloc)) orelse return alloc.alloc([]u8, 0);
+    alloc.free(state.from_branch);
+    return state.conflicts;
+}
+
+pub fn abort(store: *Store, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !void {
+    const state = (try loadState(store, alloc)) orelse return error.NoMergeInProgress;
+    defer freeState(alloc, state);
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+
+    try store.updateRef(branch, state.pre_merge);
+
+    const change = try store.readChange(state.pre_merge);
+    defer object.freeChange(alloc, change);
+    try workspace.materialize(store, change.tree, work_dir);
+
+    try clearState(store);
+}
+
 // --- tests ---
 
 const testing = std.testing;
@@ -473,4 +598,108 @@ test "conflicting merge produces markers" {
     try testing.expect(std.mem.indexOf(u8, merged_data, ">>>>>>> theirs") != null);
     try testing.expect(std.mem.indexOf(u8, merged_data, "X") != null);
     try testing.expect(std.mem.indexOf(u8, merged_data, "Y") != null);
+}
+
+test "hasConflictMarkers detects markers" {
+    try testing.expect(hasConflictMarkers("a\n<<<<<<< ours\nb\n"));
+    try testing.expect(hasConflictMarkers("a\n=======\nb\n"));
+    try testing.expect(hasConflictMarkers("a\n>>>>>>> theirs\n"));
+    try testing.expect(!hasConflictMarkers("a\nb\nc\n"));
+}
+
+test "merge state roundtrip" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try testing.expect((try loadState(&store, alloc)) == null);
+
+    const pre = Oid.ofBytes("pre-merge tip");
+    const paths = [_][]const u8{ "a.txt", "sub/b.txt" };
+    try saveState(&store, "feature", pre, &paths);
+
+    const state = (try loadState(&store, alloc)).?;
+    defer freeState(alloc, state);
+    try testing.expectEqualStrings("feature", state.from_branch);
+    try testing.expect(state.pre_merge.eql(pre));
+    try testing.expectEqual(@as(usize, 2), state.conflicts.len);
+    try testing.expectEqualStrings("a.txt", state.conflicts[0]);
+    try testing.expectEqualStrings("sub/b.txt", state.conflicts[1]);
+
+    try clearState(&store);
+    try testing.expect((try loadState(&store, alloc)) == null);
+}
+
+test "markResolved removes clean path and clears when empty" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const pre = Oid.ofBytes("tip");
+    const paths = [_][]const u8{ "a.txt", "b.txt" };
+    try saveState(&store, "feature", pre, &paths);
+
+    try work.writeFile(io, .{ .sub_path = "a.txt", .data = "<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n" });
+    try testing.expectError(error.StillConflicted, markResolved(&store, alloc, work, "a.txt"));
+
+    try work.writeFile(io, .{ .sub_path = "a.txt", .data = "resolved\n" });
+    try markResolved(&store, alloc, work, "a.txt");
+
+    {
+        const rem = try remainingConflicts(&store, alloc);
+        defer {
+            for (rem) |p| alloc.free(p);
+            alloc.free(rem);
+        }
+        try testing.expectEqual(@as(usize, 1), rem.len);
+        try testing.expectEqualStrings("b.txt", rem[0]);
+    }
+
+    try work.writeFile(io, .{ .sub_path = "b.txt", .data = "resolved\n" });
+    try markResolved(&store, alloc, work, "b.txt");
+    try testing.expect((try loadState(&store, alloc)) == null);
+}
+
+test "abort restores working tree and branch to pre-merge" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try tmp.dir.createDirPath(io, "work");
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/f", .data = "original\n" });
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const pre = try workspace.snapshot(&store, work, "T <t@e.com>", "base", 1_700_000_000);
+
+    try work.writeFile(io, .{ .sub_path = "f", .data = "<<<<<<< ours\nmess\n>>>>>>> theirs\n" });
+    const bogus = Oid.ofBytes("bogus merge tip");
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    try store.updateRef(branch, bogus);
+
+    const paths = [_][]const u8{"f"};
+    try saveState(&store, "feature", pre, &paths);
+
+    try abort(&store, alloc, work);
+
+    const restored = try work.readFileAlloc(io, "f", alloc, .unlimited);
+    defer alloc.free(restored);
+    try testing.expectEqualStrings("original\n", restored);
+    try testing.expect((try store.readRef(branch)).eql(pre));
+    try testing.expect((try loadState(&store, alloc)) == null);
+    try testing.expectError(error.NoMergeInProgress, abort(&store, alloc, work));
 }

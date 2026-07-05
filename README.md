@@ -14,8 +14,13 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Working copy is always a change | No staging, no stash. Edit, then `gr save`. |
 | Operation log | `gr undo` and `gr redo` across the whole repo. Nothing gets lost. |
 | Instant copy-on-write worktrees | `gr work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). |
-| Three-way merge | Branch merges with conflict markers. Non-overlapping edits merge cleanly. |
+| Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
+| Three-way merge + resolve | Conflict markers, then `gr resolve <file>` / `gr resolve --abort`. |
+| Absorb | `gr absorb` folds working edits into the changes they belong to. |
+| Garbage collection | `gr gc` reclaims space from unreachable objects (`--dry-run` to preview). |
 | Prompt provenance (opt-in) | Record which agent or prompt produced a change, stored in the repo. |
+| Per-line blame | `gr blame <file>` shows per-line authorship, including agent/prompt. |
+| Scriptable output | `gr status --json` and `gr log --json`; `gr completions <fish\|zsh\|bash>`. |
 | Bidirectional git interop | Import and export full history, branches, and tags. Push and pull to GitHub. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
 
@@ -38,6 +43,9 @@ gr status | gr diff | gr log
 gr new feature            # branch and switch
 gr work ../agent-copy     # instant worktree
 gr undo   /   gr redo
+gr blame file.txt         # per-line authorship + provenance
+gr absorb                 # fold edits into the changes they belong to
+gr gc                     # reclaim unreachable objects
 ```
 
 Working with git:
