@@ -22,6 +22,7 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Per-line blame | `gr blame <file>` shows per-line authorship, including agent/prompt. |
 | Scriptable output | `gr status --json` and `gr log --json`; `gr completions <fish\|zsh\|bash>`. |
 | Bidirectional git interop | Import and export full history, branches, and tags. Push and pull to GitHub. |
+| Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
 
 ## Git, side by side
@@ -55,6 +56,17 @@ gr clone <git-url> <dir>
 gr import <git-repo>   /   gr export <git-repo>
 gr push [remote] [branch]     # uses your existing git credentials
 ```
+
+Large files (Git LFS):
+
+```
+gr lfs track "*.psd"      # matching files export to git as LFS pointers
+gr lfs ls | gr lfs status # what is tracked, and what is cached locally
+gr lfs fetch | gr lfs push
+gr lfs env                # endpoint, cache location, settings
+```
+
+On import, gr resolves LFS pointers to the real bytes (from `.git/lfs/objects`, else the LFS batch API) and stores them chunked in its own object database, so `gr diff`, `gr blame` and `gr work` all see real files. On export and push it writes the pointers back and uploads any objects the remote is missing. Set `gr config lfs.smudge false` to keep pointers verbatim instead, `lfs.url` to override the endpoint, and `lfs.upload false` to skip uploads.
 
 ## Install
 

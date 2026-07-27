@@ -61,6 +61,7 @@ const fish_script =
     \\complete -c gr -n __fish_use_subcommand -a init -d 'create a guardrail repo here'
     \\complete -c gr -n __fish_use_subcommand -a config -d 'get/set config'
     \\complete -c gr -n __fish_use_subcommand -a update -d 'update gr to the latest release'
+    \\complete -c gr -n __fish_use_subcommand -a lfs -d 'git-lfs interop (track, ls, fetch, push, env)'
     \\complete -c gr -n __fish_use_subcommand -a gc -d 'garbage-collect unreachable objects'
     \\complete -c gr -n __fish_use_subcommand -a blame -d 'per-line authorship of a file'
     \\complete -c gr -n __fish_use_subcommand -a resolve -d 'resolve merge conflicts'
@@ -110,6 +111,7 @@ const zsh_script =
     \\    'init:create a guardrail repo here'
     \\    'config:get/set config'
     \\    'update:update gr to the latest release'
+    \\    'lfs:git-lfs interop (track, ls, fetch, push, env)'
     \\    'gc:garbage-collect unreachable objects'
     \\    'blame:per-line authorship of a file'
     \\    'resolve:resolve merge conflicts'
@@ -134,7 +136,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve completions version help"
+    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve lfs completions version help"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0

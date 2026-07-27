@@ -1,6 +1,8 @@
 const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
+const proc = @import("proc.zig");
+const lfs = @import("lfs.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -9,6 +11,11 @@ const c = @cImport({
 });
 
 pub const Error = error{GitError};
+
+/// Set by the last import/push so the CLI can report LFS work without having to
+/// re-open a session: pointers that stayed pointers, and objects uploaded.
+pub var lfs_unresolved: usize = 0;
+pub var lfs_uploaded: usize = 0;
 
 var init_done: bool = false;
 
@@ -33,24 +40,10 @@ const CredState = struct {
 var g_cred: CredState = .{};
 
 fn envToken() ?[*:0]const u8 {
-    if (std.c.getenv("GIT_TOKEN")) |v| return v;
-    if (std.c.getenv("GITHUB_TOKEN")) |v| return v;
-    return null;
+    return proc.envToken();
 }
 
-extern "c" fn fork() std.c.pid_t;
-extern "c" fn close(fd: std.c.fd_t) c_int;
-extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
-
-const Cred = struct {
-    user: [:0]u8,
-    pass: [:0]u8,
-
-    fn free(self: Cred) void {
-        std.heap.c_allocator.free(self.user);
-        std.heap.c_allocator.free(self.pass);
-    }
-};
+const Cred = proc.Cred;
 
 var g_helper: ?Cred = null;
 var g_helper_tried: bool = false;
@@ -59,104 +52,6 @@ fn resetCredCache() void {
     if (g_helper) |hc| hc.free();
     g_helper = null;
     g_helper_tried = false;
-}
-
-/// Parse `git credential fill` stdout (lines like `username=..`, `password=..`,
-/// blank-line terminated) into user/pass spans of `data`. Returns null unless
-/// BOTH username and password are present.
-fn parseCredentialOutput(data: []const u8) ?struct { user: []const u8, pass: []const u8 } {
-    var user: ?[]const u8 = null;
-    var pass: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        const val = line[eq + 1 ..];
-        if (std.mem.eql(u8, key, "username")) {
-            user = val;
-        } else if (std.mem.eql(u8, key, "password")) {
-            pass = val;
-        }
-    }
-    if (user == null or pass == null) return null;
-    return .{ .user = user.?, .pass = pass.? };
-}
-
-/// Query git's configured credential helper (e.g. osxkeychain) by running
-/// `git credential fill`, feeding `url=<url>\n\n` on stdin and parsing the
-/// answer from stdout. Uses a real pipe/fork/exec (no shell) so the external
-/// url cannot be interpreted by a shell. Returns heap-allocated null-terminated
-/// user/pass on success.
-fn credentialFromHelper(url: []const u8) ?Cred {
-    const a = std.heap.c_allocator;
-
-    var in_pipe: [2]std.c.fd_t = undefined;
-    var out_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&in_pipe) != 0) return null;
-    if (std.c.pipe(&out_pipe) != 0) {
-        _ = close(in_pipe[0]);
-        _ = close(in_pipe[1]);
-        return null;
-    }
-
-    const pid = fork();
-    if (pid < 0) {
-        _ = close(in_pipe[0]);
-        _ = close(in_pipe[1]);
-        _ = close(out_pipe[0]);
-        _ = close(out_pipe[1]);
-        return null;
-    }
-    if (pid == 0) {
-        _ = std.c.dup2(in_pipe[0], 0);
-        _ = std.c.dup2(out_pipe[1], 1);
-        _ = close(in_pipe[0]);
-        _ = close(in_pipe[1]);
-        _ = close(out_pipe[0]);
-        _ = close(out_pipe[1]);
-        const argv = [_:null]?[*:0]const u8{ "git", "credential", "fill" };
-        _ = execvp("git", &argv);
-        std.c._exit(127);
-    }
-
-    _ = close(in_pipe[0]);
-    _ = close(out_pipe[1]);
-
-    const req = std.fmt.allocPrint(a, "url={s}\n\n", .{url}) catch {
-        _ = close(in_pipe[1]);
-        _ = close(out_pipe[0]);
-        _ = std.c.waitpid(pid, null, 0);
-        return null;
-    };
-    defer a.free(req);
-    var written: usize = 0;
-    while (written < req.len) {
-        const n = std.c.write(in_pipe[1], req.ptr + written, req.len - written);
-        if (n <= 0) break;
-        written += @intCast(n);
-    }
-    _ = close(in_pipe[1]);
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    var tmp: [4096]u8 = undefined;
-    while (true) {
-        const n = std.c.read(out_pipe[0], &tmp, tmp.len);
-        if (n <= 0) break;
-        buf.appendSlice(a, tmp[0..@intCast(n)]) catch break;
-    }
-    _ = close(out_pipe[0]);
-    _ = std.c.waitpid(pid, null, 0);
-
-    const parsed = parseCredentialOutput(buf.items) orelse return null;
-    const user = a.dupeZ(u8, parsed.user) catch return null;
-    const pass = a.dupeZ(u8, parsed.pass) catch {
-        a.free(user);
-        return null;
-    };
-    return .{ .user = user, .pass = pass };
 }
 
 fn credentialsCb(
@@ -174,7 +69,7 @@ fn credentialsCb(
         if (!g_helper_tried) {
             g_helper_tried = true;
             if (url != null) {
-                g_helper = credentialFromHelper(std.mem.span(url));
+                g_helper = proc.credentialFill(std.mem.span(url));
             }
         }
         if (g_helper) |hc| {
@@ -210,6 +105,53 @@ fn gitOidHex(o: *const c.git_oid) [40]u8 {
     var buf: [40]u8 = undefined;
     _ = c.git_oid_fmt(&buf, o);
     return buf;
+}
+
+/// Absolute path of a repo's git directory (`.git/`, or the repo itself when
+/// bare). That is where git-lfs keeps `lfs/objects`, so gr shares it. Caller
+/// frees.
+fn repoGitDir(alloc: std.mem.Allocator, repo: ?*c.git_repository) !?[]u8 {
+    const p = c.git_repository_path(repo);
+    if (p == null) return null;
+    return try alloc.dupe(u8, std.mem.span(p));
+}
+
+/// URL of a named remote, or of the first remote when `origin` is absent.
+/// Caller frees. null when the repo has no remotes.
+fn repoRemoteUrl(alloc: std.mem.Allocator, repo: ?*c.git_repository) !?[]u8 {
+    var remote: ?*c.git_remote = null;
+    if (c.git_remote_lookup(&remote, repo, "origin") == 0) {
+        defer c.git_remote_free(remote);
+        const u = c.git_remote_url(remote);
+        if (u != null) return try alloc.dupe(u8, std.mem.span(u));
+        return null;
+    }
+    var names: c.git_strarray = undefined;
+    if (c.git_remote_list(&names, repo) != 0) return null;
+    defer c.git_strarray_dispose(&names);
+    if (names.count == 0) return null;
+    if (c.git_remote_lookup(&remote, repo, names.strings[0]) != 0) return null;
+    defer c.git_remote_free(remote);
+    const u = c.git_remote_url(remote);
+    if (u == null) return null;
+    return try alloc.dupe(u8, std.mem.span(u));
+}
+
+/// Open an LFS session pointed at `repo`'s object cache, using `remote_url` (or
+/// the repo's own remote) for batch transfers. Never fails the caller: LFS is
+/// an add-on, so an unusable session simply means pointers pass through.
+fn lfsSessionFor(store: *Store, repo: ?*c.git_repository, remote_url: ?[]const u8) ?lfs.Session {
+    const alloc = store.alloc;
+    const git_dir = (repoGitDir(alloc, repo) catch null) orelse return null;
+    defer alloc.free(git_dir);
+    var owned_url: ?[]u8 = null;
+    defer if (owned_url) |u| alloc.free(u);
+    var url = remote_url;
+    if (url == null) {
+        owned_url = repoRemoteUrl(alloc, repo) catch null;
+        url = owned_url;
+    }
+    return lfs.Session.open(store, git_dir, url) catch null;
 }
 
 /// Persistent, bidirectional map between git commit ids (40-hex SHA-1) and
@@ -297,6 +239,7 @@ const WalkCtx = struct {
     repo: ?*c.git_repository,
     alloc: std.mem.Allocator,
     entries: *std.ArrayList(object.TreeEntry),
+    lfs_session: ?*lfs.Session = null,
 };
 
 fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
@@ -333,7 +276,22 @@ fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
                 &[_]u8{}
             else
                 @as([*]const u8, @ptrCast(raw))[0..size];
-            const blob_oid = try ctx.store.writeFileContent(bytes);
+
+            // Git LFS smudge: a pointer blob stands in for the real file, so
+            // resolve it back to content before gr chunks and stores it. When
+            // the content cannot be had (offline, or smudge is off) the pointer
+            // is stored verbatim, exactly as git would.
+            var smudged: ?[]u8 = null;
+            defer if (smudged) |s| ctx.alloc.free(s);
+            if (ctx.lfs_session) |sess| {
+                if (sess.smudge) {
+                    if (lfs.parsePointer(bytes)) |p| {
+                        smudged = sess.resolve(p) catch null;
+                    }
+                }
+            }
+            const content: []const u8 = smudged orelse bytes;
+            const blob_oid = try ctx.store.writeFileContent(content);
             try ctx.entries.append(ctx.alloc, .{ .mode = mode, .path = path, .blob = blob_oid });
         } else {
             // skip submodules / gitlinks / anything else
@@ -345,7 +303,7 @@ fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
 /// Import a single git commit (by id) into `store` as a guardrail change, reusing
 /// the gitmap if already imported. Parents must already be present in `map`
 /// (guaranteed by a topological, oldest-first walk). Returns the gr change Oid.
-fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *const c.git_oid) !Oid {
+fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *const c.git_oid, sess: ?*lfs.Session) !Oid {
     const git_hex = gitOidHex(cid);
     if (map.lookupGr(&git_hex)) |existing| return existing;
 
@@ -364,7 +322,7 @@ fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *con
         for (entries.items) |e| alloc.free(e.path);
         entries.deinit(alloc);
     }
-    var ctx = WalkCtx{ .store = store, .repo = repo, .alloc = alloc, .entries = &entries };
+    var ctx = WalkCtx{ .store = store, .repo = repo, .alloc = alloc, .entries = &entries, .lfs_session = sess };
     try walkTree(&ctx, tree, "");
     std.mem.sort(object.TreeEntry, entries.items, {}, object.Tree.lessThan);
     const tree_oid = try store.writeTree(.{ .entries = entries.items });
@@ -443,10 +401,17 @@ pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
     _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL | c.GIT_SORT_REVERSE);
     try check(c.git_revwalk_push(walk, &head_oid));
 
+    lfs_unresolved = 0;
+    var session = lfsSessionFor(store, repo, null);
+    defer if (session) |*s| {
+        lfs_unresolved = s.unresolved;
+        s.deinit();
+    };
+
     var tip: Oid = Oid.zero();
     var woid: c.git_oid = undefined;
     while (c.git_revwalk_next(&woid, walk) == 0) {
-        tip = try importCommit(store, repo, &map, &woid);
+        tip = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
     }
 
     try map.save(store);
@@ -520,10 +485,17 @@ pub fn importAll(store: *Store, git_repo_path: []const u8) !void {
         }
     }
 
+    lfs_unresolved = 0;
+    var session = lfsSessionFor(store, repo, null);
+    defer if (session) |*s| {
+        lfs_unresolved = s.unresolved;
+        s.deinit();
+    };
+
     // Import the whole reachable DAG oldest-first.
     var woid: c.git_oid = undefined;
     while (c.git_revwalk_next(&woid, walk) == 0) {
-        _ = try importCommit(store, repo, &map, &woid);
+        _ = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
     }
 
     // Create gr branch refs.
@@ -652,18 +624,40 @@ fn splitAuthor(author: []const u8) struct { name: []const u8, email: []const u8 
 
 /// Build a git tree object in `repo` from a guardrail flat Tree, returning the
 /// looked-up git tree (caller frees). Reuses the nested ExportNode builder.
-fn buildGitTree(store: *Store, repo: ?*c.git_repository, tree: object.Tree) !?*c.git_tree {
+fn buildGitTree(store: *Store, repo: ?*c.git_repository, tree: object.Tree, sess: ?*lfs.Session) !?*c.git_tree {
     const alloc = store.alloc;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const aa = arena.allocator();
     const root = try ExportNode.newDir(aa);
 
+    // `.gitattributes` travels in the tree itself, so each exported change gets
+    // the LFS rules that were in force at that point in history.
+    var attrs = try lfs.attributesFromTree(store, tree);
+    defer attrs.deinit();
+
     for (tree.entries) |e| {
         const content = try store.readFileContent(e.blob);
         defer alloc.free(content);
+
+        // Git LFS clean: a tracked path is committed to git as a pointer, with
+        // the real bytes landing in the destination repo's LFS cache (and queued
+        // for upload on push).
+        var pointer: ?[]u8 = null;
+        defer if (pointer) |p| alloc.free(p);
+        if (sess) |s| {
+            if (lfs.parsePointer(content)) |existing| {
+                s.markPending(&existing.oid_hex, existing.size) catch {};
+            } else if (attrs.isLfs(e.path)) {
+                const hex = try s.writeObject(content);
+                s.markPending(&hex, content.len) catch {};
+                pointer = try lfs.pointerForContent(alloc, content);
+            }
+        }
+        const payload: []const u8 = pointer orelse content;
+
         var blob_oid: c.git_oid = undefined;
-        try check(c.git_blob_create_from_buffer(&blob_oid, repo, content.ptr, content.len));
+        try check(c.git_blob_create_from_buffer(&blob_oid, repo, payload.ptr, payload.len));
 
         var cur = root;
         var comp_it = std.mem.splitScalar(u8, e.path, '/');
@@ -707,7 +701,7 @@ fn collectChain(store: *Store, o: Oid, out: *std.ArrayList(Oid), seen: *std.Stri
 /// Reuses the mapped git commit if it still exists in `repo`. Root changes (no
 /// gr parents) chain onto `graft` if provided (used to fast-forward onto an
 /// existing branch tip). Returns the git commit id and records it in the map.
-fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid) !c.git_oid {
+fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session) !c.git_oid {
     if (map.lookupGit(gr)) |existing| {
         var commit: ?*c.git_commit = null;
         if (c.git_commit_lookup(&commit, repo, &existing) == 0) {
@@ -722,7 +716,7 @@ fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, 
     const tree = try store.readTree(change.tree);
     defer object.freeTree(alloc, tree);
 
-    const git_tree = try buildGitTree(store, repo, tree);
+    const git_tree = try buildGitTree(store, repo, tree, sess);
     defer c.git_tree_free(git_tree);
 
     const parsed = splitAuthor(change.author);
@@ -770,7 +764,7 @@ fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, 
 
 /// Export the full history reachable from `tip` into `repo`, oldest-first.
 /// Returns the git commit id of the tip.
-fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, graft: ?*const c.git_oid) !c.git_oid {
+fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session) !c.git_oid {
     const alloc = store.alloc;
     var out: std.ArrayList(Oid) = .empty;
     defer out.deinit(alloc);
@@ -782,7 +776,7 @@ fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, 
     }
     try collectChain(store, tip, &out, &seen, alloc);
     var last: c.git_oid = undefined;
-    for (out.items) |o| last = try exportChange(store, repo, map, o, graft);
+    for (out.items) |o| last = try exportChange(store, repo, map, o, graft, sess);
     return last;
 }
 
@@ -844,7 +838,10 @@ pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?
     var map = try Gitmap.load(store);
     defer map.deinit();
 
-    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null);
+    var session = lfsSessionFor(store, repo, null);
+    defer if (session) |*s| s.deinit();
+
+    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null, if (session) |*s| s else null);
 
     var newref: ?*c.git_reference = null;
     try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
@@ -875,6 +872,9 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
     const head_branch = try store.headBranch();
     defer alloc.free(head_branch);
 
+    var session = lfsSessionFor(store, repo, null);
+    defer if (session) |*s| s.deinit();
+
     // Export every gr branch.
     {
         var dir = try store.root.openDir(store.io, "refs/heads", .{ .iterate = true });
@@ -891,7 +891,7 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
             var graft_oid: c.git_oid = undefined;
             const have_graft = c.git_reference_name_to_id(&graft_oid, repo, ref_name.ptr) == 0;
 
-            const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null);
+            const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null, if (session) |*s| s else null);
             var newref: ?*c.git_reference = null;
             try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
             c.git_reference_free(newref);
@@ -941,7 +941,7 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
 /// Export ONLY the gr HEAD tip change as a single commit chained onto the target
 /// branch's existing tip (fast-forward). Used by `pushRemote` so pushing to an
 /// existing remote does not rewrite or replay entire gr history there.
-fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8) !void {
+fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, sess: ?*lfs.Session) !void {
     ensureInit();
     const alloc = store.alloc;
 
@@ -979,7 +979,7 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
     }
     defer alloc.free(target);
 
-    const git_tree = try buildGitTree(store, repo, tree);
+    const git_tree = try buildGitTree(store, repo, tree, sess);
     defer c.git_tree_free(git_tree);
 
     const parsed = splitAuthor(change.author);
@@ -1050,6 +1050,76 @@ fn mirrorRepoPath(store: *Store) ![:0]u8 {
     return abs;
 }
 
+/// Collect every Git LFS pointer blob in a git tree, recursively, as batch
+/// requests. Caller frees each `oid_hex` and the list.
+fn collectTreePointers(
+    alloc: std.mem.Allocator,
+    repo: ?*c.git_repository,
+    tree: ?*c.git_tree,
+    out: *std.ArrayList(lfs.Request),
+) !void {
+    const n = c.git_tree_entrycount(tree);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const entry = c.git_tree_entry_byindex(tree, i);
+        const etype = c.git_tree_entry_type(entry);
+        if (etype == c.GIT_OBJECT_TREE) {
+            var sub: ?*c.git_tree = null;
+            if (c.git_tree_lookup(&sub, repo, c.git_tree_entry_id(entry)) != 0) continue;
+            defer c.git_tree_free(sub);
+            try collectTreePointers(alloc, repo, sub, out);
+            continue;
+        }
+        if (etype != c.GIT_OBJECT_BLOB) continue;
+        var blob: ?*c.git_blob = null;
+        if (c.git_blob_lookup(&blob, repo, c.git_tree_entry_id(entry)) != 0) continue;
+        defer c.git_blob_free(blob);
+        const size: usize = @intCast(c.git_blob_rawsize(blob));
+        if (size == 0 or size > lfs.max_pointer_bytes) continue;
+        const bytes = @as([*]const u8, @ptrCast(c.git_blob_rawcontent(blob)))[0..size];
+        const p = lfs.parsePointer(bytes) orelse continue;
+        const hex = try alloc.dupe(u8, &p.oid_hex);
+        errdefer alloc.free(hex);
+        try out.append(alloc, .{ .oid_hex = hex, .size = p.size });
+    }
+}
+
+/// Upload the LFS objects backing `branch`'s tip tree that `remote_url` does not
+/// already have. Runs before the git push so the remote never ends up with
+/// pointers whose content is missing. Best-effort: a repo with no LFS content,
+/// no endpoint or no local cache simply uploads nothing.
+fn uploadLfsForBranch(
+    store: *Store,
+    repo: ?*c.git_repository,
+    branch: []const u8,
+    remote_url: []const u8,
+) !usize {
+    const alloc = store.alloc;
+
+    var ref_buf: [512]u8 = undefined;
+    const ref_name = std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{branch}) catch return 0;
+    var tip: c.git_oid = undefined;
+    if (c.git_reference_name_to_id(&tip, repo, ref_name.ptr) != 0) return 0;
+    var commit: ?*c.git_commit = null;
+    if (c.git_commit_lookup(&commit, repo, &tip) != 0) return 0;
+    defer c.git_commit_free(commit);
+    var tree: ?*c.git_tree = null;
+    if (c.git_commit_tree(&tree, commit) != 0) return 0;
+    defer c.git_tree_free(tree);
+
+    var reqs: std.ArrayList(lfs.Request) = .empty;
+    defer {
+        for (reqs.items) |r| alloc.free(r.oid_hex);
+        reqs.deinit(alloc);
+    }
+    try collectTreePointers(alloc, repo, tree, &reqs);
+    if (reqs.items.len == 0) return 0;
+
+    var session = lfsSessionFor(store, repo, remote_url) orelse return 0;
+    defer session.deinit();
+    return session.uploadObjects(reqs.items) catch 0;
+}
+
 /// Push guardrail HEAD to an actual git remote (https/ssh/file://) via libgit2's
 /// smart protocol. Exports HEAD into the managed `.gr/gitmirror` repo, then
 /// pushes `refspec` (default `refs/heads/<branch>:refs/heads/<branch>`) to
@@ -1094,7 +1164,11 @@ pub fn pushRemote(store: *Store, remote_url: []const u8, branch_opt: ?[]const u8
 
     // Export guardrail HEAD onto the target branch in the mirror. If the fetch
     // above populated refs/heads/<branch>, exportTipOnto chains onto that tip.
-    try exportTipOnto(store, mirror_abs, branch);
+    lfs_uploaded = 0;
+    var session = lfsSessionFor(store, repo, remote_url);
+    defer if (session) |*s| s.deinit();
+    try exportTipOnto(store, mirror_abs, branch, if (session) |*s| s else null);
+    if (session) |*s| lfs_uploaded = s.flushPending() catch 0;
 
     const rs = try std.fmt.allocPrintSentinel(alloc, "refs/heads/{s}:refs/heads/{s}", .{ branch, branch }, 0);
     defer alloc.free(rs);
@@ -1130,6 +1204,8 @@ pub fn pushColocated(store: *Store, work_dir_path: []const u8, remote_url: []con
 
     resetCredCache();
     g_cred.token = envToken();
+
+    lfs_uploaded = uploadLfsForBranch(store, repo, branch, remote_url) catch 0;
 
     const prefix = if (force) "+" else "";
     const rs = try std.fmt.allocPrintSentinel(alloc, "{s}refs/heads/{s}:refs/heads/{s}", .{ prefix, branch, branch }, 0);
@@ -1232,18 +1308,6 @@ fn resetIndexToHead(store: *Store, work_dir_path: []const u8) !void {
 // --- tests ---
 
 const testing = std.testing;
-
-test "parseCredentialOutput parses username and password" {
-    const blob = "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghp_abc123\n\n";
-    const got = parseCredentialOutput(blob) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("x-access-token", got.user);
-    try testing.expectEqualStrings("ghp_abc123", got.pass);
-}
-
-test "parseCredentialOutput returns null when password missing" {
-    const blob = "protocol=https\nhost=github.com\nusername=x-access-token\n\n";
-    try testing.expect(parseCredentialOutput(blob) == null);
-}
 
 test "importHead from a libgit2-created repo" {
     ensureInit();
@@ -1944,4 +2008,222 @@ test "exportAll writes full history and multiple branches into fresh repo" {
     try check(c.git_commit_lookup(&side_commit, repo, &side_tip));
     defer c.git_commit_free(side_commit);
     try testing.expectEqualStrings("a\n", std.mem.span(c.git_commit_message(side_commit)));
+}
+
+/// Seed a git repo with an LFS-tracked file: `.gitattributes`, a pointer blob
+/// standing in for `payload`, and `payload` itself in the repo's LFS cache.
+fn commitLfsFixture(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    tmp_dir: std.Io.Dir,
+    repo: ?*c.git_repository,
+    repo_sub: []const u8,
+    payload: []const u8,
+    cache_it: bool,
+) !void {
+    const pointer = try lfs.pointerForContent(alloc, payload);
+    defer alloc.free(pointer);
+
+    var bld: ?*c.git_treebuilder = null;
+    try check(c.git_treebuilder_new(&bld, repo, null));
+    defer c.git_treebuilder_free(bld);
+
+    const attrs = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+    var attr_oid: c.git_oid = undefined;
+    try check(c.git_blob_create_from_buffer(&attr_oid, repo, attrs.ptr, attrs.len));
+    try check(c.git_treebuilder_insert(null, bld, ".gitattributes", &attr_oid, c.GIT_FILEMODE_BLOB));
+
+    var ptr_oid: c.git_oid = undefined;
+    try check(c.git_blob_create_from_buffer(&ptr_oid, repo, pointer.ptr, pointer.len));
+    try check(c.git_treebuilder_insert(null, bld, "big.bin", &ptr_oid, c.GIT_FILEMODE_BLOB));
+
+    var tree_oid: c.git_oid = undefined;
+    try check(c.git_treebuilder_write(&tree_oid, bld));
+    var gtree: ?*c.git_tree = null;
+    try check(c.git_tree_lookup(&gtree, repo, &tree_oid));
+    defer c.git_tree_free(gtree);
+
+    var sig: ?*c.git_signature = null;
+    try check(c.git_signature_new(&sig, "Lfs", "lfs@example.com", 1_600_000_000, 0));
+    defer c.git_signature_free(sig);
+    var commit_oid: c.git_oid = undefined;
+    try check(c.git_commit_create(&commit_oid, repo, "refs/heads/master", sig, sig, null, "lfs fixture\n", gtree, 0, null));
+    try check(c.git_repository_set_head(repo, "refs/heads/master"));
+
+    if (!cache_it) return;
+    const hex = lfs.sha256Hex(payload);
+    var rel_buf: [128]u8 = undefined;
+    const rel = try lfs.objectRelPath(&rel_buf, &hex);
+    const dir = try std.fmt.allocPrint(alloc, "{s}/.git/{s}", .{ repo_sub, std.fs.path.dirname(rel).? });
+    defer alloc.free(dir);
+    try tmp_dir.createDirPath(io, dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/.git/{s}", .{ repo_sub, rel });
+    defer alloc.free(path);
+    try tmp_dir.writeFile(io, .{ .sub_path = path, .data = payload });
+}
+
+test "import smudges lfs pointers into real content, export cleans them back" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "PAYLOAD " ** 64;
+
+    try tmp.dir.createDirPath(io, "src");
+    const src_abs = try tmp.dir.realPathFileAlloc(io, "src", alloc);
+    defer alloc.free(src_abs);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, src_abs.ptr, 0));
+    defer c.git_repository_free(repo);
+    try commitLfsFixture(io, alloc, tmp.dir, repo, "src", payload, true);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const tip = try importHead(&store, src_abs);
+    try testing.expectEqual(@as(usize, 0), lfs_unresolved);
+
+    // gr's own tree holds the real bytes, not the pointer.
+    const change = try store.readChange(tip);
+    defer object.freeChange(alloc, change);
+    const tree = try store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+
+    var found = false;
+    for (tree.entries) |e| {
+        if (!std.mem.eql(u8, e.path, "big.bin")) continue;
+        found = true;
+        const content = try store.readFileContent(e.blob);
+        defer alloc.free(content);
+        try testing.expectEqualStrings(payload, content);
+        try testing.expect(lfs.parsePointer(content) == null);
+    }
+    try testing.expect(found);
+
+    // Exporting puts the pointer back in git and the bytes in the dest cache.
+    try tmp.dir.createDirPath(io, "gitout");
+    const out_abs = try tmp.dir.realPathFileAlloc(io, "gitout", alloc);
+    defer alloc.free(out_abs);
+    try exportHead(&store, out_abs);
+
+    var out_repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&out_repo, out_abs.ptr));
+    defer c.git_repository_free(out_repo);
+
+    var head_ref: ?*c.git_reference = null;
+    try check(c.git_repository_head(&head_ref, out_repo));
+    defer c.git_reference_free(head_ref);
+    var commit_obj: ?*c.git_object = null;
+    try check(c.git_reference_peel(&commit_obj, head_ref, c.GIT_OBJECT_COMMIT));
+    defer c.git_object_free(commit_obj);
+    var out_tree: ?*c.git_tree = null;
+    try check(c.git_commit_tree(&out_tree, @ptrCast(commit_obj)));
+    defer c.git_tree_free(out_tree);
+
+    var entry: ?*c.git_tree_entry = null;
+    try check(c.git_tree_entry_bypath(&entry, out_tree, "big.bin"));
+    defer c.git_tree_entry_free(entry);
+    var blob: ?*c.git_blob = null;
+    try check(c.git_blob_lookup(&blob, out_repo, c.git_tree_entry_id(entry)));
+    defer c.git_blob_free(blob);
+    const bsize: usize = @intCast(c.git_blob_rawsize(blob));
+    const braw = @as([*]const u8, @ptrCast(c.git_blob_rawcontent(blob)))[0..bsize];
+
+    const p = lfs.parsePointer(braw) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, payload.len), p.size);
+    try testing.expectEqualStrings(&lfs.sha256Hex(payload), &p.oid_hex);
+
+    var rel_buf: [128]u8 = undefined;
+    const rel = try lfs.objectRelPath(&rel_buf, &p.oid_hex);
+    const cached_path = try std.fmt.allocPrint(alloc, "gitout/.git/{s}", .{rel});
+    defer alloc.free(cached_path);
+    const cached = try tmp.dir.readFileAlloc(io, cached_path, alloc, .unlimited);
+    defer alloc.free(cached);
+    try testing.expectEqualStrings(payload, cached);
+}
+
+test "lfs.smudge off keeps pointers verbatim through import and export" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "OTHER PAYLOAD " ** 32;
+
+    try tmp.dir.createDirPath(io, "src");
+    const src_abs = try tmp.dir.realPathFileAlloc(io, "src", alloc);
+    defer alloc.free(src_abs);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, src_abs.ptr, 0));
+    defer c.git_repository_free(repo);
+    try commitLfsFixture(io, alloc, tmp.dir, repo, "src", payload, true);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+    try @import("config.zig").set(&store, "lfs.smudge", "false");
+
+    const tip = try importHead(&store, src_abs);
+    const change = try store.readChange(tip);
+    defer object.freeChange(alloc, change);
+    const tree = try store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+
+    for (tree.entries) |e| {
+        if (!std.mem.eql(u8, e.path, "big.bin")) continue;
+        const content = try store.readFileContent(e.blob);
+        defer alloc.free(content);
+        const p = lfs.parsePointer(content) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(&lfs.sha256Hex(payload), &p.oid_hex);
+    }
+}
+
+test "import leaves a pointer alone when the object cannot be resolved" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "UNCACHED " ** 16;
+
+    try tmp.dir.createDirPath(io, "src");
+    const src_abs = try tmp.dir.realPathFileAlloc(io, "src", alloc);
+    defer alloc.free(src_abs);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, src_abs.ptr, 0));
+    defer c.git_repository_free(repo);
+    // cache_it = false: the bytes exist nowhere, and there is no remote.
+    try commitLfsFixture(io, alloc, tmp.dir, repo, "src", payload, false);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const tip = try importHead(&store, src_abs);
+    try testing.expectEqual(@as(usize, 1), lfs_unresolved);
+
+    const change = try store.readChange(tip);
+    defer object.freeChange(alloc, change);
+    const tree = try store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+    for (tree.entries) |e| {
+        if (!std.mem.eql(u8, e.path, "big.bin")) continue;
+        const content = try store.readFileContent(e.blob);
+        defer alloc.free(content);
+        try testing.expect(lfs.parsePointer(content) != null);
+    }
 }

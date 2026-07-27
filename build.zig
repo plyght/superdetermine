@@ -33,6 +33,15 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const fmt_paths = &[_][]const u8{ "src", "build.zig" };
+    const fmt = b.addFmt(.{ .paths = fmt_paths });
+    const fmt_step = b.step("fmt", "Format the source tree");
+    fmt_step.dependOn(&fmt.step);
+
+    const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
+    const fmt_check_step = b.step("fmt-check", "Fail if the source tree is unformatted");
+    fmt_check_step.dependOn(&fmt_check.step);
 }
 
 fn linkLibgit2(

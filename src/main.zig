@@ -21,6 +21,8 @@ const gc = @import("gc.zig");
 const blame = @import("blame.zig");
 const completions = @import("completions.zig");
 const absorb = @import("absorb.zig");
+const lfs = @import("lfs.zig");
+const proc = @import("proc.zig");
 
 const Oid = oid.Oid;
 const Store = store.Store;
@@ -68,6 +70,7 @@ const usage =
     \\  import <git-repo>   pull a git repo's HEAD into guardrail
     \\  export <git-repo>   write guardrail HEAD out as git commits
     \\  sync <dir>          mirror guardrail HEAD into the colocated .git
+    \\  lfs <cmd>           git-lfs interop (track, ls, fetch, push, env)
     \\  push [remote] [branch] | pull [remote]   (remote defaults to origin)
     \\
     \\  init            create a guardrail repo here
@@ -179,6 +182,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdAbsorb(io, alloc, w);
     } else if (eq(cmd, "gc")) {
         try cmdGc(io, alloc, w, rest);
+    } else if (eq(cmd, "lfs")) {
+        try cmdLfs(io, alloc, w, rest);
     } else if (eq(cmd, "completions")) {
         try cmdCompletions(w, rest);
     } else {
@@ -428,6 +433,31 @@ fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const 
     defer s.deinit();
     const dry_run = hasFlag(rest, "--dry-run") or hasFlag(rest, "-n");
     try gc.run(&s, alloc, w, dry_run);
+}
+
+fn cmdLfs(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    // Share `.git/lfs/objects` with git-lfs when a git repo sits alongside.
+    var git_dir: ?[:0]u8 = null;
+    defer if (git_dir) |g| alloc.free(g);
+    if (std.Io.Dir.cwd().access(io, ".git", .{})) |_| {
+        git_dir = std.Io.Dir.cwd().realPathFileAlloc(io, ".git", alloc) catch null;
+    } else |_| {}
+
+    const remote_name = flagValue(rest, "--remote", "--remote");
+    const url = resolveRemote(io, alloc, &s, if (remote_name.len != 0) remote_name else "origin") catch null;
+    defer if (url) |u| alloc.free(u);
+
+    try lfs.run(.{
+        .store = &s,
+        .work = work,
+        .git_dir_abs = git_dir,
+        .remote_url = url,
+    }, w, rest);
 }
 
 fn cmdCompletions(w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1198,5 +1228,7 @@ test {
     _ = blame;
     _ = completions;
     _ = absorb;
+    _ = lfs;
+    _ = proc;
     _ = @import("index.zig");
 }

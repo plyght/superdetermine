@@ -135,7 +135,7 @@ fn basename(path: []const u8) []const u8 {
 
 /// Match a slash-bearing pattern against a full rel_path. `**` spans segments;
 /// `*`/`?` stay within a single segment.
-fn matchPath(pattern: []const u8, path: []const u8) bool {
+pub fn matchPath(pattern: []const u8, path: []const u8) bool {
     var pat_it = std.mem.splitScalar(u8, pattern, '/');
     var pat_segs: [256][]const u8 = undefined;
     var np: usize = 0;
@@ -168,7 +168,7 @@ fn matchSegs(pat: []const []const u8, path: []const []const u8) bool {
 }
 
 /// Single-segment glob supporting `*` and `?` (neither crosses a segment).
-fn matchSegment(pat: []const u8, s: []const u8) bool {
+pub fn matchSegment(pat: []const u8, s: []const u8) bool {
     var pi: usize = 0;
     var si: usize = 0;
     var star_pi: ?usize = null;
