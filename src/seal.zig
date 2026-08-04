@@ -434,18 +434,28 @@ pub const Member = struct {
     wrapped: []u8,
 };
 
+pub const Sealed = struct {
+    path: []u8,
+    body: ?[]u8,
+};
+
+pub const body_prefix = '|';
+
 pub const Manifest = struct {
     alloc: std.mem.Allocator,
-    paths: std.ArrayList([]u8),
+    files: std.ArrayList(Sealed),
     members: std.ArrayList(Member),
 
     pub fn empty(alloc: std.mem.Allocator) Manifest {
-        return .{ .alloc = alloc, .paths = .empty, .members = .empty };
+        return .{ .alloc = alloc, .files = .empty, .members = .empty };
     }
 
     pub fn deinit(self: *Manifest) void {
-        for (self.paths.items) |p| self.alloc.free(p);
-        self.paths.deinit(self.alloc);
+        for (self.files.items) |f| {
+            self.alloc.free(f.path);
+            if (f.body) |b| self.alloc.free(b);
+        }
+        self.files.deinit(self.alloc);
         for (self.members.items) |m| {
             self.alloc.free(m.name);
             self.alloc.free(m.wrapped);
@@ -457,8 +467,26 @@ pub const Manifest = struct {
         var m = Manifest.empty(alloc);
         errdefer m.deinit();
 
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(alloc);
+        var collecting = false;
+
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw| {
+            if (raw.len != 0 and raw[0] == body_prefix) {
+                if (!collecting) return Error.BadManifest;
+                if (body.items.len != 0) try body.append(alloc, '\n');
+                var content = raw[1..];
+                if (content.len != 0 and content[0] == ' ') content = content[1..];
+                try body.appendSlice(alloc, content);
+                continue;
+            }
+            if (collecting) {
+                try m.attachBody(body.items);
+                body.clearRetainingCapacity();
+                collecting = false;
+            }
+
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
 
@@ -467,7 +495,8 @@ pub const Manifest = struct {
             if (std.mem.eql(u8, kind, "version")) continue;
             if (std.mem.eql(u8, kind, "seal")) {
                 const path = it.next() orelse return Error.BadManifest;
-                try m.paths.append(alloc, try alloc.dupe(u8, path));
+                try m.files.append(alloc, .{ .path = try alloc.dupe(u8, path), .body = null });
+                collecting = true;
             } else if (std.mem.eql(u8, kind, "wrap")) {
                 const name = it.next() orelse return Error.BadManifest;
                 const pub_s = it.next() orelse return Error.BadManifest;
@@ -486,14 +515,34 @@ pub const Manifest = struct {
                 return Error.BadManifest;
             }
         }
+        if (collecting) try m.attachBody(body.items);
         return m;
+    }
+
+    fn attachBody(self: *Manifest, text: []const u8) !void {
+        if (text.len == 0) return;
+        const last = &self.files.items[self.files.items.len - 1];
+        if (last.body) |b| self.alloc.free(b);
+        last.body = try self.alloc.dupe(u8, text);
     }
 
     pub fn render(self: *const Manifest, alloc: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
         try out.appendSlice(alloc, "version 1\n");
-        for (self.paths.items) |p| try out.print(alloc, "seal {s}\n", .{p});
+        for (self.files.items) |f| {
+            try out.print(alloc, "seal {s}\n", .{f.path});
+            const text = f.body orelse continue;
+            var body_lines = std.mem.splitScalar(u8, text, '\n');
+            while (body_lines.next()) |line| {
+                if (line.len == 0) {
+                    try out.append(alloc, body_prefix);
+                } else {
+                    try out.print(alloc, "{c} {s}", .{ body_prefix, line });
+                }
+                try out.append(alloc, '\n');
+            }
+        }
         for (self.members.items) |m| {
             const enc = try m.public.encode(alloc);
             defer alloc.free(enc);
@@ -503,15 +552,37 @@ pub const Manifest = struct {
     }
 
     pub fn hasPath(self: *const Manifest, path: []const u8) bool {
-        for (self.paths.items) |p| {
-            if (std.mem.eql(u8, p, path)) return true;
+        return self.find(path) != null;
+    }
+
+    pub fn find(self: *const Manifest, path: []const u8) ?usize {
+        for (self.files.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f.path, path)) return i;
         }
-        return false;
+        return null;
+    }
+
+    pub fn bodyOf(self: *const Manifest, path: []const u8) ?[]const u8 {
+        const i = self.find(path) orelse return null;
+        return self.files.items[i].body;
+    }
+
+    /// Replace the sealed text for `path`. Returns true when the bytes changed,
+    /// so callers can skip rewriting the manifest on a no-op save.
+    pub fn setBody(self: *Manifest, path: []const u8, text: []const u8) !bool {
+        const i = self.find(path) orelse return false;
+        const slot = &self.files.items[i];
+        if (slot.body) |old| {
+            if (std.mem.eql(u8, old, text)) return false;
+            self.alloc.free(old);
+        }
+        slot.body = try self.alloc.dupe(u8, text);
+        return true;
     }
 
     pub fn addPath(self: *Manifest, path: []const u8) !bool {
         if (self.hasPath(path)) return false;
-        try self.paths.append(self.alloc, try self.alloc.dupe(u8, path));
+        try self.files.append(self.alloc, .{ .path = try self.alloc.dupe(u8, path), .body = null });
         return true;
     }
 
@@ -736,8 +807,8 @@ test "manifest roundtrip, membership and rotation" {
 
     var parsed = try Manifest.parse(alloc, text);
     defer parsed.deinit();
-    try testing.expectEqual(@as(usize, 1), parsed.paths.items.len);
-    try testing.expectEqualStrings(".env", parsed.paths.items[0]);
+    try testing.expectEqual(@as(usize, 1), parsed.files.items.len);
+    try testing.expectEqualStrings(".env", parsed.files.items[0].path);
     try testing.expectEqual(@as(usize, 2), parsed.members.items.len);
 
     try testing.expectEqualSlices(u8, &k, &try parsed.unwrapFor(alloc, nico));
@@ -752,6 +823,46 @@ test "manifest roundtrip, membership and rotation" {
     try testing.expectEqualSlices(u8, &k2, &try parsed.unwrapFor(alloc, nico));
 
     try testing.expectError(Error.BadManifest, Manifest.parse(alloc, "bogus line here"));
+}
+
+test "a sealed body survives the manifest byte for byte" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    const nico = Identity.generate(io);
+    const k = newRepoKey(io);
+    const src =
+        \\# a comment
+        \\
+        \\DATABASE_URL=postgres://localhost/x
+        \\  SPACED  =  value with spaces
+        \\EMPTY=
+        \\
+    ;
+    const sealed = try sealText(alloc, k, ".env", src);
+    defer alloc.free(sealed);
+
+    var m = Manifest.empty(alloc);
+    defer m.deinit();
+    _ = try m.addPath(".env");
+    try m.putMember(io, k, "nico", nico.publicId());
+    try testing.expect(try m.setBody(".env", sealed));
+    try testing.expect(!try m.setBody(".env", sealed));
+
+    const text = try m.render(alloc);
+    defer alloc.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "postgres://localhost/x") == null);
+
+    var parsed = try Manifest.parse(alloc, text);
+    defer parsed.deinit();
+    try testing.expectEqualStrings(sealed, parsed.bodyOf(".env").?);
+
+    const opened = try unsealText(alloc, k, ".env", parsed.bodyOf(".env").?);
+    defer alloc.free(opened);
+    try testing.expectEqualStrings(src, opened);
+
+    try testing.expect(parsed.bodyOf(".env.other") == null);
+    try testing.expectError(Error.BadManifest, Manifest.parse(alloc, "| orphan body line"));
 }
 
 test "sealed path naming" {

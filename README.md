@@ -24,7 +24,7 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Bidirectional git interop | Import and export full history, branches, and tags. Push and pull to GitHub. |
 | Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
-| Sealed secrets | Commit `.env`. Values are encrypted per-variable; the plaintext is never an object. Team access is a wrapped key, not a service. |
+| Sealed secrets | Commit your `.env` safely. Values are encrypted per-variable into one file; the plaintext is never an object. Team access is a wrapped key, not a service. |
 | Encrypted sharing | `gr send` hands a repo to someone peer to peer, or as a link or file no host can read. |
 
 ## Git, side by side
@@ -76,16 +76,21 @@ On import, gr resolves LFS pointers to the real bytes (from `.git/lfs/objects`, 
 
 ```
 gr key new                # k new  your keypair, once per machine
-gr seal .env              # sl     writes .env.sealed; .env becomes uncommittable
+gr seal .env              # sl     .env becomes uncommittable from here on
 gr save -m "add config"
 ```
 
-`.env.sealed` is a normal tracked file that diffs cleanly:
+Your `.env` stays exactly where it is, in plaintext, for your app to read. It just stops being committable. The sealed copy lives in `.grsealed`, the one file gr adds:
 
 ```
-DATABASE_URL=gr1:csEGYiVIFSnnLn4Q2oJv2TyekUkzChccyeVXlXtF3QQ8TrpS...
-STRIPE_KEY=gr1:HJh0CycJJ4ssQq3epof75ooeomALvzNQPGUo_5gAK3M6FNWS3U...
+version 1
+seal .env
+| DATABASE_URL=gr1:csEGYiVIFSnnLn4Q2oJv2TyekUkzChccyeVXlXtF3QQ8TrpS...
+| STRIPE_KEY=gr1:HJh0CycJJ4ssQq3epof75ooeomALvzNQPGUo_5gAK3M6FNWS3U...
+wrap nico gr1lPATx... <the repo key, locked to nico>
 ```
+
+One committed file holds both the sealed values and who can open them. There is no second `.env` to keep track of.
 
 Each value gets its own key derived from the variable's name and path, and the nonce comes from the plaintext, so an unchanged value re-seals to identical bytes and only real edits show up in a diff. The name and path are authenticated, so moving a `STRIPE_KEY` ciphertext onto the `DATABASE_URL` line fails to decrypt rather than quietly returning the wrong secret. What this reveals, in full: your variable names, how many there are, each value's length, and whether a value repeats at that same name. Nothing else.
 
@@ -126,7 +131,7 @@ With `--file`, send the file and the key over different channels. Either alone i
 
 The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline. that is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run a relay yourself with `gr relay` (`gr rv`); `gr serve --link <dir>` hosts a `--link` export over HTTP.
 
-The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not, without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
+The two layers compose the way you would want: share a repo and the recipient gets `.grsealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not, without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
 
 Git interop deliberately has no share layer: GitHub sees your code so review works, and only your values stay sealed.
 

@@ -2098,14 +2098,12 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     if (rest.len != 0 and eq(rest[0], "status")) {
         var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
         defer manifest.deinit();
-        for (manifest.paths.items) |p| {
-            const sealed = try seal.sealedPathAlloc(alloc, p);
-            defer alloc.free(sealed);
-            const present = if (work.access(io, p, .{})) |_| true else |_| false;
+        for (manifest.files.items) |f| {
+            const present = if (work.access(io, f.path, .{})) |_| true else |_| false;
             try w.print("  {s}{s}{s} {s} {s}{s}{s} {s}{s}{s}\n", .{
                 ui.on(if (present) .green else .yellow), if (present) ui.check else ui.warn, ui.off(),
-                p,                                       ui.on(.dim),                        ui.arrow,
-                ui.off(),                                ui.on(.cyan),                       sealed,
+                f.path,                                  ui.on(.dim),                        ui.arrow,
+                ui.off(),                                ui.on(.cyan),                       seal.manifest_name,
                 ui.off(),
             });
             if (!present) try ui.hint(w, "      no local plaintext. run `gr unseal`");
@@ -2175,15 +2173,15 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
         return;
     }
-    for (plan.sources, plan.outputs) |src, dst| {
+    for (plan.sources) |src| {
         try w.print("  {s}{s}{s} {s} {s}{s}{s} {s}{s}{s}\n", .{
             ui.on(.green), ui.check,     ui.off(),
             src,           ui.on(.dim),  ui.arrow,
-            ui.off(),      ui.on(.cyan), dst,
+            ui.off(),      ui.on(.cyan), seal.manifest_name,
             ui.off(),
         });
     }
-    try w.print("\n{s}commit {s} and the sealed file; the plaintext stays out of every change{s}\n", .{
+    try w.print("\n{s}commit {s}; the plaintext stays out of every change{s}\n", .{
         ui.on(.dim), seal.manifest_name, ui.off(),
     });
 }
@@ -2225,16 +2223,13 @@ fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         return;
     };
 
-    for (manifest.paths.items) |src| {
-        const dst = try seal.sealedPathAlloc(alloc, src);
-        defer alloc.free(dst);
-        if (work.access(io, src, .{})) |_| continue else |_| {}
-        const sealed = work.readFileAlloc(io, dst, alloc, .unlimited) catch continue;
-        defer alloc.free(sealed);
-        const plain = try seal.unsealText(alloc, old, src, sealed);
+    for (manifest.files.items) |f| {
+        if (work.access(io, f.path, .{})) |_| continue else |_| {}
+        const sealed = f.body orelse continue;
+        const plain = try seal.unsealText(alloc, old, f.path, sealed);
         defer alloc.free(plain);
         try work.writeFile(io, .{
-            .sub_path = src,
+            .sub_path = f.path,
             .data = plain,
             .flags = .{ .permissions = .fromMode(0o600) },
         });
@@ -2242,17 +2237,15 @@ fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 
     const fresh = seal.newRepoKey(io);
     try manifest.rewrapAll(io, fresh);
-    try keyring.saveManifest(io, alloc, work, &manifest);
 
-    for (manifest.paths.items) |src| {
-        const dst = try seal.sealedPathAlloc(alloc, src);
-        defer alloc.free(dst);
-        const plain = work.readFileAlloc(io, src, alloc, .unlimited) catch continue;
+    for (manifest.files.items) |f| {
+        const plain = work.readFileAlloc(io, f.path, alloc, .unlimited) catch continue;
         defer alloc.free(plain);
-        const sealed = try seal.sealText(alloc, fresh, src, plain);
+        const sealed = try seal.sealText(alloc, fresh, f.path, plain);
         defer alloc.free(sealed);
-        try work.writeFile(io, .{ .sub_path = dst, .data = sealed });
+        _ = try manifest.setBody(f.path, sealed);
     }
+    try keyring.saveManifest(io, alloc, work, &manifest);
 
     try w.print("{s}{s}{s} rotated the repo key, re-wrapped to {d} member(s)\n", .{
         ui.on(.green), ui.check, ui.off(), manifest.members.items.len,

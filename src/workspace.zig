@@ -426,7 +426,8 @@ test "a sealed source never enters the tree and its sealed form always does" {
     var saw_sealed = false;
     for (tree.entries) |e| {
         try testing.expect(!std.mem.eql(u8, e.path, ".env"));
-        if (std.mem.eql(u8, e.path, ".env.sealed")) {
+        try testing.expect(!std.mem.eql(u8, e.path, ".env.sealed"));
+        if (std.mem.eql(u8, e.path, seal.manifest_name)) {
             saw_sealed = true;
             const data = try store.readFileContent(e.blob);
             defer alloc.free(data);

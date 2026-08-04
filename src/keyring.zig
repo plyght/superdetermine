@@ -148,7 +148,7 @@ pub fn repoKey(
 pub fn prepare(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Plan {
     var manifest = (try loadManifest(io, alloc, work_dir)) orelse return .none;
     defer manifest.deinit();
-    if (manifest.paths.items.len == 0) return .none;
+    if (manifest.files.items.len == 0) return .none;
 
     var sources: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -161,29 +161,22 @@ pub fn prepare(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Plan
         outputs.deinit(alloc);
     }
 
-    for (manifest.paths.items) |p| {
-        try sources.append(alloc, try alloc.dupe(u8, p));
-        try outputs.append(alloc, try seal.sealedPathAlloc(alloc, p));
+    for (manifest.files.items) |f| {
+        try sources.append(alloc, try alloc.dupe(u8, f.path));
     }
+    try outputs.append(alloc, try alloc.dupe(u8, seal.manifest_name));
 
     const key = try repoKey(io, alloc, &manifest);
     var sealed_any = false;
     if (key) |k| {
-        for (manifest.paths.items, outputs.items) |src, dst| {
-            const plain = work_dir.readFileAlloc(io, src, alloc, .unlimited) catch continue;
+        for (manifest.files.items) |f| {
+            const plain = work_dir.readFileAlloc(io, f.path, alloc, .unlimited) catch continue;
             defer alloc.free(plain);
-            const sealed = try seal.sealText(alloc, k, src, plain);
+            const sealed = try seal.sealText(alloc, k, f.path, plain);
             defer alloc.free(sealed);
-
-            const existing = work_dir.readFileAlloc(io, dst, alloc, .unlimited) catch null;
-            defer if (existing) |e| alloc.free(e);
-            if (existing) |e| {
-                if (std.mem.eql(u8, e, sealed)) continue;
-            }
-            if (std.fs.path.dirnamePosix(dst)) |d| try work_dir.createDirPath(io, d);
-            try work_dir.writeFile(io, .{ .sub_path = dst, .data = sealed });
-            sealed_any = true;
+            if (try manifest.setBody(f.path, sealed)) sealed_any = true;
         }
+        if (sealed_any) try saveManifest(io, alloc, work_dir, &manifest);
     }
 
     return .{
@@ -207,19 +200,16 @@ pub fn unsealAll(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Un
     const key = (try repoKey(io, alloc, &manifest)) orelse return seal.Error.NotAMember;
 
     var result: Unsealed = .{ .written = 0, .skipped = 0 };
-    for (manifest.paths.items) |src| {
-        const dst = try seal.sealedPathAlloc(alloc, src);
-        defer alloc.free(dst);
-        const sealed = work_dir.readFileAlloc(io, dst, alloc, .unlimited) catch {
+    for (manifest.files.items) |f| {
+        const sealed = f.body orelse {
             result.skipped += 1;
             continue;
         };
-        defer alloc.free(sealed);
-        const plain = try seal.unsealText(alloc, key, src, sealed);
+        const plain = try seal.unsealText(alloc, key, f.path, sealed);
         defer alloc.free(plain);
-        if (std.fs.path.dirnamePosix(src)) |d| try work_dir.createDirPath(io, d);
+        if (std.fs.path.dirnamePosix(f.path)) |d| try work_dir.createDirPath(io, d);
         try work_dir.writeFile(io, .{
-            .sub_path = src,
+            .sub_path = f.path,
             .data = plain,
             .flags = .{ .permissions = .fromMode(0o600) },
         });
@@ -256,15 +246,9 @@ pub fn protectPath(
     work_dir: std.Io.Dir,
     path: []const u8,
 ) !void {
-    const sealed = try seal.sealedPathAlloc(alloc, path);
-    defer alloc.free(sealed);
-    const negation = try std.fmt.allocPrint(alloc, "!{s}", .{sealed});
-    defer alloc.free(negation);
-
     try ensureIgnoreLine(io, alloc, work_dir, ".grignore", path);
     if (work_dir.access(io, ".git", .{})) |_| {
         try ensureIgnoreLine(io, alloc, work_dir, ".gitignore", path);
-        try ensureIgnoreLine(io, alloc, work_dir, ".gitignore", negation);
     } else |_| {}
 }
 
@@ -336,12 +320,13 @@ test "prepare seals sources and leaves plaintext out of the plan" {
     defer plan.deinit();
     try testing.expect(plan.have_key);
     try testing.expect(plan.isSource(".env"));
-    try testing.expect(plan.isOutput(".env.sealed"));
+    try testing.expect(plan.isOutput(seal.manifest_name));
 
-    const sealed = try work.readFileAlloc(io, ".env.sealed", alloc, .unlimited);
-    defer alloc.free(sealed);
-    try testing.expect(std.mem.indexOf(u8, sealed, "sk-live-1") == null);
-    try testing.expect(std.mem.indexOf(u8, sealed, "API_KEY=gr1:") != null);
+    try testing.expectError(error.FileNotFound, work.access(io, ".env.sealed", .{}));
+    const stored = try work.readFileAlloc(io, seal.manifest_name, alloc, .unlimited);
+    defer alloc.free(stored);
+    try testing.expect(std.mem.indexOf(u8, stored, "sk-live-1") == null);
+    try testing.expect(std.mem.indexOf(u8, stored, "API_KEY=gr1:") != null);
 
     try work.deleteFile(io, ".env");
     const out = try unsealAll(io, alloc, work);
@@ -404,5 +389,5 @@ test "protectPath adds ignore rules and re-running is idempotent" {
 
     const gi = try tmp.dir.readFileAlloc(io, ".gitignore", alloc, .unlimited);
     defer alloc.free(gi);
-    try testing.expectEqualStrings(".env\n!.env.sealed\n", gi);
+    try testing.expectEqualStrings(".env\n", gi);
 }
