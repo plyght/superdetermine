@@ -103,7 +103,7 @@ const sections = [_]Section{
 };
 
 fn printUsage(w: *std.Io.Writer) !void {
-    try w.print("{s}gr{s} {s}— guardrail, a fast independent VCS built for humans and agents{s}\n\n", .{
+    try w.print("{s}gr{s} {s}guardrail: a fast independent VCS built for humans and agents{s}\n\n", .{
         ui.on(.bold), ui.off(), ui.on(.dim), ui.off(),
     });
     try w.print("  {s}usage:{s} gr <command> [args]\n", .{ ui.on(.dim), ui.off() });
@@ -490,7 +490,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
             },
             else => return e,
         };
-        try w.writeAll("merge aborted — working tree restored\n");
+        try w.writeAll("merge aborted. working tree restored\n");
         return;
     }
     if (rest.len < 1) {
@@ -509,7 +509,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     }
     merge.markResolved(&s, alloc, work, rest[0]) catch |e| switch (e) {
         error.StillConflicted => {
-            try w.print("{s} still has conflict markers — fix them first\n", .{rest[0]});
+            try w.print("{s} still has conflict markers. fix them first\n", .{rest[0]});
             return;
         },
         error.NoMergeInProgress => {
@@ -524,9 +524,9 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
         alloc.free(rem);
     }
     if (rem.len == 0) {
-        try w.print("resolved {s} — all conflicts cleared, now `gr save`\n", .{rest[0]});
+        try w.print("resolved {s}. all conflicts cleared, now `gr save`\n", .{rest[0]});
     } else {
-        try w.print("resolved {s} — {d} conflict(s) left\n", .{ rest[0], rem.len });
+        try w.print("resolved {s}. {d} conflict(s) left\n", .{ rest[0], rem.len });
     }
 }
 
@@ -536,7 +536,7 @@ fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     const branch = try s.headBranch();
     defer alloc.free(branch);
     const tip = s.readRef(branch) catch {
-        try w.writeAll("nothing to revert — no changes yet\n");
+        try w.writeAll("nothing to revert. no changes yet\n");
         return;
     };
     const head_change = try s.readChange(tip);
@@ -594,7 +594,7 @@ fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     const change = try workspace.snapshot(&s, work, author, msg, nowSeconds(io));
     oplog.record(&s, .{ .kind = .other, .branch = branch, .prev = prev, .new = change, .timestamp = nowSeconds(io) }) catch {};
     var buf: [Oid.len * 2]u8 = undefined;
-    try w.print("reverted — new change {s}\n", .{shortHex(change, &buf)});
+    try w.print("reverted. new change {s}\n", .{shortHex(change, &buf)});
 }
 
 fn cmdAbsorb(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -772,7 +772,7 @@ fn cmdDescribe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []
     const branch = try s.headBranch();
     defer alloc.free(branch);
     const tip = s.readRef(branch) catch {
-        try w.writeAll("nothing to describe — save something first\n");
+        try w.writeAll("nothing to describe. save something first\n");
         return;
     };
     const change = try s.readChange(tip);
@@ -852,7 +852,7 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     }
 
     if (conflicts.len != 0) {
-        try w.print("{s}{s} merge in progress — {d} unresolved conflict(s){s}\n", .{
+        try w.print("{s}{s} merge in progress: {d} unresolved conflict(s){s}\n", .{
             ui.on(.red), ui.warn, conflicts.len, ui.off(),
         });
         for (conflicts) |p| try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.red), ui.warn, ui.off(), p });
@@ -860,7 +860,7 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     }
     if (entries.len == 0) {
         if (conflicts.len == 0) {
-            try w.print("{s}{s}{s} clean — nothing to save\n", .{ ui.on(.green), ui.check, ui.off() });
+            try w.print("{s}{s}{s} clean, nothing to save\n", .{ ui.on(.green), ui.check, ui.off() });
         }
         return;
     }
@@ -1156,12 +1156,12 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     workspace.materialize(&s, result.tree, work) catch {};
 
     if (result.conflicts.len == 0) {
-        try w.print("merged {s} into {s} — clean\n", .{ rest[0], into });
+        try w.print("merged {s} into {s}, clean\n", .{ rest[0], into });
     } else {
         merge.saveState(&s, rest[0], before, result.conflicts) catch {};
         try w.print("merged {s} into {s} with {d} conflict(s):\n", .{ rest[0], into, result.conflicts.len });
         for (result.conflicts) |p| try w.print("  ! {s}\n", .{p});
-        try w.writeAll("fix the markers, then `gr resolve <file>` each — or `gr resolve --abort`\n");
+        try w.writeAll("fix the markers, then `gr resolve <file>` each, or `gr resolve --abort`\n");
     }
 }
 
@@ -1193,7 +1193,7 @@ fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     if (prefix.len == 0) {
         try w.print("fetched {s} ({s})\n", .{ shortHex(change, &buf), branch });
     } else {
-        try w.print("sparse-fetched {s} — only paths under '{s}' ({s})\n", .{ shortHex(change, &buf), prefix, branch });
+        try w.print("sparse-fetched {s}: only paths under '{s}' ({s})\n", .{ shortHex(change, &buf), prefix, branch });
     }
 }
 
@@ -1204,7 +1204,7 @@ fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     defer alloc.free(author);
     var work = try openWork(io);
     defer work.close(io);
-    try w.writeAll("watching for changes — auto-saving (ctrl-c to stop)\n");
+    try w.writeAll("watching for changes, auto-saving (ctrl-c to stop)\n");
     try w.flush();
     try watch.watch(&s, work, .{ .author = author });
 }
@@ -1356,7 +1356,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     }
     const remote_name = if (np >= 1) pos[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
-        try w.print("unknown remote '{s}' — pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });
+        try w.print("unknown remote '{s}'. pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });
         return;
     };
     defer alloc.free(url);
@@ -1386,7 +1386,7 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     defer s.deinit();
     const remote_name = if (rest.len >= 1) rest[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
-        try w.print("unknown remote '{s}' — pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });
+        try w.print("unknown remote '{s}'. pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });
         return;
     };
     defer alloc.free(url);
@@ -1504,7 +1504,7 @@ fn cmdShare(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     try w.print("{s}{s}{s} wrote encrypted objects to {s}{s}/{s}\n\n  {s}{s}{s}\n\n", .{
         ui.on(.green), ui.check, ui.off(), ui.on(.cyan), out_dir, ui.off(), ui.on(.bold), url, ui.off(),
     });
-    try w.writeAll("upload that directory anywhere static. the host never receives the key —\n");
+    try w.writeAll("upload that directory anywhere static. the host never receives the key:\n");
     try w.writeAll("it lives after the '#', which browsers and gr never put in a request.\n");
     try w.print("sealed values stay sealed: whoever opens this gets the code, not the secrets.\n", .{});
 }
@@ -1544,7 +1544,7 @@ fn cmdBundle(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         ui.on(.dim),   ui.off(), ui.on(.bold), url[frag..],  ui.off(),
     });
     try w.print("open it with:  gr clone '{s}{s}' <dir>\n", .{ path, url[frag..] });
-    try w.writeAll("send the file and the key over different channels — either alone is useless.\n");
+    try w.writeAll("send the file and the key over different channels. either alone is useless.\n");
 }
 
 const default_relay_port: u16 = 7790;
@@ -1581,7 +1581,7 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     try w.print("on the other machine, run:\n\n  gr receive {s}{s}{s} <dir>\n\n", .{
         ui.on(.bold), code, ui.off(),
     });
-    try w.writeAll("say those words out loud — do not paste them anywhere the code could be logged.\n");
+    try w.writeAll("say those words out loud. do not paste them anywhere the code could be logged.\n");
     try w.print("waiting for a peer via {s}:{d} ...\n", .{ host, port });
     try w.flush();
 
@@ -1669,13 +1669,13 @@ fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     try w.print("{s}{s}{s} received into {s}{s}{s}\n", .{
         ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
     });
-    try w.writeAll("any sealed values are still sealed — the code moved the code, not the secrets.\n");
+    try w.writeAll("any sealed values are still sealed. the code moved the code, not the secrets.\n");
 }
 
 fn reportHandshake(w: *std.Io.Writer, e: anyerror) !void {
     switch (e) {
         wormhole.Error.ConfirmationFailed => {
-            try w.print("{s}{s}{s} the codes do not match — nothing was transferred.\n", .{ ui.on(.red), ui.cross, ui.off() });
+            try w.print("{s}{s}{s} the codes do not match. nothing was transferred.\n", .{ ui.on(.red), ui.cross, ui.off() });
             try w.writeAll("check the words, or start over: a wrong guess costs the sender a try.\n");
         },
         wormhole.Error.SlotBurned => {
@@ -1683,7 +1683,7 @@ fn reportHandshake(w: *std.Io.Writer, e: anyerror) !void {
         },
         wormhole.Error.BadCode => try w.writeAll("that does not look like a gr wormhole code\n"),
         error.EndOfStream, error.ReadFailed, error.WriteFailed => {
-            try w.writeAll("the peer hung up before the transfer — usually a mistyped code.\n");
+            try w.writeAll("the peer hung up before the transfer, usually a mistyped code.\n");
             try w.writeAll("nothing was sent. run `gr send` again for a fresh one.\n");
         },
         else => try w.print("handshake failed: {t}\n", .{e}),
@@ -1754,7 +1754,7 @@ fn cloneShare(
     try w.print("{s}{s}{s} cloned into {s}{s}{s}\n", .{
         ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
     });
-    try w.writeAll("any sealed values are still sealed — `gr unseal` needs a key you were not given.\n");
+    try w.writeAll("any sealed values are still sealed. `gr unseal` needs a key you were not given.\n");
 }
 
 fn sealUsage(w: *std.Io.Writer) !void {
@@ -1796,7 +1796,7 @@ fn loadRepoManifest(
 
 fn requireIdentity(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?seal.Identity {
     return (try keyring.loadIdentity(io, alloc)) orelse {
-        try w.print("{s}{s}{s} no keypair yet — run {s}gr key new{s}\n", .{ ui.on(.red), ui.cross, ui.off(), ui.on(.cyan), ui.off() });
+        try w.print("{s}{s}{s} no keypair yet. run {s}gr key new{s}\n", .{ ui.on(.red), ui.cross, ui.off(), ui.on(.cyan), ui.off() });
         return null;
     };
 }
@@ -1894,7 +1894,7 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         try w.print("removed {s} from {s}\n", .{ rest[1], seal.manifest_name });
         try w.writeAll("they still hold the old key and every commit they already cloned.\n");
         try w.writeAll("run `gr rotate`, then rotate the underlying secrets themselves\n");
-        try w.writeAll("(new database password, new API keys) — only that actually revokes them.\n");
+        try w.writeAll("(new database password, new API keys). only that actually revokes them.\n");
         return;
     }
 
@@ -1960,7 +1960,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
                 ui.off(),                                ui.on(.cyan),                       sealed,
                 ui.off(),
             });
-            if (!present) try ui.hint(w, "      no local plaintext — run `gr unseal`");
+            if (!present) try ui.hint(w, "      no local plaintext. run `gr unseal`");
         }
         try w.print("{d} member(s) can read these values\n", .{manifest.members.items.len});
         const key = try keyring.repoKey(io, alloc, &manifest);
@@ -1994,7 +1994,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             try manifest.putMember(io, fresh, name, id.publicId());
             break :blk fresh;
         } else (try keyring.repoKey(io, alloc, &manifest)) orelse {
-            try w.print("{s}{s}{s} you cannot read this repo's secrets — ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
+            try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
             return;
         };
         _ = key;
@@ -2007,7 +2007,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
         if (try pathInHistory(alloc, &s, path)) {
             try w.print("warning: {s} is already committed in this repo's history.\n", .{path});
-            try w.writeAll("sealing it now protects future changes only — the old plaintext is\n");
+            try w.writeAll("sealing it now protects future changes only. the old plaintext is\n");
             try w.writeAll("still in past changes and in every clone. treat those values as leaked\n");
             try w.writeAll("and rotate them.\n\n");
         }
@@ -2024,7 +2024,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         return;
     }
     if (!plan.have_key) {
-        try w.print("{s}{s}{s} you cannot read this repo's secrets — ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
         return;
     }
     for (plan.sources, plan.outputs) |src, dst| {
@@ -2050,12 +2050,12 @@ fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
             return;
         },
         seal.Error.NotAMember => {
-            try w.print("{s}{s}{s} you cannot read this repo's secrets — ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
+            try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
             try w.writeAll("(`gr key show` prints the public key they need)\n");
             return;
         },
         seal.Error.BadToken => {
-            try w.writeAll("a sealed value failed to decrypt — the file may be corrupt or edited\n");
+            try w.writeAll("a sealed value failed to decrypt. the file may be corrupt or edited\n");
             return;
         },
         else => return e,
@@ -2110,7 +2110,7 @@ fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         ui.on(.green), ui.check, ui.off(), manifest.members.items.len,
     });
     try w.writeAll("anyone removed earlier still holds the OLD key and any commit they cloned.\n");
-    try w.writeAll("rotate the secrets themselves too — new password, new API key — or they keep working.\n");
+    try w.writeAll("rotate the secrets themselves too (new password, new API key), or they keep working.\n");
 }
 
 test {

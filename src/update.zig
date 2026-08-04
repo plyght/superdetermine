@@ -211,7 +211,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
 
     if (!std.ascii.eqlIgnoreCase(expected, actual)) {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        try w.writeAll("gr update: checksum mismatch — refusing to install\n");
+        try w.writeAll("gr update: checksum mismatch, refusing to install\n");
         return;
     }
 

@@ -41,10 +41,10 @@ If gr turns out not to be for you, your git history is right there, untouched.
 
 ```
 gr init
-gr save -m "message"      # sv  — snapshot the working tree (no add, no stash)
+gr save -m "message"      # sv   snapshot the working tree (no add, no stash)
 gr status | gr diff | gr log     # st | d | l
-gr new feature            # n   — branch and switch
-gr work ../agent-copy     # wt  — instant worktree
+gr new feature            # n    branch and switch
+gr work ../agent-copy     # wt   instant worktree
 gr undo   /   gr redo     # u   /  r
 gr blame file.txt         # per-line authorship + provenance
 gr absorb                 # fold edits into the changes they belong to
@@ -72,11 +72,11 @@ On import, gr resolves LFS pointers to the real bytes (from `.git/lfs/objects`, 
 
 ## Secrets you can actually commit
 
-`.env` is the file everyone gitignores and then mails around anyway. gr commits it instead — sealed.
+`.env` is the file everyone gitignores and then mails around anyway. gr commits it instead, sealed.
 
 ```
-gr key new                # k new — your keypair, once per machine
-gr seal .env              # sl    — writes .env.sealed; .env becomes uncommittable
+gr key new                # k new  your keypair, once per machine
+gr seal .env              # sl     writes .env.sealed; .env becomes uncommittable
 gr save -m "add config"
 ```
 
@@ -87,7 +87,7 @@ DATABASE_URL=gr1:csEGYiVIFSnnLn4Q2oJv2TyekUkzChccyeVXlXtF3QQ8TrpS...
 STRIPE_KEY=gr1:HJh0CycJJ4ssQq3epof75ooeomALvzNQPGUo_5gAK3M6FNWS3U...
 ```
 
-Each value gets its own key derived from the variable's name and path, and the nonce comes from the plaintext — so an unchanged value re-seals to identical bytes and only real edits show up in a diff. The name and path are authenticated, so moving a `STRIPE_KEY` ciphertext onto the `DATABASE_URL` line fails to decrypt rather than quietly returning the wrong secret. What this reveals, in full: your variable names, how many there are, each value's length, and whether a value repeats at that same name. Nothing else.
+Each value gets its own key derived from the variable's name and path, and the nonce comes from the plaintext, so an unchanged value re-seals to identical bytes and only real edits show up in a diff. The name and path are authenticated, so moving a `STRIPE_KEY` ciphertext onto the `DATABASE_URL` line fails to decrypt rather than quietly returning the wrong secret. What this reveals, in full: your variable names, how many there are, each value's length, and whether a value repeats at that same name. Nothing else.
 
 Adding a teammate is a pull request, not an account:
 
@@ -97,7 +97,7 @@ gr key add dana gr1lPATx6VZ...    # you run this, then commit .grsealed
 gr unseal                         # they run this, and have .env
 ```
 
-The repo key is wrapped separately to each member with X25519 **and** ML-KEM-768 — an attacker has to break both, so values committed today stay sealed against a future quantum computer. `gr rotate` issues a new key and re-wraps it. It also tells you the part software cannot do: someone you removed still holds the old key and every commit they already cloned, so rotate the underlying credentials too.
+The repo key is wrapped separately to each member with X25519 **and** ML-KEM-768, so an attacker has to break both, so values committed today stay sealed against a future quantum computer. `gr rotate` issues a new key and re-wraps it. It also tells you the part software cannot do: someone you removed still holds the old key and every commit they already cloned, so rotate the underlying credentials too.
 
 ## Sharing without a service
 
@@ -107,24 +107,24 @@ gr share --base https://your-host --out ./share
 gr clone '<that url>' ./dir
 ```
 
-Every object is encrypted under a fresh key and stored under a blinded name. The key lives after the `#`, which by the URL spec is never sent in a request — so the host serves bytes it cannot read and its terms of service stop being a security question. Object contents are verified against their own hashes on arrival, so a hostile host cannot substitute anything either.
+Every object is encrypted under a fresh key and stored under a blinded name. The key lives after the `#`, which by the URL spec is never sent in a request, so the host serves bytes it cannot read and its terms of service stop being a security question. Object contents are verified against their own hashes on arrival, so a hostile host cannot substitute anything either.
 
 For no network at all, `gr bundle -o repo.grb` makes one sealed file; send the file and the key over different channels.
 
-For a person sitting next to you, there is no link at all — just three words:
+For a person sitting next to you, there is no link at all, just three words:
 
 ```
-gr send                     # snd — prints:  gr receive 40-bagel-guitar <dir>
+gr send                     # snd  prints:  gr receive 40-bagel-guitar <dir>
 gr receive 40-bagel-guitar ./their-copy      # rc
 ```
 
-The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline — which is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run the relay yourself with `gr rendezvous` (`gr rv`).
+The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline. that is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run the relay yourself with `gr rendezvous` (`gr rv`).
 
-The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not — without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
+The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not, without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
 
-Git interop deliberately has no share layer — GitHub sees your code so review works, and only your values stay sealed.
+Git interop deliberately has no share layer: GitHub sees your code so review works, and only your values stay sealed.
 
-Every command has a short alias — `gr st`, `gr d`, `gr sv`, `gr sl`, `gr rv`. Run `gr help` for the full table. Output is colored when stdout is a terminal and respects `NO_COLOR`.
+Every command has a short alias: `gr st`, `gr d`, `gr sv`, `gr sl`, `gr rv`. Run `gr help` for the full table. Output is colored when stdout is a terminal and respects `NO_COLOR`.
 
 ## Install
 

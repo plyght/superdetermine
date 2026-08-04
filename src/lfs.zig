@@ -1017,7 +1017,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         defer alloc.free(text);
         try ctx.work.writeFile(io, .{ .sub_path = ".gitattributes", .data = text });
         if (std.mem.eql(u8, sub, "track")) {
-            try w.print("tracking {s} — files matching it export to git as LFS pointers\n", .{pattern});
+            try w.print("tracking {s}: files matching it export to git as LFS pointers\n", .{pattern});
         } else {
             try w.print("stopped tracking {s}\n", .{pattern});
         }
@@ -1031,7 +1031,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         if (session.endpoint) |e| {
             try w.print("endpoint   {s}\n", .{e});
         } else {
-            try w.writeAll("endpoint   (none — no remote, or a local/file:// one)\n");
+            try w.writeAll("endpoint   (none: no remote, or a local/file:// one)\n");
         }
         try w.print("smudge     {s}  (lfs.smudge)\n", .{if (session.smudge) "on" else "off"});
         try w.print("upload     {s}  (lfs.upload)\n", .{if (session.uploads) "on" else "off"});
@@ -1051,7 +1051,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         defer attrs.deinit();
 
         if (attrs.rules.len == 0 and tracked.len == 0) {
-            try w.writeAll("nothing tracked by LFS — try `gr lfs track \"*.psd\"`\n");
+            try w.writeAll("nothing tracked by LFS. try `gr lfs track \"*.psd\"`\n");
             return;
         }
         if (std.mem.eql(u8, sub, "status")) {
@@ -1113,7 +1113,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
                 missing += 1;
             }
         }
-        try w.print("lfs fetch — {d} object(s) added to the cache", .{added});
+        try w.print("lfs fetch: {d} object(s) added to the cache", .{added});
         if (missing != 0) {
             try w.print(", {d} unavailable (no endpoint or not on the server)", .{missing});
         }
@@ -1125,7 +1125,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         var session = try Session.open(store, ctx.git_dir_abs, ctx.remote_url);
         defer session.deinit();
         if (session.endpoint == null) {
-            try w.writeAll("no LFS endpoint — set a remote, or `gr config lfs.url <endpoint>`\n");
+            try w.writeAll("no LFS endpoint. set a remote, or `gr config lfs.url <endpoint>`\n");
             return;
         }
         var reqs: std.ArrayList(Request) = .empty;
@@ -1153,7 +1153,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
             try w.print("lfs push failed: {s}\n", .{@errorName(e)});
             return;
         };
-        try w.print("lfs push — {d} object(s) uploaded, {d} already on the server\n", .{
+        try w.print("lfs push: {d} object(s) uploaded, {d} already on the server\n", .{
             sent,
             reqs.items.len - sent,
         });
