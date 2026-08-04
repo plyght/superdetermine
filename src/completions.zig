@@ -154,7 +154,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve lfs completions seal unseal key rotate share bundle send receive recv rendezvous version help"
+    \\  local commands="ab b bl blame bn br branch branches bundle cfg ci cl clone co comp completions config d desc diff export f fetch gc help import init k key l lfs log merge mg n new pl prov provenance ps pull push r rc receive recv redo relay rendezvous res resolve restore rev rot rotate rs rv save seal send serve sh share sl snap snapshot snd srv st status sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0

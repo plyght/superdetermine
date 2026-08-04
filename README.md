@@ -41,11 +41,11 @@ If gr turns out not to be for you, your git history is right there, untouched.
 
 ```
 gr init
-gr save -m "message"      # snapshot the working tree (no add, no stash)
-gr status | gr diff | gr log
-gr new feature            # branch and switch
-gr work ../agent-copy     # instant worktree
-gr undo   /   gr redo
+gr save -m "message"      # sv  — snapshot the working tree (no add, no stash)
+gr status | gr diff | gr log     # st | d | l
+gr new feature            # n   — branch and switch
+gr work ../agent-copy     # wt  — instant worktree
+gr undo   /   gr redo     # u   /  r
 gr blame file.txt         # per-line authorship + provenance
 gr absorb                 # fold edits into the changes they belong to
 gr gc                     # reclaim unreachable objects
@@ -75,8 +75,8 @@ On import, gr resolves LFS pointers to the real bytes (from `.git/lfs/objects`, 
 `.env` is the file everyone gitignores and then mails around anyway. gr commits it instead — sealed.
 
 ```
-gr key new                # your keypair, once per machine
-gr seal .env              # writes .env.sealed; .env itself becomes uncommittable
+gr key new                # k new — your keypair, once per machine
+gr seal .env              # sl    — writes .env.sealed; .env becomes uncommittable
 gr save -m "add config"
 ```
 
@@ -114,15 +114,17 @@ For no network at all, `gr bundle -o repo.grb` makes one sealed file; send the f
 For a person sitting next to you, there is no link at all — just three words:
 
 ```
-gr send                     # prints:  gr receive 40-bagel-guitar <dir>
-gr receive 40-bagel-guitar ./their-copy
+gr send                     # snd — prints:  gr receive 40-bagel-guitar <dir>
+gr receive 40-bagel-guitar ./their-copy      # rc
 ```
 
-The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline — which is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run the relay yourself with `gr rendezvous`.
+The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline — which is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run the relay yourself with `gr rendezvous` (`gr rv`).
 
 The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not — without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
 
 Git interop deliberately has no share layer — GitHub sees your code so review works, and only your values stay sealed.
+
+Every command has a short alias — `gr st`, `gr d`, `gr sv`, `gr sl`, `gr rv`. Run `gr help` for the full table. Output is colored when stdout is a terminal and respects `NO_COLOR`.
 
 ## Install
 

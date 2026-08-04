@@ -27,82 +27,214 @@ const seal = @import("seal.zig");
 const keyring = @import("keyring.zig");
 const share = @import("share.zig");
 const wormhole = @import("wormhole.zig");
+const ui = @import("ui.zig");
 
 const Oid = oid.Oid;
 const Store = store.Store;
 
 const version = "0.1.2";
 
-const usage =
-    \\gr — guardrail, a fast independent VCS built for humans and agents
-    \\
-    \\usage: gr <command> [args]
-    \\
-    \\the everyday loop
-    \\  save [-m msg]   checkpoint the working tree (--prompt records who/why)
-    \\  status | st     what changed since the last save
-    \\  diff            line-level diff of the working tree vs the last save
-    \\  log             the change history
-    \\  desc -m msg     name (or rename) the current change
-    \\
-    \\moving around
-    \\  new <name>      start a new branch off the current one and switch to it
-    \\  switch <name>   move to another branch (your work auto-saves first)
-    \\  branch          list branches
-    \\  work <dir>      instant copy-on-write worktree (great for agents)
-    \\
-    \\  restore <file>  discard local edits to one file (from last save)
-    \\  merge <branch>  merge another branch into the current one
-    \\  resolve <file>  mark a conflicted file resolved (--abort to bail out)
-    \\  revert [change] undo a change as a new change (default: the last one)
-    \\  absorb          fold working edits into the changes they belong to
-    \\  blame <file>    per-line authorship, incl. agent/prompt provenance
-    \\  provenance      show which agent/prompt produced each change (opt-in)
-    \\  why <file>      who last authored a file — human or which agent
-    \\
-    \\undo is never scary
-    \\  undo            revert the last change-making operation (whole repo)
-    \\  redo            reapply what you just undid
-    \\
-    \\distributed (no forced server — a peer is just a store)
-    \\  serve [port]    share this repo's objects over TCP (default 7777)
-    \\  fetch <src> [p] sparse-pull a branch (optionally only paths under p)
-    \\  watch           experimental: auto-save on every file change
-    \\
-    \\git, side by side
-    \\  clone <src> <dir>   clone a git repo, a share URL, or a bundle
-    \\  import <git-repo>   pull a git repo's HEAD into guardrail
-    \\  export <git-repo>   write guardrail HEAD out as git commits
-    \\  sync <dir>          mirror guardrail HEAD into the colocated .git
-    \\  lfs <cmd>           git-lfs interop (track, ls, fetch, push, env)
-    \\  push [remote] [branch] | pull [remote]   (remote defaults to origin)
-    \\
-    \\sharing without a service (the host stays blind)
-    \\  share           encrypt every object under a fresh key, print a link
-    \\  share serve <dir> [port]   host an exported share over HTTP
-    \\  bundle -o <f>   one sealed file; send file and key separately
-    \\  send            peer-to-peer via a spoken code; the relay stays blind
-    \\  receive <code> <dir>       pick up what someone sent you
-    \\  rendezvous [port]          run the relay yourself
-    \\
-    \\secrets you can actually commit
-    \\  seal <path>     seal a .env-style file; values become gr1: ciphertext
-    \\  unseal          write the plaintext back out (needs your key)
-    \\  key new | show | add <name> <pubkey> | remove <name> | list
-    \\  rotate          new repo key, re-wrapped to every member
-    \\
-    \\  init            create a guardrail repo here
-    \\  gc [--dry-run]  reclaim space from unreachable objects
-    \\  config [--global] <key> [value]   get/set config (identity, defaults)
-    \\  completions <fish|zsh|bash>       print shell completion script
-    \\  update [--nightly]   update gr to the latest release (or nightly build)
-    \\  version | help
-    \\
-    \\  (status and log accept --json for scripting)
-    \\
-;
+const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
+const Section = struct { title: []const u8, entries: []const Entry };
+
+const sections = [_]Section{
+    .{ .title = "the everyday loop", .entries = &.{
+        .{ .name = "save", .alias = "sv", .args = "[-m msg]", .desc = "checkpoint the working tree" },
+        .{ .name = "status", .alias = "st", .desc = "what changed since the last save" },
+        .{ .name = "diff", .alias = "d", .desc = "line-level diff vs the last save" },
+        .{ .name = "log", .alias = "l", .desc = "the change history" },
+        .{ .name = "describe", .alias = "desc", .args = "-m msg", .desc = "name or rename the current change" },
+    } },
+    .{ .title = "moving around", .entries = &.{
+        .{ .name = "new", .alias = "n", .args = "<name>", .desc = "branch off here and switch to it" },
+        .{ .name = "switch", .alias = "sw", .args = "<name>", .desc = "move to another branch (auto-saves)" },
+        .{ .name = "branch", .alias = "b", .desc = "list branches" },
+        .{ .name = "work", .alias = "wt", .args = "<dir>", .desc = "instant copy-on-write worktree" },
+        .{ .name = "restore", .alias = "rs", .args = "<file>", .desc = "discard local edits to one file" },
+        .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
+        .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
+        .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
+        .{ .name = "absorb", .alias = "ab", .desc = "fold edits into the changes they belong to" },
+    } },
+    .{ .title = "who wrote this", .entries = &.{
+        .{ .name = "blame", .alias = "bl", .args = "<file>", .desc = "per-line authorship, incl. agent/prompt" },
+        .{ .name = "provenance", .alias = "prov", .desc = "which agent/prompt produced each change" },
+        .{ .name = "why", .args = "<file>", .desc = "who last authored a file" },
+    } },
+    .{ .title = "undo is never scary", .entries = &.{
+        .{ .name = "undo", .alias = "u", .desc = "revert the last operation, whole repo" },
+        .{ .name = "redo", .alias = "r", .desc = "reapply what you just undid" },
+    } },
+    .{ .title = "secrets you can actually commit", .entries = &.{
+        .{ .name = "seal", .alias = "sl", .args = "<path>", .desc = "seal a .env-style file" },
+        .{ .name = "unseal", .alias = "us", .desc = "write the plaintext back out" },
+        .{ .name = "key", .alias = "k", .args = "<cmd>", .desc = "new | show | add | remove | list" },
+        .{ .name = "rotate", .alias = "rot", .desc = "new repo key, re-wrapped to every member" },
+    } },
+    .{ .title = "sharing without a service", .entries = &.{
+        .{ .name = "share", .alias = "sh", .desc = "encrypt every object, print a link" },
+        .{ .name = "bundle", .alias = "bn", .args = "-o <f>", .desc = "one sealed file" },
+        .{ .name = "send", .alias = "snd", .desc = "peer-to-peer via a spoken code" },
+        .{ .name = "receive", .alias = "rc", .args = "<code> <dir>", .desc = "pick up what someone sent you" },
+        .{ .name = "rendezvous", .alias = "rv", .desc = "run the relay yourself" },
+    } },
+    .{ .title = "distributed (no forced server)", .entries = &.{
+        .{ .name = "serve", .alias = "srv", .args = "[port]", .desc = "share this repo's objects over TCP" },
+        .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
+        .{ .name = "watch", .desc = "experimental: auto-save on every change" },
+    } },
+    .{ .title = "git, side by side", .entries = &.{
+        .{ .name = "clone", .alias = "cl", .args = "<src> <dir>", .desc = "a git repo, a share URL, or a bundle" },
+        .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into guardrail" },
+        .{ .name = "export", .args = "<repo>", .desc = "write guardrail HEAD out as git commits" },
+        .{ .name = "sync", .args = "<dir>", .desc = "mirror HEAD into the colocated .git" },
+        .{ .name = "push", .alias = "ps", .desc = "uses your existing git credentials" },
+        .{ .name = "pull", .alias = "pl", .desc = "fetch and merge from a git remote" },
+        .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
+    } },
+    .{ .title = "housekeeping", .entries = &.{
+        .{ .name = "init", .desc = "create a guardrail repo here" },
+        .{ .name = "gc", .args = "[--dry-run]", .desc = "reclaim unreachable objects" },
+        .{ .name = "config", .alias = "cfg", .args = "<key> [val]", .desc = "identity and defaults" },
+        .{ .name = "completions", .alias = "comp", .args = "<shell>", .desc = "fish | zsh | bash" },
+        .{ .name = "update", .desc = "update gr (--nightly for the latest build)" },
+        .{ .name = "version", .desc = "" },
+    } },
+};
+
+fn printUsage(w: *std.Io.Writer) !void {
+    try w.print("{s}gr{s} {s}— guardrail, a fast independent VCS built for humans and agents{s}\n\n", .{
+        ui.on(.bold), ui.off(), ui.on(.dim), ui.off(),
+    });
+    try w.print("  {s}usage:{s} gr <command> [args]\n", .{ ui.on(.dim), ui.off() });
+
+    for (sections) |section| {
+        try w.print("\n  {s}{s}{s}\n", .{ ui.on(.bold), section.title, ui.off() });
+        for (section.entries) |e| {
+            try w.print("    {s}{s}{s}", .{ ui.on(.cyan), e.name, ui.off() });
+            var used = e.name.len;
+            if (e.args.len != 0) {
+                try w.print(" {s}{s}{s}", .{ ui.on(.dim), e.args, ui.off() });
+                used += 1 + e.args.len;
+            }
+            try padTo(w, used, 26);
+            if (e.alias.len != 0) {
+                try w.print("{s}{s}{s}", .{ ui.on(.magenta), e.alias, ui.off() });
+                try padTo(w, e.alias.len, 6);
+            } else {
+                try padTo(w, 0, 6);
+            }
+            try w.print("{s}\n", .{e.desc});
+        }
+    }
+    try w.print("\n  {s}status and log take --json. NO_COLOR is respected.{s}\n", .{ ui.on(.dim), ui.off() });
+}
+
+fn padTo(w: *std.Io.Writer, used: usize, target: usize) !void {
+    try w.splatByteAll(' ', if (used >= target) 1 else target - used);
+}
 
 const default_author = "you <you@localhost>";
+
+const Alias = struct { short: []const u8, full: []const u8 };
+
+const aliases = [_]Alias{
+    .{ .short = "sv", .full = "save" },
+    .{ .short = "snapshot", .full = "save" },
+    .{ .short = "snap", .full = "save" },
+    .{ .short = "ci", .full = "save" },
+    .{ .short = "st", .full = "status" },
+    .{ .short = "d", .full = "diff" },
+    .{ .short = "l", .full = "log" },
+    .{ .short = "desc", .full = "describe" },
+    .{ .short = "b", .full = "branch" },
+    .{ .short = "br", .full = "branch" },
+    .{ .short = "branches", .full = "branch" },
+    .{ .short = "n", .full = "new" },
+    .{ .short = "sw", .full = "switch" },
+    .{ .short = "co", .full = "switch" },
+    .{ .short = "wt", .full = "work" },
+    .{ .short = "rs", .full = "restore" },
+    .{ .short = "mg", .full = "merge" },
+    .{ .short = "res", .full = "resolve" },
+    .{ .short = "rev", .full = "revert" },
+    .{ .short = "ab", .full = "absorb" },
+    .{ .short = "bl", .full = "blame" },
+    .{ .short = "prov", .full = "provenance" },
+    .{ .short = "u", .full = "undo" },
+    .{ .short = "r", .full = "redo" },
+    .{ .short = "srv", .full = "serve" },
+    .{ .short = "f", .full = "fetch" },
+    .{ .short = "cl", .full = "clone" },
+    .{ .short = "ps", .full = "push" },
+    .{ .short = "pl", .full = "pull" },
+    .{ .short = "cfg", .full = "config" },
+    .{ .short = "comp", .full = "completions" },
+    .{ .short = "sl", .full = "seal" },
+    .{ .short = "us", .full = "unseal" },
+    .{ .short = "k", .full = "key" },
+    .{ .short = "rot", .full = "rotate" },
+    .{ .short = "sh", .full = "share" },
+    .{ .short = "bn", .full = "bundle" },
+    .{ .short = "snd", .full = "send" },
+    .{ .short = "rc", .full = "receive" },
+    .{ .short = "recv", .full = "receive" },
+    .{ .short = "rv", .full = "rendezvous" },
+    .{ .short = "relay", .full = "rendezvous" },
+    .{ .short = "upgrade", .full = "update" },
+    .{ .short = "-h", .full = "help" },
+    .{ .short = "--help", .full = "help" },
+    .{ .short = "--version", .full = "version" },
+};
+
+fn editDistance(a: []const u8, b: []const u8) usize {
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+    if (a.len > 64 or b.len > 64) return std.math.maxInt(usize);
+
+    var prev: [65]usize = undefined;
+    var cur: [65]usize = undefined;
+    for (0..b.len + 1) |j| prev[j] = j;
+
+    for (a, 0..) |ca, i| {
+        cur[0] = i + 1;
+        for (b, 0..) |cb, j| {
+            const cost: usize = if (ca == cb) 0 else 1;
+            cur[j + 1] = @min(@min(cur[j] + 1, prev[j + 1] + 1), prev[j] + cost);
+        }
+        @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+    }
+    return prev[b.len];
+}
+
+fn nearestCommand(cmd: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_score: usize = 3;
+    for (sections) |section| {
+        for (section.entries) |e| {
+            const d = editDistance(cmd, e.name);
+            if (d < best_score) {
+                best_score = d;
+                best = e.name;
+            }
+        }
+    }
+    for (aliases) |a| {
+        const d = editDistance(cmd, a.short);
+        if (d < best_score) {
+            best_score = d;
+            best = a.full;
+        }
+    }
+    return best;
+}
+
+fn canonical(cmd: []const u8) []const u8 {
+    for (aliases) |a| {
+        if (eq(cmd, a.short)) return a.full;
+    }
+    return cmd;
+}
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -118,43 +250,44 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buf: [8192]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
+    ui.init(io, std.Io.File.stdout());
     defer w.flush() catch {};
 
     if (args.len < 2) {
-        try w.writeAll(usage);
+        try printUsage(w);
         return;
     }
 
-    const cmd = args[1];
+    const cmd = canonical(args[1]);
     const rest = args[2..];
 
-    if (eq(cmd, "version") or eq(cmd, "--version")) {
+    if (eq(cmd, "version")) {
         try w.print("gr {s}\n", .{version});
-    } else if (eq(cmd, "update") or eq(cmd, "upgrade")) {
+    } else if (eq(cmd, "update")) {
         var nightly = false;
         for (rest) |a| {
             if (eq(a, "--nightly")) nightly = true;
         }
         try update.run(io, alloc, w, version, nightly);
-    } else if (eq(cmd, "help") or eq(cmd, "-h") or eq(cmd, "--help")) {
-        try w.writeAll(usage);
+    } else if (eq(cmd, "help")) {
+        try printUsage(w);
     } else if (eq(cmd, "init")) {
         try cmdInit(io, alloc, w);
-    } else if (eq(cmd, "save") or eq(cmd, "snapshot") or eq(cmd, "snap")) {
+    } else if (eq(cmd, "save")) {
         try cmdSave(io, alloc, w, rest);
-    } else if (eq(cmd, "describe") or eq(cmd, "desc")) {
+    } else if (eq(cmd, "describe")) {
         try cmdDescribe(io, alloc, w, rest);
-    } else if (eq(cmd, "status") or eq(cmd, "st")) {
+    } else if (eq(cmd, "status")) {
         try cmdStatus(io, alloc, w, rest);
     } else if (eq(cmd, "diff")) {
         try cmdDiff(io, alloc, w);
     } else if (eq(cmd, "log")) {
         try cmdLog(io, alloc, w, rest);
-    } else if (eq(cmd, "branch") or eq(cmd, "branches")) {
+    } else if (eq(cmd, "branch")) {
         try cmdBranch(io, alloc, w);
     } else if (eq(cmd, "new")) {
         try cmdNew(io, alloc, w, rest);
-    } else if (eq(cmd, "switch") or eq(cmd, "sw")) {
+    } else if (eq(cmd, "switch")) {
         try cmdSwitch(io, alloc, w, rest);
     } else if (eq(cmd, "work")) {
         try cmdWork(io, alloc, w, rest);
@@ -218,13 +351,18 @@ pub fn main(init: std.process.Init) !void {
         try cmdBundle(io, alloc, w, rest);
     } else if (eq(cmd, "send")) {
         try cmdSend(io, alloc, w, rest);
-    } else if (eq(cmd, "receive") or eq(cmd, "recv")) {
+    } else if (eq(cmd, "receive")) {
         try cmdReceive(io, alloc, w, rest);
     } else if (eq(cmd, "rendezvous")) {
         try cmdRendezvous(io, alloc, w, rest);
     } else {
-        try w.print("unknown command: {s}\n\n", .{cmd});
-        try w.writeAll(usage);
+        try w.print("{s}{s}{s} unknown command: {s}{s}{s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), cmd, ui.off(),
+        });
+        if (nearestCommand(cmd)) |guess| {
+            try w.print("  did you mean {s}gr {s}{s}?\n", .{ ui.on(.cyan), guess, ui.off() });
+        }
+        try w.print("{s}run `gr help` for the full list{s}\n", .{ ui.on(.dim), ui.off() });
     }
 }
 
@@ -283,7 +421,8 @@ fn openWork(io: std.Io) !std.Io.Dir {
 
 fn openRepo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?Store {
     return Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
-        try w.writeAll("not a guardrail repo (run `gr init`)\n");
+        try w.print("{s}{s}{s} not a guardrail repo\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "run `gr init` here, or cd into a repo");
         return null;
     };
 }
@@ -305,7 +444,9 @@ fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     defer alloc.free(db);
     s.setHeadBranch(db) catch {};
     s.deinit();
-    try w.print("initialized empty guardrail repo in .gr (branch {s})\n", .{db});
+    try w.print("{s}{s}{s} initialized empty guardrail repo in {s}.gr{s} on {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.dim), ui.off(), ui.on(.cyan), db, ui.off(),
+    });
 }
 
 fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -579,7 +720,11 @@ fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const branch = try s.headBranch();
     defer alloc.free(branch);
     var buf: [Oid.len * 2]u8 = undefined;
-    try w.print("saved {s} on {s}\n", .{ shortHex(change, &buf), branch });
+    try w.print("{s}{s}{s} saved {s}{s}{s} on {s}{s}{s}\n", .{
+        ui.on(.green),  ui.check,               ui.off(),
+        ui.on(.yellow), shortHex(change, &buf), ui.off(),
+        ui.on(.cyan),   branch,                 ui.off(),
+    });
 }
 
 // Snapshot the working tree and log the op. Shared by save and auto-save.
@@ -707,22 +852,37 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     }
 
     if (conflicts.len != 0) {
-        try w.print("merge in progress — {d} unresolved conflict(s):\n", .{conflicts.len});
-        for (conflicts) |p| try w.print("  ! {s}\n", .{p});
-        try w.writeAll("fix the markers then `gr resolve <file>`, or `gr resolve --abort`\n");
+        try w.print("{s}{s} merge in progress — {d} unresolved conflict(s){s}\n", .{
+            ui.on(.red), ui.warn, conflicts.len, ui.off(),
+        });
+        for (conflicts) |p| try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.red), ui.warn, ui.off(), p });
+        try ui.hint(w, "fix the markers then `gr resolve <file>`, or `gr resolve --abort`");
     }
     if (entries.len == 0) {
-        if (conflicts.len == 0) try w.writeAll("clean — nothing to save\n");
+        if (conflicts.len == 0) {
+            try w.print("{s}{s}{s} clean — nothing to save\n", .{ ui.on(.green), ui.check, ui.off() });
+        }
         return;
     }
+    var added: usize = 0;
+    var modified: usize = 0;
+    var deleted: usize = 0;
     for (entries) |e| {
-        const tag = switch (e.kind) {
-            .added => "new",
-            .modified => "mod",
-            .deleted => "del",
+        const symbol, const color = switch (e.kind) {
+            .added => .{ "+", ui.Color.green },
+            .modified => .{ "~", ui.Color.yellow },
+            .deleted => .{ "-", ui.Color.red },
         };
-        try w.print("  {s}  {s}\n", .{ tag, e.path });
+        switch (e.kind) {
+            .added => added += 1,
+            .modified => modified += 1,
+            .deleted => deleted += 1,
+        }
+        try w.print("  {s}{s}{s}  {s}\n", .{ ui.on(color), symbol, ui.off(), e.path });
     }
+    try w.print("\n{s}{d} added · {d} modified · {d} deleted{s}\n", .{
+        ui.on(.dim), added, modified, deleted, ui.off(),
+    });
 }
 
 fn cmdDiff(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -754,7 +914,7 @@ fn cmdDiff(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         alloc.free(entries);
     }
     if (entries.len == 0) {
-        try w.writeAll("no changes\n");
+        try w.print("{s}{s}{s} no changes\n", .{ ui.on(.green), ui.check, ui.off() });
         return;
     }
 
@@ -800,6 +960,7 @@ fn cmdLog(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         return;
     };
     if (json) try w.writeByte('[');
+    var first_change = true;
     var first = true;
     while (!cur.isZero()) {
         const change = try s.readChange(cur);
@@ -823,12 +984,25 @@ fn cmdLog(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             }
             try w.writeByte('}');
         } else {
-            const msg = if (change.message.len == 0) "(no message)" else change.message;
-            try w.print("{s}  {s}\n    {s}\n", .{ shortHex(cur, &buf), change.author, msg });
+            const full = if (change.message.len == 0) "(no message)" else change.message;
+            const nl = std.mem.indexOfScalar(u8, full, '\n');
+            const msg = if (nl) |k| full[0..k] else full;
+            if (!first_change) try w.writeByte('\n');
+            first_change = false;
+            try w.print("{s}{s}{s} {s}{s}{s}  {s}{s}{s}\n", .{
+                ui.on(.yellow), ui.branch_mark,      ui.off(),
+                ui.on(.yellow), shortHex(cur, &buf), ui.off(),
+                ui.on(.bold),   msg,                 ui.off(),
+            });
+            try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), change.author, ui.off() });
             if (try provenance.get(&s, alloc, cur)) |p| {
                 defer provenance.freeEntry(alloc, p);
-                if (p.agent.len != 0) try w.print("    ↳ agent: {s}\n", .{p.agent});
-                if (p.prompt.len != 0) try w.print("    ↳ prompt: {s}\n", .{p.prompt});
+                if (p.agent.len != 0) {
+                    try w.print("  {s}{s} agent: {s}{s}\n", .{ ui.on(.magenta), ui.arrow, p.agent, ui.off() });
+                }
+                if (p.prompt.len != 0) {
+                    try w.print("  {s}{s} prompt: {s}{s}\n", .{ ui.on(.dim), ui.arrow, p.prompt, ui.off() });
+                }
             }
         }
         if (change.parents.len == 0) break;
@@ -848,12 +1022,17 @@ fn cmdBranch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         alloc.free(names);
     }
     if (names.len == 0) {
-        try w.print("* {s} (unborn)\n", .{cur});
+        try w.print("{s}{s} {s}{s} {s}(unborn){s}\n", .{
+            ui.on(.cyan), ui.branch_mark, cur, ui.off(), ui.on(.dim), ui.off(),
+        });
         return;
     }
     for (names) |n| {
-        const mark: []const u8 = if (eq(n, cur)) "*" else " ";
-        try w.print("{s} {s}\n", .{ mark, n });
+        if (eq(n, cur)) {
+            try w.print("{s}{s} {s}{s}\n", .{ ui.on(.cyan), ui.branch_mark, n, ui.off() });
+        } else {
+            try w.print("{s}{s}{s} {s}\n", .{ ui.on(.dim), ui.bullet, ui.off(), n });
+        }
     }
 }
 
@@ -1322,7 +1501,9 @@ fn cmdShare(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     const url = try share.encodeUrl(alloc, base, key);
     defer alloc.free(url);
 
-    try w.print("wrote encrypted objects to {s}/\n\n{s}\n\n", .{ out_dir, url });
+    try w.print("{s}{s}{s} wrote encrypted objects to {s}{s}/{s}\n\n  {s}{s}{s}\n\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), out_dir, ui.off(), ui.on(.bold), url, ui.off(),
+    });
     try w.writeAll("upload that directory anywhere static. the host never receives the key —\n");
     try w.writeAll("it lives after the '#', which browsers and gr never put in a request.\n");
     try w.print("sealed values stay sealed: whoever opens this gets the code, not the secrets.\n", .{});
@@ -1358,7 +1539,10 @@ fn cmdBundle(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     defer alloc.free(url);
     const frag = std.mem.indexOf(u8, url, "#k=") orelse url.len;
 
-    try w.print("wrote {s}\n\nkey: {s}\n\n", .{ path, url[frag..] });
+    try w.print("{s}{s}{s} wrote {s}{s}{s}\n\n  {s}key{s}  {s}{s}{s}\n\n", .{
+        ui.on(.green), ui.check, ui.off(),     ui.on(.cyan), path,     ui.off(),
+        ui.on(.dim),   ui.off(), ui.on(.bold), url[frag..],  ui.off(),
+    });
     try w.print("open it with:  gr clone '{s}{s}' <dir>\n", .{ path, url[frag..] });
     try w.writeAll("send the file and the key over different channels — either alone is useless.\n");
 }
@@ -1394,14 +1578,18 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const code = try wormhole.generateCode(io, alloc);
     defer alloc.free(code);
 
-    try w.print("on the other machine, run:\n\n  gr receive {s} <dir>\n\n", .{code});
+    try w.print("on the other machine, run:\n\n  gr receive {s}{s}{s} <dir>\n\n", .{
+        ui.on(.bold), code, ui.off(),
+    });
     try w.writeAll("say those words out loud — do not paste them anywhere the code could be logged.\n");
     try w.print("waiting for a peer via {s}:{d} ...\n", .{ host, port });
     try w.flush();
 
     const conn = wormhole.Conn.open(io, alloc, host, port) catch {
-        try w.print("\ncannot reach a rendezvous at {s}:{d}\n", .{ host, port });
-        try w.writeAll("start one with `gr rendezvous`, or point at another with --relay host:port\n");
+        try w.print("\n{s}{s}{s} cannot reach a rendezvous at {s}{s}:{d}{s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), host, port, ui.off(),
+        });
+        try ui.hint(w, "start one with `gr rv`, or point at another with --relay host:port");
         return;
     };
     defer conn.destroy();
@@ -1419,7 +1607,9 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     defer alloc.free(payload);
 
     try session.sendStream(io, alloc, conn.channel(), payload);
-    try w.print("sent {d} bytes. the relay saw ciphertext and nothing else.\n", .{payload.len});
+    try w.print("{s}{s}{s} sent {d} bytes. the relay saw ciphertext and nothing else.\n", .{
+        ui.on(.green), ui.check, ui.off(), payload.len,
+    });
 }
 
 fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1444,8 +1634,10 @@ fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     defer s.deinit();
 
     const conn = wormhole.Conn.open(io, alloc, host, port) catch {
-        try w.print("cannot reach a rendezvous at {s}:{d}\n", .{ host, port });
-        try w.writeAll("start one with `gr rendezvous`, or point at another with --relay host:port\n");
+        try w.print("{s}{s}{s} cannot reach a rendezvous at {s}{s}:{d}{s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), host, port, ui.off(),
+        });
+        try ui.hint(w, "start one with `gr rv`, or point at another with --relay host:port");
         return;
     };
     defer conn.destroy();
@@ -1474,14 +1666,16 @@ fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
         defer object.freeChange(alloc, change);
         try workspace.materialize(&s, change.tree, dest);
     }
-    try w.print("received into {s}\n", .{into});
+    try w.print("{s}{s}{s} received into {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+    });
     try w.writeAll("any sealed values are still sealed — the code moved the code, not the secrets.\n");
 }
 
 fn reportHandshake(w: *std.Io.Writer, e: anyerror) !void {
     switch (e) {
         wormhole.Error.ConfirmationFailed => {
-            try w.writeAll("the codes do not match — nothing was transferred.\n");
+            try w.print("{s}{s}{s} the codes do not match — nothing was transferred.\n", .{ ui.on(.red), ui.cross, ui.off() });
             try w.writeAll("check the words, or start over: a wrong guess costs the sender a try.\n");
         },
         wormhole.Error.SlotBurned => {
@@ -1557,7 +1751,9 @@ fn cloneShare(
         defer object.freeChange(alloc, change);
         try workspace.materialize(&s, change.tree, dest);
     }
-    try w.print("cloned into {s}\n", .{into});
+    try w.print("{s}{s}{s} cloned into {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+    });
     try w.writeAll("any sealed values are still sealed — `gr unseal` needs a key you were not given.\n");
 }
 
@@ -1600,7 +1796,7 @@ fn loadRepoManifest(
 
 fn requireIdentity(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?seal.Identity {
     return (try keyring.loadIdentity(io, alloc)) orelse {
-        try w.writeAll("no keypair yet — run `gr key new`\n");
+        try w.print("{s}{s}{s} no keypair yet — run {s}gr key new{s}\n", .{ ui.on(.red), ui.cross, ui.off(), ui.on(.cyan), ui.off() });
         return null;
     };
 }
@@ -1644,7 +1840,11 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             const fp = try m.public.fingerprint(alloc);
             defer alloc.free(fp);
             const is_me = if (mine) |p| std.mem.eql(u8, &p.x, &m.public.x) else false;
-            try w.print("{s}  {s}{s}\n", .{ m.name, fp, if (is_me) "  (you)" else "" });
+            const mark = if (is_me) ui.branch_mark else ui.bullet;
+            const mark_color: ui.Color = if (is_me) .cyan else .dim;
+            try w.print("{s}{s}{s} {s}", .{ ui.on(mark_color), mark, ui.off(), m.name });
+            try ui.pad(w, m.name, 14);
+            try w.print("{s}{s}{s}{s}\n", .{ ui.on(.magenta), fp, ui.off(), if (is_me) "  (you)" else "" });
         }
         return;
     }
@@ -1676,9 +1876,9 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
 
         const fp = try public.fingerprint(alloc);
         defer alloc.free(fp);
-        try w.print("{s} can now read the sealed values\n", .{name});
-        try w.print("  fingerprint  {s}\n", .{fp});
-        try w.print("confirm that out loud with them, then commit {s}\n", .{seal.manifest_name});
+        try w.print("{s}{s}{s} {s} can now read the sealed values\n", .{ ui.on(.green), ui.check, ui.off(), name });
+        try w.print("  {s}fingerprint{s}  {s}{s}{s}\n", .{ ui.on(.dim), ui.off(), ui.on(.magenta), fp, ui.off() });
+        try w.print("{s}confirm that out loud with them, then commit {s}{s}\n", .{ ui.on(.dim), seal.manifest_name, ui.off() });
         return;
     }
 
@@ -1711,7 +1911,9 @@ fn printPublicKey(
     defer alloc.free(enc);
     const fp = try public.fingerprint(alloc);
     defer alloc.free(fp);
-    try w.print("{s}\n\n{s}\n\nfingerprint  {s}\n", .{ label, enc, fp });
+    try w.print("{s}{s}{s}\n\n{s}\n\n  {s}fingerprint{s}  {s}{s}{s}\n", .{
+        ui.on(.bold), label, ui.off(), enc, ui.on(.dim), ui.off(), ui.on(.magenta), fp, ui.off(),
+    });
 }
 
 fn pathInHistory(alloc: std.mem.Allocator, s: *Store, path: []const u8) !bool {
@@ -1752,7 +1954,13 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             const sealed = try seal.sealedPathAlloc(alloc, p);
             defer alloc.free(sealed);
             const present = if (work.access(io, p, .{})) |_| true else |_| false;
-            try w.print("{s} -> {s}{s}\n", .{ p, sealed, if (present) "" else "  (no local plaintext)" });
+            try w.print("  {s}{s}{s} {s} {s}{s}{s} {s}{s}{s}\n", .{
+                ui.on(if (present) .green else .yellow), if (present) ui.check else ui.warn, ui.off(),
+                p,                                       ui.on(.dim),                        ui.arrow,
+                ui.off(),                                ui.on(.cyan),                       sealed,
+                ui.off(),
+            });
+            if (!present) try ui.hint(w, "      no local plaintext — run `gr unseal`");
         }
         try w.print("{d} member(s) can read these values\n", .{manifest.members.items.len});
         const key = try keyring.repoKey(io, alloc, &manifest);
@@ -1786,7 +1994,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             try manifest.putMember(io, fresh, name, id.publicId());
             break :blk fresh;
         } else (try keyring.repoKey(io, alloc, &manifest)) orelse {
-            try w.writeAll("you cannot read this repo's secrets — ask a member to `gr key add` you\n");
+            try w.print("{s}{s}{s} you cannot read this repo's secrets — ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
             return;
         };
         _ = key;
@@ -1816,13 +2024,20 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         return;
     }
     if (!plan.have_key) {
-        try w.writeAll("you cannot read this repo's secrets — ask a member to `gr key add` you\n");
+        try w.print("{s}{s}{s} you cannot read this repo's secrets — ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
         return;
     }
     for (plan.sources, plan.outputs) |src, dst| {
-        try w.print("{s} -> {s}\n", .{ src, dst });
+        try w.print("  {s}{s}{s} {s} {s}{s}{s} {s}{s}{s}\n", .{
+            ui.on(.green), ui.check,     ui.off(),
+            src,           ui.on(.dim),  ui.arrow,
+            ui.off(),      ui.on(.cyan), dst,
+            ui.off(),
+        });
     }
-    try w.print("commit {s} and the sealed file; the plaintext stays out of every change\n", .{seal.manifest_name});
+    try w.print("\n{s}commit {s} and the sealed file; the plaintext stays out of every change{s}\n", .{
+        ui.on(.dim), seal.manifest_name, ui.off(),
+    });
 }
 
 fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -1835,7 +2050,7 @@ fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
             return;
         },
         seal.Error.NotAMember => {
-            try w.writeAll("you cannot read this repo's secrets — ask a member to `gr key add` you\n");
+            try w.print("{s}{s}{s} you cannot read this repo's secrets — ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
             try w.writeAll("(`gr key show` prints the public key they need)\n");
             return;
         },
@@ -1845,7 +2060,7 @@ fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         },
         else => return e,
     };
-    try w.print("wrote {d} file(s)", .{out.written});
+    try w.print("{s}{s}{s} wrote {d} file(s)", .{ ui.on(.green), ui.check, ui.off(), out.written });
     if (out.skipped != 0) try w.print(", skipped {d} with no sealed form", .{out.skipped});
     try w.writeAll("\n");
 }
@@ -1891,7 +2106,9 @@ fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         try work.writeFile(io, .{ .sub_path = dst, .data = sealed });
     }
 
-    try w.print("rotated the repo key, re-wrapped to {d} member(s)\n", .{manifest.members.items.len});
+    try w.print("{s}{s}{s} rotated the repo key, re-wrapped to {d} member(s)\n", .{
+        ui.on(.green), ui.check, ui.off(), manifest.members.items.len,
+    });
     try w.writeAll("anyone removed earlier still holds the OLD key and any commit they cloned.\n");
     try w.writeAll("rotate the secrets themselves too — new password, new API key — or they keep working.\n");
 }
@@ -1902,6 +2119,7 @@ test {
     _ = keyring;
     _ = share;
     _ = wormhole;
+    _ = ui;
     _ = oid;
     _ = cdc;
     _ = object;

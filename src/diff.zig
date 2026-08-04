@@ -1,4 +1,5 @@
 const std = @import("std");
+const ui = @import("ui.zig");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const store_mod = @import("store.zig");
@@ -96,8 +97,8 @@ pub fn diffLines(alloc: std.mem.Allocator, old: []const u8, new: []const u8) ![]
 /// beyond 3 lines are collapsed, and each surviving change group gets an
 /// `@@ -oldstart,oldcount +newstart,newcount @@` header.
 pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !void {
-    try w.print("--- a/{s}\n", .{path});
-    try w.print("+++ b/{s}\n", .{path});
+    try w.print("{s}--- a/{s}{s}\n", .{ ui.on(.bold), path, ui.off() });
+    try w.print("{s}+++ b/{s}{s}\n", .{ ui.on(.bold), path, ui.off() });
 
     const context = 3;
     // Mark which ops belong to a hunk (a change, or context within `context`
@@ -147,7 +148,7 @@ pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !v
         }
         const old_start = if (old_count == 0) old_line - 1 else old_line;
         const new_start = if (new_count == 0) new_line - 1 else new_line;
-        try w.print("@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_count, new_start, new_count });
+        try w.print("{s}@@ -{d},{d} +{d},{d} @@{s}\n", .{ ui.on(.cyan), old_start, old_count, new_start, new_count, ui.off() });
         var h = start;
         while (h < end) : (h += 1) {
             const op = ops[h];
@@ -158,11 +159,11 @@ pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !v
                     new_line += 1;
                 },
                 .del => {
-                    try w.print("-{s}\n", .{op.text});
+                    try w.print("{s}-{s}{s}\n", .{ ui.on(.red), op.text, ui.off() });
                     old_line += 1;
                 },
                 .add => {
-                    try w.print("+{s}\n", .{op.text});
+                    try w.print("{s}+{s}{s}\n", .{ ui.on(.green), op.text, ui.off() });
                     new_line += 1;
                 },
             }
