@@ -565,15 +565,6 @@ pub fn join(ch: Channel, code: []const u8) !void {
     try joinSlot(ch, parsed.slot);
 }
 
-fn replyStatus(io: std.Io, stream: net.Stream, ok: bool) void {
-    var wbuf: [16]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    var rbuf: [1]u8 = undefined;
-    var sr = stream.reader(io, &rbuf);
-    const ch: Channel = .{ .r = &sr.interface, .w = &sw.interface };
-    writeFrame(ch, &[_]u8{@intFromBool(!ok)}) catch {};
-}
-
 const Pump = struct {
     io: std.Io,
     from: net.Stream,

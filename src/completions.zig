@@ -57,6 +57,9 @@ const fish_script =
     \\complete -c gr -n __fish_use_subcommand -a rotate -d 'new repo key, re-wrapped to members'
     \\complete -c gr -n __fish_use_subcommand -a share -d 'encrypted share the host cannot read'
     \\complete -c gr -n __fish_use_subcommand -a bundle -d 'one sealed file'
+    \\complete -c gr -n __fish_use_subcommand -a send -d 'peer-to-peer transfer via a spoken code'
+    \\complete -c gr -n __fish_use_subcommand -a receive -d 'pick up what someone sent you'
+    \\complete -c gr -n __fish_use_subcommand -a rendezvous -d 'run the wormhole relay'
     \\complete -c gr -n __fish_use_subcommand -a watch -d 'auto-save on every file change'
     \\complete -c gr -n __fish_use_subcommand -a clone -d 'clone a git repo into guardrail'
     \\complete -c gr -n __fish_use_subcommand -a import -d "pull a git repo's HEAD into guardrail"
@@ -113,6 +116,9 @@ const zsh_script =
     \\    'rotate:new repo key, re-wrapped to members'
     \\    'share:encrypted share the host cannot read'
     \\    'bundle:one sealed file'
+    \\    'send:peer-to-peer transfer via a spoken code'
+    \\    'receive:pick up what someone sent you'
+    \\    'rendezvous:run the wormhole relay'
     \\    'watch:auto-save on every file change'
     \\    'clone:clone a git repo into guardrail'
     \\    'import:pull a git repo HEAD into guardrail'
@@ -148,7 +154,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve lfs completions seal unseal key rotate share bundle version help"
+    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve lfs completions seal unseal key rotate share bundle send receive recv rendezvous version help"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0

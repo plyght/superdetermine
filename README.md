@@ -111,6 +111,15 @@ Every object is encrypted under a fresh key and stored under a blinded name. The
 
 For no network at all, `gr bundle -o repo.grb` makes one sealed file; send the file and the key over different channels.
 
+For a person sitting next to you, there is no link at all — just three words:
+
+```
+gr send                     # prints:  gr receive 40-bagel-guitar <dir>
+gr receive 40-bagel-guitar ./their-copy
+```
+
+The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline — which is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run the relay yourself with `gr rendezvous`.
+
 The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not — without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
 
 Git interop deliberately has no share layer — GitHub sees your code so review works, and only your values stay sealed.
