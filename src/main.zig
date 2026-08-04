@@ -28,6 +28,8 @@ const keyring = @import("keyring.zig");
 const share = @import("share.zig");
 const wormhole = @import("wormhole.zig");
 const ui = @import("ui.zig");
+const discovery = @import("discovery.zig");
+const ipnet = std.Io.net;
 
 const Oid = oid.Oid;
 const Store = store.Store;
@@ -71,15 +73,16 @@ const sections = [_]Section{
         .{ .name = "key", .alias = "k", .args = "<cmd>", .desc = "new | show | add | remove | list" },
         .{ .name = "rotate", .alias = "rot", .desc = "new repo key, re-wrapped to every member" },
     } },
-    .{ .title = "sharing without a service", .entries = &.{
-        .{ .name = "share", .alias = "sh", .desc = "encrypt every object, print a link" },
-        .{ .name = "bundle", .alias = "bn", .args = "-o <f>", .desc = "one sealed file" },
-        .{ .name = "send", .alias = "snd", .desc = "peer-to-peer via a spoken code" },
-        .{ .name = "receive", .alias = "rc", .args = "<code> <dir>", .desc = "pick up what someone sent you" },
-        .{ .name = "rendezvous", .alias = "rv", .desc = "run the relay yourself" },
+    .{ .title = "handing a repo to someone", .entries = &.{
+        .{ .name = "send", .alias = "snd", .desc = "peer-to-peer on this network, via a code" },
+        .{ .name = "send --file", .args = "<f>", .desc = "one sealed file, no network at all" },
+        .{ .name = "send --link", .args = "<dir>", .desc = "static files you upload anywhere" },
+        .{ .name = "get", .alias = "g", .args = "<code|url|file>", .desc = "the other side of all three" },
+        .{ .name = "relay", .alias = "rv", .desc = "run a meeting point for internet transfers" },
     } },
     .{ .title = "distributed (no forced server)", .entries = &.{
         .{ .name = "serve", .alias = "srv", .args = "[port]", .desc = "share this repo's objects over TCP" },
+        .{ .name = "serve --link", .args = "<dir>", .desc = "host a `send --link` export over HTTP" },
         .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
         .{ .name = "watch", .desc = "experimental: auto-save on every change" },
     } },
@@ -174,13 +177,15 @@ const aliases = [_]Alias{
     .{ .short = "us", .full = "unseal" },
     .{ .short = "k", .full = "key" },
     .{ .short = "rot", .full = "rotate" },
-    .{ .short = "sh", .full = "share" },
-    .{ .short = "bn", .full = "bundle" },
     .{ .short = "snd", .full = "send" },
-    .{ .short = "rc", .full = "receive" },
-    .{ .short = "recv", .full = "receive" },
-    .{ .short = "rv", .full = "rendezvous" },
-    .{ .short = "relay", .full = "rendezvous" },
+    .{ .short = "share", .full = "send" },
+    .{ .short = "bundle", .full = "send" },
+    .{ .short = "g", .full = "get" },
+    .{ .short = "receive", .full = "get" },
+    .{ .short = "recv", .full = "get" },
+    .{ .short = "rc", .full = "get" },
+    .{ .short = "rv", .full = "relay" },
+    .{ .short = "rendezvous", .full = "relay" },
     .{ .short = "upgrade", .full = "update" },
     .{ .short = "-h", .full = "help" },
     .{ .short = "--help", .full = "help" },
@@ -345,16 +350,12 @@ pub fn main(init: std.process.Init) !void {
         try cmdUnseal(io, alloc, w);
     } else if (eq(cmd, "rotate")) {
         try cmdRotate(io, alloc, w);
-    } else if (eq(cmd, "share")) {
-        try cmdShare(io, alloc, w, rest);
-    } else if (eq(cmd, "bundle")) {
-        try cmdBundle(io, alloc, w, rest);
     } else if (eq(cmd, "send")) {
         try cmdSend(io, alloc, w, rest);
-    } else if (eq(cmd, "receive")) {
-        try cmdReceive(io, alloc, w, rest);
-    } else if (eq(cmd, "rendezvous")) {
-        try cmdRendezvous(io, alloc, w, rest);
+    } else if (eq(cmd, "get")) {
+        try cmdGet(io, alloc, w, rest);
+    } else if (eq(cmd, "relay")) {
+        try cmdRelay(io, alloc, w, rest);
     } else {
         try w.print("{s}{s}{s} unknown command: {s}{s}{s}\n", .{
             ui.on(.red), ui.cross, ui.off(), ui.on(.bold), cmd, ui.off(),
@@ -1166,6 +1167,24 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
 }
 
 fn cmdServe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len >= 2 and eq(rest[0], "--link")) {
+        var dir = std.Io.Dir.cwd().openDir(io, rest[1], .{}) catch {
+            try w.print("no such directory: {s}\n", .{rest[1]});
+            return;
+        };
+        defer dir.close(io);
+        const link_port: u16 = if (rest.len >= 3)
+            std.fmt.parseInt(u16, rest[2], 10) catch 7788
+        else
+            7788;
+        try w.print("serving {s}{s}{s} on port {d} (ctrl-c to stop)\n", .{
+            ui.on(.cyan), rest[1], ui.off(), link_port,
+        });
+        try ui.hint(w, "this process cannot decrypt what it is serving.");
+        try w.flush();
+        return share.serveDir(io, alloc, dir, link_port);
+    }
+
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     var port: u16 = 7777;
@@ -1422,19 +1441,6 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     try w.print("cloned {s} into {s}\n", .{ rest[0], into });
 }
 
-fn shareUsage(w: *std.Io.Writer) !void {
-    try w.writeAll(
-        \\usage: gr share [--base <url>] [--out <dir>] [branch...]
-        \\           encrypt this repo's objects under a fresh key and write them out
-        \\       gr share serve <dir> [port]
-        \\           host an exported share over HTTP (it never sees the key)
-        \\       gr bundle -o <file> [branch...]
-        \\           one sealed file; send the file one way, the key another
-        \\       gr clone <url-with-#k=> <dir>
-        \\
-    );
-}
-
 fn shareBranches(alloc: std.mem.Allocator, rest: []const []const u8, from: usize) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(alloc);
@@ -1447,104 +1453,6 @@ fn shareBranches(alloc: std.mem.Allocator, rest: []const []const u8, from: usize
         try out.append(alloc, rest[i]);
     }
     return out.toOwnedSlice(alloc);
-}
-
-fn cmdShare(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    if (rest.len != 0 and (eq(rest[0], "-h") or eq(rest[0], "--help"))) return shareUsage(w);
-
-    if (rest.len != 0 and eq(rest[0], "serve")) {
-        if (rest.len < 2) return shareUsage(w);
-        var dir = std.Io.Dir.cwd().openDir(io, rest[1], .{}) catch {
-            try w.print("no such directory: {s}\n", .{rest[1]});
-            return;
-        };
-        defer dir.close(io);
-        const port: u16 = if (rest.len >= 3)
-            std.fmt.parseInt(u16, rest[2], 10) catch 7788
-        else
-            7788;
-        try w.print("serving encrypted objects from {s} on port {d} (ctrl-c to stop)\n", .{ rest[1], port });
-        try w.writeAll("this process cannot decrypt what it is serving\n");
-        try w.flush();
-        return share.serveDir(io, alloc, dir, port);
-    }
-
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-
-    var base: []const u8 = "https://YOUR-HOST";
-    var out_dir: []const u8 = "share";
-    var i: usize = 0;
-    while (i < rest.len) : (i += 1) {
-        if (eq(rest[i], "--base") and i + 1 < rest.len) {
-            base = rest[i + 1];
-            i += 1;
-        } else if (eq(rest[i], "--out") and i + 1 < rest.len) {
-            out_dir = rest[i + 1];
-            i += 1;
-        }
-    }
-
-    const wanted = try shareBranches(alloc, rest, 0);
-    defer alloc.free(wanted);
-
-    std.Io.Dir.cwd().createDirPath(io, out_dir) catch {};
-    var dest = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
-    defer dest.close(io);
-
-    const key = share.newShareKey(io);
-    share.exportDir(&s, alloc, io, key, dest, wanted) catch |e| {
-        try w.print("share failed: {t}\n", .{e});
-        return;
-    };
-
-    const url = try share.encodeUrl(alloc, base, key);
-    defer alloc.free(url);
-
-    try w.print("{s}{s}{s} wrote encrypted objects to {s}{s}/{s}\n\n  {s}{s}{s}\n\n", .{
-        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), out_dir, ui.off(), ui.on(.bold), url, ui.off(),
-    });
-    try w.writeAll("upload that directory anywhere static. the host never receives the key:\n");
-    try w.writeAll("it lives after the '#', which browsers and gr never put in a request.\n");
-    try w.print("sealed values stay sealed: whoever opens this gets the code, not the secrets.\n", .{});
-}
-
-fn cmdBundle(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    var out_path: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < rest.len) : (i += 1) {
-        if ((eq(rest[i], "-o") or eq(rest[i], "--out")) and i + 1 < rest.len) {
-            out_path = rest[i + 1];
-            i += 1;
-        }
-    }
-    const path = out_path orelse {
-        try w.writeAll("usage: gr bundle -o <file> [branch...]\n");
-        return;
-    };
-
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-
-    const wanted = try shareBranches(alloc, rest, 0);
-    defer alloc.free(wanted);
-
-    const key = share.newShareKey(io);
-    share.writeBundle(&s, alloc, io, key, path, wanted) catch |e| {
-        try w.print("bundle failed: {t}\n", .{e});
-        return;
-    };
-
-    const url = try share.encodeUrl(alloc, "file", key);
-    defer alloc.free(url);
-    const frag = std.mem.indexOf(u8, url, "#k=") orelse url.len;
-
-    try w.print("{s}{s}{s} wrote {s}{s}{s}\n\n  {s}key{s}  {s}{s}{s}\n\n", .{
-        ui.on(.green), ui.check, ui.off(),     ui.on(.cyan), path,     ui.off(),
-        ui.on(.dim),   ui.off(), ui.on(.bold), url[frag..],  ui.off(),
-    });
-    try w.print("open it with:  gr clone '{s}{s}' <dir>\n", .{ path, url[frag..] });
-    try w.writeAll("send the file and the key over different channels. either alone is useless.\n");
 }
 
 const default_relay_port: u16 = 7790;
@@ -1564,40 +1472,112 @@ fn relayFlag(rest: []const []const u8, host: *[]const u8, port: *u16) void {
     }
 }
 
+fn sendUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\usage: gr send                    hand it to someone on this network
+        \\       gr send --file <path>      one sealed file, no network at all
+        \\       gr send --link <dir>       static files you upload anywhere
+        \\       gr send --relay <host:port>  across the internet, via a relay
+        \\
+        \\       gr get <code | url | file>   the other side of all of these
+        \\
+    );
+}
+
+const lan_wait_ms: u64 = 90_000;
+const announce_every_ms: u64 = 500;
+const send_port_base: u16 = 7787;
+
+fn announceLoop(io: std.Io, slot: u16, tcp_port: u16, stop: *std.atomic.Value(bool)) void {
+    var broadcaster = discovery.Broadcaster.init(io) catch return;
+    defer broadcaster.deinit(io);
+    while (!stop.load(.acquire)) {
+        _ = broadcaster.pulse(io, slot, tcp_port);
+        io.sleep(.{ .nanoseconds = announce_every_ms * std.time.ns_per_ms }, .awake) catch return;
+    }
+}
+
 fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len != 0 and (eq(rest[0], "-h") or eq(rest[0], "--help"))) return sendUsage(w);
+
+    var link_dir: ?[]const u8 = null;
+    var file_path: ?[]const u8 = null;
+    var base: []const u8 = "https://YOUR-HOST";
+    var relay_host: ?[]const u8 = null;
+    var relay_port: u16 = default_relay_port;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if (eq(rest[i], "--link") and i + 1 < rest.len) {
+            link_dir = rest[i + 1];
+            i += 1;
+        } else if ((eq(rest[i], "--file") or eq(rest[i], "-o")) and i + 1 < rest.len) {
+            file_path = rest[i + 1];
+            i += 1;
+        } else if (eq(rest[i], "--base") and i + 1 < rest.len) {
+            base = rest[i + 1];
+            i += 1;
+        } else if (eq(rest[i], "--relay") and i + 1 < rest.len) {
+            const spec = rest[i + 1];
+            if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
+                relay_host = spec[0..c];
+                relay_port = std.fmt.parseInt(u16, spec[c + 1 ..], 10) catch default_relay_port;
+            } else {
+                relay_host = spec;
+            }
+            i += 1;
+        }
+    }
+
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
-
-    var host: []const u8 = "127.0.0.1";
-    var port: u16 = default_relay_port;
-    relayFlag(rest, &host, &port);
-
     const wanted = try shareBranches(alloc, rest, 0);
     defer alloc.free(wanted);
 
+    if (file_path) |path| return sendFile(io, alloc, w, &s, path, wanted);
+    if (link_dir) |dir| return sendLink(io, alloc, w, &s, dir, base, wanted);
+
     const code = try wormhole.generateCode(io, alloc);
     defer alloc.free(code);
+    const parsed = wormhole.Code.parse(code) catch return sendUsage(w);
 
-    try w.print("on the other machine, run:\n\n  gr receive {s}{s}{s} <dir>\n\n", .{
-        ui.on(.bold), code, ui.off(),
-    });
-    try w.writeAll("say those words out loud. do not paste them anywhere the code could be logged.\n");
-    try w.print("waiting for a peer via {s}:{d} ...\n", .{ host, port });
+    if (relay_host) |host| return sendViaRelay(io, alloc, w, &s, code, host, relay_port, wanted);
+
+    var server: ipnet.Server = undefined;
+    var bound: u16 = 0;
+    var candidate: u16 = send_port_base;
+    while (candidate < send_port_base + 16) : (candidate += 1) {
+        var address: ipnet.IpAddress = .{ .ip4 = ipnet.Ip4Address.unspecified(candidate) };
+        server = address.listen(io, .{ .reuse_address = true }) catch continue;
+        bound = candidate;
+        break;
+    }
+    if (bound == 0) {
+        try w.writeAll("could not open a port to listen on\n");
+        return;
+    }
+    defer server.deinit(io);
+
+    try w.print("  {s}{s}{s}\n\n", .{ ui.on(.bold), code, ui.off() });
+    try w.writeAll("on the other machine, on this same network, run:\n\n");
+    try w.print("  gr get {s}\n\n", .{code});
+    try ui.hint(w, "say the words out loud. they never touch the network.");
+    try w.print("{s}waiting for a peer on this network...{s}\n", .{ ui.on(.dim), ui.off() });
     try w.flush();
 
-    const conn = wormhole.Conn.open(io, alloc, host, port) catch {
-        try w.print("\n{s}{s}{s} cannot reach a rendezvous at {s}{s}:{d}{s}\n", .{
-            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), host, port, ui.off(),
-        });
-        try ui.hint(w, "start one with `gr rv`, or point at another with --relay host:port");
-        return;
+    var stop = std.atomic.Value(bool).init(false);
+    const announcer = std.Thread.spawn(.{}, announceLoop, .{ io, parsed.slot, bound, &stop }) catch null;
+    defer if (announcer) |th| {
+        stop.store(true, .release);
+        th.join();
     };
+
+    const stream = try server.accept(io);
+    stop.store(true, .release);
+
+    const conn = try wormhole.Conn.adopt(io, alloc, stream);
     defer conn.destroy();
 
-    wormhole.join(conn.channel(), code) catch |e| {
-        try w.print("rendezvous refused the slot: {t}\n", .{e});
-        return;
-    };
     var session = wormhole.senderHandshake(io, alloc, conn.channel(), code) catch |e| {
         try reportHandshake(w, e);
         return;
@@ -1605,24 +1585,172 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
     const payload = try share.buildBundle(&s, alloc, session.key, wanted);
     defer alloc.free(payload);
+    try session.sendStream(io, alloc, conn.channel(), payload);
 
+    try w.print("{s}{s}{s} sent {d} bytes directly. nothing left this network.\n", .{
+        ui.on(.green), ui.check, ui.off(), payload.len,
+    });
+}
+
+fn sendFile(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    path: []const u8,
+    wanted: []const []const u8,
+) !void {
+    const key = share.newShareKey(io);
+    share.writeBundle(s, alloc, io, key, path, wanted) catch |e| {
+        try w.print("could not write {s}: {t}\n", .{ path, e });
+        return;
+    };
+    const url = try share.encodeUrl(alloc, "file", key);
+    defer alloc.free(url);
+    const frag = std.mem.indexOf(u8, url, "#k=") orelse url.len;
+
+    try w.print("{s}{s}{s} wrote {s}{s}{s}\n\n  {s}key{s}  {s}{s}{s}\n\n", .{
+        ui.on(.green), ui.check, ui.off(),
+        ui.on(.cyan),  path,     ui.off(),
+        ui.on(.dim),   ui.off(), ui.on(.bold),
+        url[frag..],   ui.off(),
+    });
+    try w.print("open it with:  gr get '{s}{s}'\n", .{ path, url[frag..] });
+    try ui.hint(w, "send the file and the key over different channels. either alone is useless.");
+}
+
+fn sendLink(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    dir: []const u8,
+    base: []const u8,
+    wanted: []const []const u8,
+) !void {
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer dest.close(io);
+
+    const key = share.newShareKey(io);
+    share.exportDir(s, alloc, io, key, dest, wanted) catch |e| {
+        try w.print("could not write {s}: {t}\n", .{ dir, e });
+        return;
+    };
+    const url = try share.encodeUrl(alloc, base, key);
+    defer alloc.free(url);
+
+    try w.print("{s}{s}{s} wrote encrypted files to {s}{s}/{s}\n\n  {s}{s}{s}\n\n", .{
+        ui.on(.green), ui.check, ui.off(),
+        ui.on(.cyan),  dir,      ui.off(),
+        ui.on(.bold),  url,      ui.off(),
+    });
+    try w.writeAll("upload that directory to any static host. it never receives the key:\n");
+    try ui.hint(w, "the key is after the '#', which browsers and gr never put in a request.");
+}
+
+fn sendViaRelay(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    code: []const u8,
+    host: []const u8,
+    port: u16,
+    wanted: []const []const u8,
+) !void {
+    try w.print("  {s}{s}{s}\n\n", .{ ui.on(.bold), code, ui.off() });
+    try w.print("  gr get {s} --relay {s}:{d}\n\n", .{ code, host, port });
+    try w.print("{s}waiting via {s}:{d}...{s}\n", .{ ui.on(.dim), host, port, ui.off() });
+    try w.flush();
+
+    const conn = wormhole.Conn.open(io, alloc, host, port) catch {
+        try relayUnreachable(w, host, port);
+        return;
+    };
+    defer conn.destroy();
+
+    wormhole.join(conn.channel(), code) catch |e| {
+        try reportHandshake(w, e);
+        return;
+    };
+    var session = wormhole.senderHandshake(io, alloc, conn.channel(), code) catch |e| {
+        try reportHandshake(w, e);
+        return;
+    };
+
+    const payload = try share.buildBundle(s, alloc, session.key, wanted);
+    defer alloc.free(payload);
     try session.sendStream(io, alloc, conn.channel(), payload);
     try w.print("{s}{s}{s} sent {d} bytes. the relay saw ciphertext and nothing else.\n", .{
         ui.on(.green), ui.check, ui.off(), payload.len,
     });
 }
 
-fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    if (rest.len < 2) {
-        try w.writeAll("usage: gr receive <code> <dir> [--relay host:port]\n");
+fn relayUnreachable(w: *std.Io.Writer, host: []const u8, port: u16) !void {
+    try w.print("{s}{s}{s} cannot reach a relay at {s}{s}:{d}{s}\n", .{
+        ui.on(.red), ui.cross, ui.off(), ui.on(.bold), host, port, ui.off(),
+    });
+    try ui.hint(w, "start one with `gr relay`, or use `gr send --file` instead");
+}
+
+fn looksLikeCode(text: []const u8) bool {
+    _ = wormhole.Code.parse(text) catch return false;
+    return true;
+}
+
+fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1 or eq(rest[0], "-h") or eq(rest[0], "--help")) {
+        try w.writeAll("usage: gr get <code | url | file> [dir]\n");
         return;
     }
-    const code = rest[0];
-    const into = rest[1];
+    const source = rest[0];
 
-    var host: []const u8 = "127.0.0.1";
-    var port: u16 = default_relay_port;
-    relayFlag(rest, &host, &port);
+    var into: []const u8 = ".";
+    var relay_host: ?[]const u8 = null;
+    var relay_port: u16 = default_relay_port;
+    var i: usize = 1;
+    while (i < rest.len) : (i += 1) {
+        if (eq(rest[i], "--relay") and i + 1 < rest.len) {
+            const spec = rest[i + 1];
+            if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
+                relay_host = spec[0..c];
+                relay_port = std.fmt.parseInt(u16, spec[c + 1 ..], 10) catch default_relay_port;
+            } else {
+                relay_host = spec;
+            }
+            i += 1;
+        } else if (!std.mem.startsWith(u8, rest[i], "-")) {
+            into = rest[i];
+        }
+    }
+
+    if (std.mem.indexOf(u8, source, "#k=") != null) {
+        return cloneShare(io, alloc, w, source, into);
+    }
+    if (!looksLikeCode(source)) {
+        try w.print("{s}{s}{s} not a code, a share url, or a bundle: {s}{s}{s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), source, ui.off(),
+        });
+        try ui.hint(w, "codes look like 43-hydrant-hostel; links and files carry a #k=... key");
+        return;
+    }
+    return receiveCode(io, alloc, w, source, into, relay_host, relay_port);
+}
+
+fn receiveCode(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    code: []const u8,
+    into: []const u8,
+    relay_host: ?[]const u8,
+    relay_port: u16,
+) !void {
+    const parsed = wormhole.Code.parse(code) catch {
+        try w.writeAll("that does not look like a gr code\n");
+        return;
+    };
 
     std.Io.Dir.cwd().createDirPath(io, into) catch {};
     var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
@@ -1633,24 +1761,39 @@ fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     };
     defer s.deinit();
 
-    const conn = wormhole.Conn.open(io, alloc, host, port) catch {
-        try w.print("{s}{s}{s} cannot reach a rendezvous at {s}{s}:{d}{s}\n", .{
-            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), host, port, ui.off(),
-        });
-        try ui.hint(w, "start one with `gr rv`, or point at another with --relay host:port");
-        return;
+    const conn = blk: {
+        if (relay_host) |host| {
+            const c = wormhole.Conn.open(io, alloc, host, relay_port) catch {
+                try relayUnreachable(w, host, relay_port);
+                return;
+            };
+            wormhole.join(c.channel(), code) catch |e| {
+                c.destroy();
+                try reportHandshake(w, e);
+                return;
+            };
+            break :blk c;
+        }
+        try w.print("{s}looking for {s} on this network...{s}\n", .{ ui.on(.dim), code, ui.off() });
+        try w.flush();
+        const peer = discovery.discover(io, parsed.slot, lan_wait_ms) catch {
+            try w.print("{s}{s}{s} nobody is sending {s} on this network\n", .{
+                ui.on(.red), ui.cross, ui.off(), code,
+            });
+            try ui.hint(w, "same wifi? otherwise ask them for `gr send --file`, or pass --relay host:port");
+            return;
+        };
+        break :blk wormhole.Conn.adopt(io, alloc, try peer.address.connect(io, .{ .mode = .stream })) catch {
+            try w.writeAll("found a peer but could not connect\n");
+            return;
+        };
     };
     defer conn.destroy();
 
-    wormhole.join(conn.channel(), code) catch |e| {
-        try reportHandshake(w, e);
-        return;
-    };
     var session = wormhole.receiverHandshake(io, alloc, conn.channel(), code) catch |e| {
         try reportHandshake(w, e);
         return;
     };
-
     const payload = session.recvStream(io, alloc, conn.channel()) catch |e| {
         try w.print("transfer failed: {t}\n", .{e});
         return;
@@ -1658,44 +1801,49 @@ fn cmdReceive(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     defer alloc.free(payload);
 
     try share.importBundle(&s, alloc, session.key, payload);
+    try materializeHead(io, alloc, &s, dest);
 
-    const branch = try s.headBranch();
-    defer alloc.free(branch);
-    if (s.refExists(branch)) {
-        const change = try s.readChange(try s.readRef(branch));
-        defer object.freeChange(alloc, change);
-        try workspace.materialize(&s, change.tree, dest);
-    }
     try w.print("{s}{s}{s} received into {s}{s}{s}\n", .{
         ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
     });
-    try w.writeAll("any sealed values are still sealed. the code moved the code, not the secrets.\n");
+    try ui.hint(w, "any sealed values are still sealed. the code moved the code, not the secrets.");
+}
+
+fn materializeHead(io: std.Io, alloc: std.mem.Allocator, s: *Store, dest: std.Io.Dir) !void {
+    _ = io;
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    if (!s.refExists(branch)) return;
+    const change = try s.readChange(try s.readRef(branch));
+    defer object.freeChange(alloc, change);
+    try workspace.materialize(s, change.tree, dest);
 }
 
 fn reportHandshake(w: *std.Io.Writer, e: anyerror) !void {
     switch (e) {
         wormhole.Error.ConfirmationFailed => {
-            try w.print("{s}{s}{s} the codes do not match. nothing was transferred.\n", .{ ui.on(.red), ui.cross, ui.off() });
-            try w.writeAll("check the words, or start over: a wrong guess costs the sender a try.\n");
+            try w.print("{s}{s}{s} the codes do not match. nothing was transferred.\n", .{
+                ui.on(.red), ui.cross, ui.off(),
+            });
+            try ui.hint(w, "check the words, or start over: a wrong guess costs the sender a try.");
         },
         wormhole.Error.SlotBurned => {
             try w.writeAll("that code is used up. generate a fresh one with `gr send`.\n");
         },
-        wormhole.Error.BadCode => try w.writeAll("that does not look like a gr wormhole code\n"),
+        wormhole.Error.BadCode => try w.writeAll("that does not look like a gr code\n"),
         error.EndOfStream, error.ReadFailed, error.WriteFailed => {
             try w.writeAll("the peer hung up before the transfer, usually a mistyped code.\n");
-            try w.writeAll("nothing was sent. run `gr send` again for a fresh one.\n");
+            try ui.hint(w, "nothing was sent. run `gr send` again for a fresh one.");
         },
         else => try w.print("handshake failed: {t}\n", .{e}),
     }
 }
 
-fn cmdRendezvous(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+fn cmdRelay(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var port: u16 = default_relay_port;
     if (rest.len >= 1) port = std.fmt.parseInt(u16, rest[0], 10) catch default_relay_port;
-    try w.print("rendezvous on port {d} (ctrl-c to stop)\n", .{port});
-    try w.writeAll("it pairs two connections by slot and relays bytes. it never sees a code,\n");
-    try w.writeAll("never derives a key, and stores nothing.\n");
+    try w.print("relay on port {d} (ctrl-c to stop)\n", .{port});
+    try ui.hint(w, "it pairs two connections and forwards bytes. it never sees a code or a key.");
     try w.flush();
     return wormhole.rendezvous(io, alloc, port);
 }
@@ -2120,6 +2268,7 @@ test {
     _ = share;
     _ = wormhole;
     _ = ui;
+    _ = discovery;
     _ = oid;
     _ = cdc;
     _ = object;

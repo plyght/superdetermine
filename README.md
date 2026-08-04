@@ -25,7 +25,7 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
 | Sealed secrets | Commit `.env`. Values are encrypted per-variable; the plaintext is never an object. Team access is a wrapped key, not a service. |
-| Encrypted sharing | `gr share` and `gr bundle` hand out a link or a file the host cannot read. |
+| Encrypted sharing | `gr send` hands a repo to someone peer to peer, or as a link or file no host can read. |
 
 ## Git, side by side
 
@@ -101,24 +101,30 @@ The repo key is wrapped separately to each member with X25519 **and** ML-KEM-768
 
 ## Sharing without a service
 
+Two commands: `gr send` gives a repo away, `gr get` picks one up. With no flags, `send` is peer to peer over your local network.
+
 ```
-gr share --base https://your-host --out ./share
-#  https://your-host/r/4fcfccde#k=ZRR1ErmnX1-F_oOLp_gd0dg14nY-agXhHZhMt6RiigY
-gr clone '<that url>' ./dir
+gr send                          -> 43-hydrant-hostel
+gr get 43-hydrant-hostel
 ```
+
+The sender announces only a two digit slot number on the network. The words never leave either machine, so there is nothing on the wire to capture. Same wifi is all it needs: no relay, no account, no IP handed out, nothing uploaded.
+
+When you are not on the same network, pick how it should travel:
+
+```
+gr send --file repo.grb          one sealed file, no network at all
+gr send --link ./out             static files you upload anywhere
+gr send --relay host:port        across the internet, via a meeting point
+```
+
+`gr get` takes whatever came out of any of those: a code, a URL, or a file.
 
 Every object is encrypted under a fresh key and stored under a blinded name. The key lives after the `#`, which by the URL spec is never sent in a request, so the host serves bytes it cannot read and its terms of service stop being a security question. Object contents are verified against their own hashes on arrival, so a hostile host cannot substitute anything either.
 
-For no network at all, `gr bundle -o repo.grb` makes one sealed file; send the file and the key over different channels.
+With `--file`, send the file and the key over different channels. Either alone is useless.
 
-For a person sitting next to you, there is no link at all, just three words:
-
-```
-gr send                     # snd  prints:  gr receive 40-bagel-guitar <dir>
-gr receive 40-bagel-guitar ./their-copy      # rc
-```
-
-The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline. that is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run the relay yourself with `gr rendezvous` (`gr rv`).
+The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline. that is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run a relay yourself with `gr relay` (`gr rv`); `gr serve --link <dir>` hosts a `--link` export over HTTP.
 
 The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not, without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
 

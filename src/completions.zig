@@ -50,16 +50,14 @@ const fish_script =
     \\complete -c gr -n __fish_use_subcommand -a undo -d 'revert the last change-making operation'
     \\complete -c gr -n __fish_use_subcommand -a redo -d 'reapply what you just undid'
     \\complete -c gr -n __fish_use_subcommand -a serve -d 'share this repo over TCP'
+    \\complete -c gr -n __fish_use_subcommand -a send -d 'hand this repo to someone'
+    \\complete -c gr -n __fish_use_subcommand -a get -d 'pick up a code, link, or bundle'
+    \\complete -c gr -n __fish_use_subcommand -a relay -d 'run a meeting point for transfers'
     \\complete -c gr -n __fish_use_subcommand -a fetch -d 'sparse-pull a branch'
     \\complete -c gr -n __fish_use_subcommand -a seal -d 'seal a .env-style file'
     \\complete -c gr -n __fish_use_subcommand -a unseal -d 'write the plaintext files back out'
     \\complete -c gr -n __fish_use_subcommand -a key -d 'manage who can read sealed values'
     \\complete -c gr -n __fish_use_subcommand -a rotate -d 'new repo key, re-wrapped to members'
-    \\complete -c gr -n __fish_use_subcommand -a share -d 'encrypted share the host cannot read'
-    \\complete -c gr -n __fish_use_subcommand -a bundle -d 'one sealed file'
-    \\complete -c gr -n __fish_use_subcommand -a send -d 'peer-to-peer transfer via a spoken code'
-    \\complete -c gr -n __fish_use_subcommand -a receive -d 'pick up what someone sent you'
-    \\complete -c gr -n __fish_use_subcommand -a rendezvous -d 'run the wormhole relay'
     \\complete -c gr -n __fish_use_subcommand -a watch -d 'auto-save on every file change'
     \\complete -c gr -n __fish_use_subcommand -a clone -d 'clone a git repo into guardrail'
     \\complete -c gr -n __fish_use_subcommand -a import -d "pull a git repo's HEAD into guardrail"
@@ -109,16 +107,14 @@ const zsh_script =
     \\    'undo:revert the last change-making operation'
     \\    'redo:reapply what you just undid'
     \\    'serve:share this repo over TCP'
+    \\    'send:hand this repo to someone'
+    \\    'get:pick up a code, link, or bundle'
+    \\    'relay:run a meeting point for transfers'
     \\    'fetch:sparse-pull a branch'
     \\    'seal:seal a .env-style file'
     \\    'unseal:write the plaintext files back out'
     \\    'key:manage who can read sealed values'
     \\    'rotate:new repo key, re-wrapped to members'
-    \\    'share:encrypted share the host cannot read'
-    \\    'bundle:one sealed file'
-    \\    'send:peer-to-peer transfer via a spoken code'
-    \\    'receive:pick up what someone sent you'
-    \\    'rendezvous:run the wormhole relay'
     \\    'watch:auto-save on every file change'
     \\    'clone:clone a git repo into guardrail'
     \\    'import:pull a git repo HEAD into guardrail'
@@ -154,7 +150,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab b bl blame bn br branch branches bundle cfg ci cl clone co comp completions config d desc diff export f fetch gc help import init k key l lfs log merge mg n new pl prov provenance ps pull push r rc receive recv redo relay rendezvous res resolve restore rev rot rotate rs rv save seal send serve sh share sl snap snapshot snd srv st status sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab b bl blame bn br branch branches bundle cfg ci cl clone co comp completions config d desc diff export f fetch g gc get help import init k key l lfs log merge mg n new pl prov provenance ps pull push r rc receive recv redo relay res resolve restore rev rot rotate rs rv save seal send serve sh share sl snap snapshot snd srv st status sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
