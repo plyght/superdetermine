@@ -1561,6 +1561,31 @@ fn printPublicKey(
     try w.print("{s}\n\n{s}\n\nfingerprint  {s}\n", .{ label, enc, fp });
 }
 
+fn pathInHistory(alloc: std.mem.Allocator, s: *Store, path: []const u8) !bool {
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    if (!s.refExists(branch)) return false;
+
+    var seen = std.AutoHashMap([Oid.len]u8, void).init(alloc);
+    defer seen.deinit();
+    var queue: std.ArrayList(Oid) = .empty;
+    defer queue.deinit(alloc);
+    try queue.append(alloc, s.readRef(branch) catch return false);
+
+    while (queue.pop()) |current| {
+        if ((try seen.getOrPut(current.bytes)).found_existing) continue;
+        const change = s.readChange(current) catch continue;
+        defer object.freeChange(alloc, change);
+        const tree = s.readTree(change.tree) catch continue;
+        defer object.freeTree(alloc, tree);
+        for (tree.entries) |e| {
+            if (std.mem.eql(u8, e.path, path)) return true;
+        }
+        for (change.parents) |p| try queue.append(alloc, p);
+    }
+    return false;
+}
+
 fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
@@ -1618,6 +1643,13 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         }
         try keyring.saveManifest(io, alloc, work, &manifest);
         try keyring.protectPath(io, alloc, work, path);
+
+        if (try pathInHistory(alloc, &s, path)) {
+            try w.print("warning: {s} is already committed in this repo's history.\n", .{path});
+            try w.writeAll("sealing it now protects future changes only — the old plaintext is\n");
+            try w.writeAll("still in past changes and in every clone. treat those values as leaked\n");
+            try w.writeAll("and rotate them.\n\n");
+        }
     }
 
     var plan = keyring.prepare(io, alloc, work) catch |e| {

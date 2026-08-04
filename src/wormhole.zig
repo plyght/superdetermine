@@ -65,38 +65,38 @@ pub const Role = enum {
 };
 
 pub const words = [_][]const u8{
-    "acrobat",   "airport",  "almanac",  "amuse",     "anchor",    "antenna",  "apple",     "april",
-    "arcade",    "armor",    "artist",   "aspect",    "atlas",     "autumn",   "avocado",   "bagel",
-    "bakery",    "balloon",  "bamboo",   "bandit",    "banjo",     "barrel",   "basket",    "batch",
-    "beacon",    "beaver",   "bedrock",  "beehive",   "bellhop",   "bicycle",  "bishop",    "bison",
-    "blanket",   "blender",  "blizzard", "blossom",   "bobcat",    "bonsai",   "bookend",   "boomerang",
-    "bottle",    "boulder",  "bracket",  "brandy",    "bravo",     "brisket",  "bronco",    "bucket",
-    "buffalo",   "bugle",    "bunker",   "burrito",   "cabinet",   "cactus",   "camera",    "campus",
-    "canary",    "candle",   "canyon",   "capsule",   "caravan",   "cardinal", "cargo",     "carnival",
-    "carpet",    "cartoon",  "cascade",  "cashew",    "catalog",   "cedar",    "celery",    "cement",
-    "census",    "chalk",    "chapter",  "cheddar",   "chimney",   "chisel",   "chorus",    "chowder",
-    "cinnamon",  "circus",   "clamp",    "clarinet",  "classic",   "clever",   "clinic",    "clockwork",
-    "cobalt",    "cobra",    "cocoa",    "coconut",   "comet",     "compass",  "concert",   "condor",
-    "confetti",  "console",  "copper",   "coral",     "cosmic",    "cottage",  "cougar",    "coyote",
-    "crayon",    "cricket",  "crimson",  "crossover", "crumble",   "crystal",  "cubic",     "cupcake",
-    "curtain",   "custard",  "cyclone",  "dagger",    "dashboard", "decimal",  "decoy",     "denim",
-    "dentist",   "desert",   "diagram",  "diesel",    "digital",   "dinner",   "diploma",   "dolphin",
-    "domino",    "donut",    "dragon",   "drummer",   "dugout",    "dynamo",   "eagle",     "eclipse",
-    "eggplant",  "elastic",  "elbow",    "elder",     "elegant",   "elephant", "elevator",  "ember",
-    "emerald",   "engine",   "epic",     "equator",   "espresso",  "eternal",  "exhibit",   "exodus",
-    "fabric",    "falcon",   "fantasy",  "fatigue",   "feather",   "fedora",   "ferry",     "fiber",
-    "fiddle",    "figment",  "filter",   "finale",    "firefly",   "flamingo", "flannel",   "flask",
-    "flint",     "floral",   "flute",    "folklore",  "fossil",    "foxtrot",  "fragile",   "freedom",
-    "fresco",    "frigate",  "fritter",  "frontier",  "frostbite", "fuchsia",  "funnel",    "gadget",
-    "galaxy",    "gallery",  "gallon",   "gambit",    "garden",    "garlic",   "gazelle",   "gecko",
-    "gemstone",  "ginger",   "giraffe",  "glacier",   "gleam",     "glider",   "glossy",    "gopher",
-    "gospel",    "granite",  "gravel",   "gravity",   "griffin",   "grotto",   "guitar",    "gumbo",
-    "gusto",     "gymnast",  "habitat",  "hacksaw",   "halibut",   "hammock",  "hamster",   "handbook",
-    "harbor",    "harmony",  "harvest",  "hazard",    "hazel",     "headline", "hedgehog",  "helium",
-    "hexagon",   "hickory",  "hillside", "hoagie",    "holiday",   "hornet",   "horizon",   "hostel",
-    "hotdog",    "hubcap",   "humble",   "hurdle",    "hydrant",   "iceberg",  "igloo",     "impala",
-    "import",    "incisor",  "indigo",   "infield",   "inkwell",   "insect",   "instant",   "iris",
-    "island",    "ivory",    "jackal",   "jacket",    "jaguar",    "jamboree", "jasmine",   "javelin",
+    "acrobat",  "airport", "almanac",  "amuse",     "anchor",    "antenna",  "apple",    "april",
+    "arcade",   "armor",   "artist",   "aspect",    "atlas",     "autumn",   "avocado",  "bagel",
+    "bakery",   "balloon", "bamboo",   "bandit",    "banjo",     "barrel",   "basket",   "batch",
+    "beacon",   "beaver",  "bedrock",  "beehive",   "bellhop",   "bicycle",  "bishop",   "bison",
+    "blanket",  "blender", "blizzard", "blossom",   "bobcat",    "bonsai",   "bookend",  "boomerang",
+    "bottle",   "boulder", "bracket",  "brandy",    "bravo",     "brisket",  "bronco",   "bucket",
+    "buffalo",  "bugle",   "bunker",   "burrito",   "cabinet",   "cactus",   "camera",   "campus",
+    "canary",   "candle",  "canyon",   "capsule",   "caravan",   "cardinal", "cargo",    "carnival",
+    "carpet",   "cartoon", "cascade",  "cashew",    "catalog",   "cedar",    "celery",   "cement",
+    "census",   "chalk",   "chapter",  "cheddar",   "chimney",   "chisel",   "chorus",   "chowder",
+    "cinnamon", "circus",  "clamp",    "clarinet",  "classic",   "clever",   "clinic",   "clockwork",
+    "cobalt",   "cobra",   "cocoa",    "coconut",   "comet",     "compass",  "concert",  "condor",
+    "confetti", "console", "copper",   "coral",     "cosmic",    "cottage",  "cougar",   "coyote",
+    "crayon",   "cricket", "crimson",  "crossover", "crumble",   "crystal",  "cubic",    "cupcake",
+    "curtain",  "custard", "cyclone",  "dagger",    "dashboard", "decimal",  "decoy",    "denim",
+    "dentist",  "desert",  "diagram",  "diesel",    "digital",   "dinner",   "diploma",  "dolphin",
+    "domino",   "donut",   "dragon",   "drummer",   "dugout",    "dynamo",   "eagle",    "eclipse",
+    "eggplant", "elastic", "elbow",    "elder",     "elegant",   "elephant", "elevator", "ember",
+    "emerald",  "engine",  "epic",     "equator",   "espresso",  "eternal",  "exhibit",  "exodus",
+    "fabric",   "falcon",  "fantasy",  "fatigue",   "feather",   "fedora",   "ferry",    "fiber",
+    "fiddle",   "figment", "filter",   "finale",    "firefly",   "flamingo", "flannel",  "flask",
+    "flint",    "floral",  "flute",    "folklore",  "fossil",    "foxtrot",  "fragile",  "freedom",
+    "fresco",   "frigate", "fritter",  "frontier",  "frostbite", "fuchsia",  "funnel",   "gadget",
+    "galaxy",   "gallery", "gallon",   "gambit",    "garden",    "garlic",   "gazelle",  "gecko",
+    "gemstone", "ginger",  "giraffe",  "glacier",   "gleam",     "glider",   "glossy",   "gopher",
+    "gospel",   "granite", "gravel",   "gravity",   "griffin",   "grotto",   "guitar",   "gumbo",
+    "gusto",    "gymnast", "habitat",  "hacksaw",   "halibut",   "hammock",  "hamster",  "handbook",
+    "harbor",   "harmony", "harvest",  "hazard",    "hazel",     "headline", "hedgehog", "helium",
+    "hexagon",  "hickory", "hillside", "hoagie",    "holiday",   "hornet",   "horizon",  "hostel",
+    "hotdog",   "hubcap",  "humble",   "hurdle",    "hydrant",   "iceberg",  "igloo",    "impala",
+    "import",   "incisor", "indigo",   "infield",   "inkwell",   "insect",   "instant",  "iris",
+    "island",   "ivory",   "jackal",   "jacket",    "jaguar",    "jamboree", "jasmine",  "javelin",
 };
 
 fn wordIndex(w: []const u8) ?usize {
@@ -486,11 +486,11 @@ pub const SlotTable = struct {
         const gop = try self.map.getOrPut(self.alloc, slot);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         if (gop.value_ptr.burned) return Error.SlotBurned;
-        gop.value_ptr.attempts += 1;
-        if (gop.value_ptr.attempts > max_slot_attempts) {
+        if (gop.value_ptr.attempts >= max_slot_attempts) {
             gop.value_ptr.burned = true;
             return Error.SlotBurned;
         }
+        gop.value_ptr.attempts += 1;
     }
 
     pub fn burn(self: *SlotTable, slot: u16) !void {
@@ -523,11 +523,11 @@ pub const SlotTable = struct {
         if (gop.value_ptr.burned) return Error.SlotBurned;
         if (gop.value_ptr.waiting) |partner| {
             gop.value_ptr.waiting = null;
-            gop.value_ptr.attempts += 1;
-            if (gop.value_ptr.attempts > max_slot_attempts) {
+            if (gop.value_ptr.attempts >= max_slot_attempts) {
                 gop.value_ptr.burned = true;
                 return Error.SlotBurned;
             }
+            gop.value_ptr.attempts += 1;
             return partner;
         }
         gop.value_ptr.waiting = stream;
@@ -1075,7 +1075,8 @@ test "end to end transfer through a live rendezvous" {
     const code = "13-hexagon-hickory";
     const payload = "a small pack of guardrail objects" ** 512;
 
-    const server = try std.Thread.spawn(.{}, rendezvousThread, .{ io, alloc, port });
+    const server_alloc = std.heap.page_allocator;
+    const server = try std.Thread.spawn(.{}, rendezvousThread, .{ io, server_alloc, port });
     server.detach();
 
     var sent: LiveResult = .{};
@@ -1090,4 +1091,70 @@ test "end to end transfer through a live rendezvous" {
     try testing.expect(sent.ok);
     try testing.expect(received.ok);
     try testing.expectEqualStrings(payload, received.payload);
+}
+
+const HandshakeOutcome = struct {
+    err: ?anyerror = null,
+    done: bool = false,
+};
+
+fn handshakeThread(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    port: u16,
+    code: []const u8,
+    role: Role,
+    out: *HandshakeOutcome,
+) void {
+    var attempt: usize = 0;
+    const conn = while (attempt < 200) : (attempt += 1) {
+        if (Conn.open(io, alloc, "127.0.0.1", port)) |c| break c else |_| {
+            io.sleep(std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+        }
+    } else {
+        out.err = error.CouldNotConnect;
+        out.done = true;
+        return;
+    };
+    defer conn.destroy();
+
+    join(conn.channel(), code) catch |e| {
+        out.err = e;
+        out.done = true;
+        return;
+    };
+    const result = switch (role) {
+        .sender => senderHandshake(io, alloc, conn.channel(), code),
+        .receiver => receiverHandshake(io, alloc, conn.channel(), code),
+    };
+    if (result) |_| {} else |e| {
+        out.err = e;
+    }
+    out.done = true;
+}
+
+test "mismatched codes fail key confirmation over a live rendezvous" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    const port: u16 = 47933;
+    const server_alloc = std.heap.page_allocator;
+    const server = try std.Thread.spawn(.{}, rendezvousThread, .{ io, server_alloc, port });
+    server.detach();
+
+    var tx_out: HandshakeOutcome = .{};
+    var rx_out: HandshakeOutcome = .{};
+
+    const rx = try std.Thread.spawn(.{}, handshakeThread, .{
+        io, alloc, port, "21-bishop-bonsai", Role.receiver, &rx_out,
+    });
+    const tx = try std.Thread.spawn(.{}, handshakeThread, .{
+        io, alloc, port, "21-bishop-bracket", Role.sender, &tx_out,
+    });
+    tx.join();
+    rx.join();
+
+    try testing.expect(rx_out.done and tx_out.done);
+    try testing.expectEqual(@as(?anyerror, Error.ConfirmationFailed), rx_out.err);
+    try testing.expect(tx_out.err != null);
 }
