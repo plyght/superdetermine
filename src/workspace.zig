@@ -4,9 +4,50 @@ const object = @import("object.zig");
 const Store = @import("store.zig").Store;
 const ignore = @import("ignore.zig");
 const idx = @import("index.zig");
+const keyring = @import("keyring.zig");
 const Oid = oid.Oid;
 
-fn scan(store: *Store, work_dir: std.Io.Dir, cache: ?*const idx.Index, fresh: ?*idx.Index) ![]object.TreeEntry {
+fn appendFile(
+    store: *Store,
+    work_dir: std.Io.Dir,
+    rel_path: []const u8,
+    cache: ?*const idx.Index,
+    fresh: ?*idx.Index,
+    entries: *std.ArrayList(object.TreeEntry),
+) !void {
+    const io = store.io;
+    const alloc = store.alloc;
+
+    const st = work_dir.statFile(io, rel_path, .{}) catch null;
+    var blob: ?Oid = null;
+    if (cache) |c| if (st) |s| {
+        if (c.lookup(rel_path, s)) |cached| {
+            if (store.has(cached)) blob = cached;
+        }
+    };
+    if (blob == null) {
+        const data = try work_dir.readFileAlloc(io, rel_path, alloc, .unlimited);
+        defer alloc.free(data);
+        blob = try store.writeFileContent(data);
+    }
+    if (fresh) |f| if (st) |s| try f.put(rel_path, s, blob.?);
+    const exec = if (st) |s| (s.permissions.toMode() & 0o111) != 0 else false;
+    const path = try alloc.dupe(u8, rel_path);
+    errdefer alloc.free(path);
+    try entries.append(alloc, .{
+        .mode = if (exec) .executable else .regular,
+        .path = path,
+        .blob = blob.?,
+    });
+}
+
+fn scan(
+    store: *Store,
+    work_dir: std.Io.Dir,
+    cache: ?*const idx.Index,
+    fresh: ?*idx.Index,
+    plan: *const keyring.Plan,
+) ![]object.TreeEntry {
     const io = store.io;
     const alloc = store.alloc;
 
@@ -19,6 +60,10 @@ fn scan(store: *Store, work_dir: std.Io.Dir, cache: ?*const idx.Index, fresh: ?*
         entries.deinit(alloc);
     }
 
+    const seen_outputs = try alloc.alloc(bool, plan.outputs.len);
+    defer alloc.free(seen_outputs);
+    @memset(seen_outputs, false);
+
     var walker = try work_dir.walkSelectively(alloc);
     defer walker.deinit();
 
@@ -28,30 +73,15 @@ fn scan(store: *Store, work_dir: std.Io.Dir, cache: ?*const idx.Index, fresh: ?*
                 if (!ignores.isIgnored(entry.path, true)) try walker.enter(io, entry);
             },
             .file => {
+                if (plan.isSource(entry.path)) continue;
                 if (ignores.isIgnored(entry.path, false)) continue;
-                const st = work_dir.statFile(io, entry.path, .{}) catch null;
-                var blob: ?Oid = null;
-                if (cache) |c| if (st) |s| {
-                    if (c.lookup(entry.path, s)) |cached| {
-                        if (store.has(cached)) blob = cached;
-                    }
-                };
-                if (blob == null) {
-                    const data = try work_dir.readFileAlloc(io, entry.path, alloc, .unlimited);
-                    defer alloc.free(data);
-                    blob = try store.writeFileContent(data);
+                for (plan.outputs, 0..) |o, i| {
+                    if (std.mem.eql(u8, o, entry.path)) seen_outputs[i] = true;
                 }
-                if (fresh) |f| if (st) |s| try f.put(entry.path, s, blob.?);
-                const exec = if (st) |s| (s.permissions.toMode() & 0o111) != 0 else false;
-                const path = try alloc.dupe(u8, entry.path);
-                errdefer alloc.free(path);
-                try entries.append(alloc, .{
-                    .mode = if (exec) .executable else .regular,
-                    .path = path,
-                    .blob = blob.?,
-                });
+                try appendFile(store, work_dir, entry.path, cache, fresh, &entries);
             },
             .sym_link => {
+                if (plan.isSource(entry.path)) continue;
                 if (ignores.isIgnored(entry.path, false)) continue;
                 var buf: [4096]u8 = undefined;
                 const n = work_dir.readLink(io, entry.path, &buf) catch continue;
@@ -66,6 +96,12 @@ fn scan(store: *Store, work_dir: std.Io.Dir, cache: ?*const idx.Index, fresh: ?*
             },
             else => {},
         }
+    }
+
+    for (plan.outputs, seen_outputs) |path, already| {
+        if (already) continue;
+        work_dir.access(io, path, .{}) catch continue;
+        try appendFile(store, work_dir, path, cache, fresh, &entries);
     }
 
     const slice = try entries.toOwnedSlice(alloc);
@@ -86,7 +122,10 @@ pub fn snapshot(store: *Store, work_dir: std.Io.Dir, author: []const u8, message
     var fresh = idx.Index.empty(alloc);
     defer fresh.deinit();
 
-    const entries = try scan(store, work_dir, &cache, &fresh);
+    var plan = try keyring.prepare(store.io, alloc, work_dir);
+    defer plan.deinit();
+
+    const entries = try scan(store, work_dir, &cache, &fresh, &plan);
     defer freeEntries(alloc, entries);
     fresh.save(store) catch {};
 
@@ -137,7 +176,10 @@ pub fn status(store: *Store, work_dir: std.Io.Dir, alloc: std.mem.Allocator) ![]
     var fresh = idx.Index.empty(store.alloc);
     defer fresh.deinit();
 
-    const work_entries = try scan(store, work_dir, &cache, &fresh);
+    var plan = try keyring.prepare(store.io, store.alloc, work_dir);
+    defer plan.deinit();
+
+    const work_entries = try scan(store, work_dir, &cache, &fresh, &plan);
     defer freeEntries(store.alloc, work_entries);
     fresh.save(store) catch {};
 
@@ -238,6 +280,9 @@ pub fn restoreFile(store: *Store, work_dir: std.Io.Dir, rel_path: []const u8) !v
 
 const testing = std.testing;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 test "snapshot, status, materialize" {
     const io = std.testing.io;
     const alloc = testing.allocator;
@@ -335,6 +380,68 @@ test "ignored files are excluded from status and snapshot" {
         try testing.expect(!std.mem.eql(u8, e.path, "junk.o"));
         try testing.expect(std.mem.indexOf(u8, e.path, "target") == null);
     }
+}
+
+test "a sealed source never enters the tree and its sealed form always does" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    const seal = @import("seal.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(abs);
+    const absz = try alloc.dupeZ(u8, abs);
+    defer alloc.free(absz);
+    _ = setenv("XDG_CONFIG_HOME", absz.ptr, 1);
+    defer _ = unsetenv("XDG_CONFIG_HOME");
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const id = try keyring.createIdentity(io, alloc, true);
+    var manifest = seal.Manifest.empty(alloc);
+    defer manifest.deinit();
+    _ = try manifest.addPath(".env");
+    try manifest.putMember(io, seal.newRepoKey(io), "nico", id.publicId());
+    try keyring.saveManifest(io, alloc, work, &manifest);
+
+    try work.writeFile(io, .{ .sub_path = ".grignore", .data = ".env\n" });
+    try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=sk-live-1\n" });
+
+    _ = try snapshot(&store, work, "Nico <n@x>", "init", 1_700_000_000);
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const change = try store.readChange(try store.readRef(branch));
+    defer object.freeChange(alloc, change);
+    const tree = try store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+
+    var saw_sealed = false;
+    for (tree.entries) |e| {
+        try testing.expect(!std.mem.eql(u8, e.path, ".env"));
+        if (std.mem.eql(u8, e.path, ".env.sealed")) {
+            saw_sealed = true;
+            const data = try store.readFileContent(e.blob);
+            defer alloc.free(data);
+            try testing.expect(std.mem.indexOf(u8, data, "sk-live-1") == null);
+            try testing.expect(std.mem.indexOf(u8, data, "API_KEY=gr1:") != null);
+        }
+    }
+    try testing.expect(saw_sealed);
+
+    const st = try status(&store, work, alloc);
+    defer {
+        for (st) |e| alloc.free(e.path);
+        alloc.free(st);
+    }
+    try testing.expectEqual(@as(usize, 0), st.len);
 }
 
 test "restoreFile discards local edits to one file" {

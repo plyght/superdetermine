@@ -23,6 +23,9 @@ const completions = @import("completions.zig");
 const absorb = @import("absorb.zig");
 const lfs = @import("lfs.zig");
 const proc = @import("proc.zig");
+const seal = @import("seal.zig");
+const keyring = @import("keyring.zig");
+const share = @import("share.zig");
 
 const Oid = oid.Oid;
 const Store = store.Store;
@@ -66,12 +69,23 @@ const usage =
     \\  watch           experimental: auto-save on every file change
     \\
     \\git, side by side
-    \\  clone <src> <dir>   clone a git repo into guardrail
+    \\  clone <src> <dir>   clone a git repo, a share URL, or a bundle
     \\  import <git-repo>   pull a git repo's HEAD into guardrail
     \\  export <git-repo>   write guardrail HEAD out as git commits
     \\  sync <dir>          mirror guardrail HEAD into the colocated .git
     \\  lfs <cmd>           git-lfs interop (track, ls, fetch, push, env)
     \\  push [remote] [branch] | pull [remote]   (remote defaults to origin)
+    \\
+    \\sharing without a service (the host stays blind)
+    \\  share           encrypt every object under a fresh key, print a link
+    \\  share serve <dir> [port]   host an exported share over HTTP
+    \\  bundle -o <f>   one sealed file; send file and key separately
+    \\
+    \\secrets you can actually commit
+    \\  seal <path>     seal a .env-style file; values become gr1: ciphertext
+    \\  unseal          write the plaintext back out (needs your key)
+    \\  key new | show | add <name> <pubkey> | remove <name> | list
+    \\  rotate          new repo key, re-wrapped to every member
     \\
     \\  init            create a guardrail repo here
     \\  gc [--dry-run]  reclaim space from unreachable objects
@@ -186,6 +200,18 @@ pub fn main(init: std.process.Init) !void {
         try cmdLfs(io, alloc, w, rest);
     } else if (eq(cmd, "completions")) {
         try cmdCompletions(w, rest);
+    } else if (eq(cmd, "key")) {
+        try cmdKey(io, alloc, w, rest);
+    } else if (eq(cmd, "seal")) {
+        try cmdSeal(io, alloc, w, rest);
+    } else if (eq(cmd, "unseal")) {
+        try cmdUnseal(io, alloc, w);
+    } else if (eq(cmd, "rotate")) {
+        try cmdRotate(io, alloc, w);
+    } else if (eq(cmd, "share")) {
+        try cmdShare(io, alloc, w, rest);
+    } else if (eq(cmd, "bundle")) {
+        try cmdBundle(io, alloc, w, rest);
     } else {
         try w.print("unknown command: {s}\n\n", .{cmd});
         try w.writeAll(usage);
@@ -1184,8 +1210,11 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
 fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 2) {
-        try w.writeAll("usage: gr clone <git-src> <dir>\n");
+        try w.writeAll("usage: gr clone <git-src|share-url|bundle#k=...> <dir>\n");
         return;
+    }
+    if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
+        return cloneShare(io, alloc, w, rest[0], rest[1]);
     }
     const into = rest[1];
     // Create the destination as a guardrail repo, then clone git into it.
@@ -1204,8 +1233,489 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     try w.print("cloned {s} into {s}\n", .{ rest[0], into });
 }
 
+fn shareUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\usage: gr share [--base <url>] [--out <dir>] [branch...]
+        \\           encrypt this repo's objects under a fresh key and write them out
+        \\       gr share serve <dir> [port]
+        \\           host an exported share over HTTP (it never sees the key)
+        \\       gr bundle -o <file> [branch...]
+        \\           one sealed file; send the file one way, the key another
+        \\       gr clone <url-with-#k=> <dir>
+        \\
+    );
+}
+
+fn shareBranches(alloc: std.mem.Allocator, rest: []const []const u8, from: usize) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i = from;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.startsWith(u8, rest[i], "-")) {
+            i += 1;
+            continue;
+        }
+        try out.append(alloc, rest[i]);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn cmdShare(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len != 0 and (eq(rest[0], "-h") or eq(rest[0], "--help"))) return shareUsage(w);
+
+    if (rest.len != 0 and eq(rest[0], "serve")) {
+        if (rest.len < 2) return shareUsage(w);
+        var dir = std.Io.Dir.cwd().openDir(io, rest[1], .{}) catch {
+            try w.print("no such directory: {s}\n", .{rest[1]});
+            return;
+        };
+        defer dir.close(io);
+        const port: u16 = if (rest.len >= 3)
+            std.fmt.parseInt(u16, rest[2], 10) catch 7788
+        else
+            7788;
+        try w.print("serving encrypted objects from {s} on port {d} (ctrl-c to stop)\n", .{ rest[1], port });
+        try w.writeAll("this process cannot decrypt what it is serving\n");
+        try w.flush();
+        return share.serveDir(io, alloc, dir, port);
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    var base: []const u8 = "https://YOUR-HOST";
+    var out_dir: []const u8 = "share";
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if (eq(rest[i], "--base") and i + 1 < rest.len) {
+            base = rest[i + 1];
+            i += 1;
+        } else if (eq(rest[i], "--out") and i + 1 < rest.len) {
+            out_dir = rest[i + 1];
+            i += 1;
+        }
+    }
+
+    const wanted = try shareBranches(alloc, rest, 0);
+    defer alloc.free(wanted);
+
+    std.Io.Dir.cwd().createDirPath(io, out_dir) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
+    defer dest.close(io);
+
+    const key = share.newShareKey(io);
+    share.exportDir(&s, alloc, io, key, dest, wanted) catch |e| {
+        try w.print("share failed: {t}\n", .{e});
+        return;
+    };
+
+    const url = try share.encodeUrl(alloc, base, key);
+    defer alloc.free(url);
+
+    try w.print("wrote encrypted objects to {s}/\n\n{s}\n\n", .{ out_dir, url });
+    try w.writeAll("upload that directory anywhere static. the host never receives the key —\n");
+    try w.writeAll("it lives after the '#', which browsers and gr never put in a request.\n");
+    try w.print("sealed values stay sealed: whoever opens this gets the code, not the secrets.\n", .{});
+}
+
+fn cmdBundle(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var out_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if ((eq(rest[i], "-o") or eq(rest[i], "--out")) and i + 1 < rest.len) {
+            out_path = rest[i + 1];
+            i += 1;
+        }
+    }
+    const path = out_path orelse {
+        try w.writeAll("usage: gr bundle -o <file> [branch...]\n");
+        return;
+    };
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const wanted = try shareBranches(alloc, rest, 0);
+    defer alloc.free(wanted);
+
+    const key = share.newShareKey(io);
+    share.writeBundle(&s, alloc, io, key, path, wanted) catch |e| {
+        try w.print("bundle failed: {t}\n", .{e});
+        return;
+    };
+
+    const url = try share.encodeUrl(alloc, "file", key);
+    defer alloc.free(url);
+    const frag = std.mem.indexOf(u8, url, "#k=") orelse url.len;
+
+    try w.print("wrote {s}\n\nkey: {s}\n\n", .{ path, url[frag..] });
+    try w.print("open it with:  gr clone '{s}{s}' <dir>\n", .{ path, url[frag..] });
+    try w.writeAll("send the file and the key over different channels — either alone is useless.\n");
+}
+
+fn cloneShare(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    source: []const u8,
+    into: []const u8,
+) !void {
+    std.Io.Dir.cwd().createDirPath(io, into) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
+    defer dest.close(io);
+    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
+        Store.Error.RepoExists => try Store.open(io, alloc, dest),
+        else => return e,
+    };
+    defer s.deinit();
+
+    const is_http = std.mem.startsWith(u8, source, "http://") or
+        std.mem.startsWith(u8, source, "https://");
+
+    if (is_http) {
+        share.fetchHttp(&s, alloc, io, source) catch |e| {
+            try w.print("clone failed: {t}\n", .{e});
+            return;
+        };
+    } else {
+        const cut = std.mem.indexOf(u8, source, "#k=").?;
+        const encoded = source[cut + "#k=".len ..];
+        var key: share.ShareKey = undefined;
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const n = decoder.calcSizeForSlice(encoded) catch 0;
+        if (n != share.key_len) {
+            try w.writeAll("that key does not look like a gr share key\n");
+            return;
+        }
+        decoder.decode(&key, encoded) catch {
+            try w.writeAll("that key does not look like a gr share key\n");
+            return;
+        };
+        share.readBundle(&s, alloc, io, key, source[0..cut]) catch |e| {
+            try w.print("clone failed: {t}\n", .{e});
+            return;
+        };
+    }
+
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    if (s.refExists(branch)) {
+        const change = try s.readChange(try s.readRef(branch));
+        defer object.freeChange(alloc, change);
+        try workspace.materialize(&s, change.tree, dest);
+    }
+    try w.print("cloned into {s}\n", .{into});
+    try w.writeAll("any sealed values are still sealed — `gr unseal` needs a key you were not given.\n");
+}
+
+fn sealUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\usage: gr seal <path>       start sealing a file (creates .grsealed)
+        \\       gr seal             re-seal every tracked path now
+        \\       gr seal status      show sealed paths and who can read them
+        \\       gr unseal           write the plaintext files back out
+        \\       gr rotate           new repo key, re-wrapped to every member
+        \\
+    );
+}
+
+fn keyUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\usage: gr key new                 create your keypair
+        \\       gr key show                print your public key (share this)
+        \\       gr key add <name> <pubkey> grant someone access to the secrets
+        \\       gr key remove <name>       revoke (then `gr rotate`)
+        \\       gr key list                who can read the sealed values
+        \\
+    );
+}
+
+fn loadRepoManifest(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    work: std.Io.Dir,
+) !?seal.Manifest {
+    return (keyring.loadManifest(io, alloc, work) catch |e| {
+        try w.print("cannot read {s}: {t}\n", .{ seal.manifest_name, e });
+        return null;
+    }) orelse {
+        try w.print("nothing is sealed here yet (run `gr seal <path>`)\n", .{});
+        return null;
+    };
+}
+
+fn requireIdentity(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?seal.Identity {
+    return (try keyring.loadIdentity(io, alloc)) orelse {
+        try w.writeAll("no keypair yet — run `gr key new`\n");
+        return null;
+    };
+}
+
+fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len == 0) return keyUsage(w);
+    const sub = rest[0];
+
+    if (eq(sub, "new")) {
+        const id = keyring.createIdentity(io, alloc, false) catch |e| switch (e) {
+            keyring.Error.IdentityExists => {
+                const path = (try keyring.identityPath(alloc)) orelse "";
+                defer if (path.len != 0) alloc.free(path);
+                try w.print("you already have a keypair at {s}\n", .{path});
+                return;
+            },
+            keyring.Error.NoHome => {
+                try w.writeAll("cannot locate a config directory (set HOME or XDG_CONFIG_HOME)\n");
+                return;
+            },
+            else => return e,
+        };
+        try printPublicKey(alloc, w, id.publicId(), "created");
+        return;
+    }
+
+    if (eq(sub, "show")) {
+        const id = (try requireIdentity(io, alloc, w)) orelse return;
+        try printPublicKey(alloc, w, id.publicId(), "your public key");
+        return;
+    }
+
+    var work = try openWork(io);
+    defer work.close(io);
+
+    if (eq(sub, "list")) {
+        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        defer manifest.deinit();
+        const mine = if (try keyring.loadIdentity(io, alloc)) |id| id.publicId() else null;
+        for (manifest.members.items) |m| {
+            const fp = try m.public.fingerprint(alloc);
+            defer alloc.free(fp);
+            const is_me = if (mine) |p| std.mem.eql(u8, &p.x, &m.public.x) else false;
+            try w.print("{s}  {s}{s}\n", .{ m.name, fp, if (is_me) "  (you)" else "" });
+        }
+        return;
+    }
+
+    if (eq(sub, "add")) {
+        if (rest.len < 3) return keyUsage(w);
+        const name = rest[1];
+        const public = seal.PublicId.decode(rest[2]) catch {
+            try w.writeAll("that does not look like a gr public key\n");
+            return;
+        };
+        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        defer manifest.deinit();
+
+        const key = (try keyring.repoKey(io, alloc, &manifest)) orelse {
+            try w.writeAll("you cannot read this repo's secrets, so you cannot grant access\n");
+            return;
+        };
+        if (manifest.findMember(name)) |i| {
+            if (!std.mem.eql(u8, &manifest.members.items[i].public.x, &public.x)) {
+                const old_fp = try manifest.members.items[i].public.fingerprint(alloc);
+                defer alloc.free(old_fp);
+                try w.print("warning: {s} already exists with a different key ({s})\n", .{ name, old_fp });
+                try w.writeAll("if you did not expect this, stop and verify out of band\n");
+            }
+        }
+        try manifest.putMember(io, key, name, public);
+        try keyring.saveManifest(io, alloc, work, &manifest);
+
+        const fp = try public.fingerprint(alloc);
+        defer alloc.free(fp);
+        try w.print("{s} can now read the sealed values\n", .{name});
+        try w.print("  fingerprint  {s}\n", .{fp});
+        try w.print("confirm that out loud with them, then commit {s}\n", .{seal.manifest_name});
+        return;
+    }
+
+    if (eq(sub, "remove")) {
+        if (rest.len < 2) return keyUsage(w);
+        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        defer manifest.deinit();
+        if (!manifest.removeMember(rest[1])) {
+            try w.print("no member named {s}\n", .{rest[1]});
+            return;
+        }
+        try keyring.saveManifest(io, alloc, work, &manifest);
+        try w.print("removed {s} from {s}\n", .{ rest[1], seal.manifest_name });
+        try w.writeAll("they still hold the old key and every commit they already cloned.\n");
+        try w.writeAll("run `gr rotate`, then rotate the underlying secrets themselves\n");
+        try w.writeAll("(new database password, new API keys) — only that actually revokes them.\n");
+        return;
+    }
+
+    try keyUsage(w);
+}
+
+fn printPublicKey(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    public: seal.PublicId,
+    label: []const u8,
+) !void {
+    const enc = try public.encode(alloc);
+    defer alloc.free(enc);
+    const fp = try public.fingerprint(alloc);
+    defer alloc.free(fp);
+    try w.print("{s}\n\n{s}\n\nfingerprint  {s}\n", .{ label, enc, fp });
+}
+
+fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    if (rest.len != 0 and eq(rest[0], "status")) {
+        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        defer manifest.deinit();
+        for (manifest.paths.items) |p| {
+            const sealed = try seal.sealedPathAlloc(alloc, p);
+            defer alloc.free(sealed);
+            const present = if (work.access(io, p, .{})) |_| true else |_| false;
+            try w.print("{s} -> {s}{s}\n", .{ p, sealed, if (present) "" else "  (no local plaintext)" });
+        }
+        try w.print("{d} member(s) can read these values\n", .{manifest.members.items.len});
+        const key = try keyring.repoKey(io, alloc, &manifest);
+        if (key == null) try w.writeAll("you are not one of them\n");
+        return;
+    }
+
+    if (rest.len != 0 and (eq(rest[0], "-h") or eq(rest[0], "--help"))) return sealUsage(w);
+
+    if (rest.len != 0) {
+        const path = rest[0];
+        work.access(io, path, .{}) catch {
+            try w.print("no such file: {s}\n", .{path});
+            return;
+        };
+        const id = (try requireIdentity(io, alloc, w)) orelse return;
+
+        var manifest = (try keyring.loadManifest(io, alloc, work)) orelse
+            seal.Manifest.empty(alloc);
+        defer manifest.deinit();
+
+        const key = if (manifest.members.items.len == 0) blk: {
+            const fresh = seal.newRepoKey(io);
+            var name = try config.get(&s, alloc, "user.name") orelse
+                try alloc.dupe(u8, "me");
+            defer alloc.free(name);
+            if (name.len == 0) {
+                alloc.free(name);
+                name = try alloc.dupe(u8, "me");
+            }
+            try manifest.putMember(io, fresh, name, id.publicId());
+            break :blk fresh;
+        } else (try keyring.repoKey(io, alloc, &manifest)) orelse {
+            try w.writeAll("you cannot read this repo's secrets — ask a member to `gr key add` you\n");
+            return;
+        };
+        _ = key;
+
+        if (!try manifest.addPath(path)) {
+            try w.print("{s} is already sealed\n", .{path});
+        }
+        try keyring.saveManifest(io, alloc, work, &manifest);
+        try keyring.protectPath(io, alloc, work, path);
+    }
+
+    var plan = keyring.prepare(io, alloc, work) catch |e| {
+        try w.print("seal failed: {t}\n", .{e});
+        return;
+    };
+    defer plan.deinit();
+
+    if (plan.outputs.len == 0) {
+        try w.writeAll("nothing is sealed here yet (run `gr seal <path>`)\n");
+        return;
+    }
+    if (!plan.have_key) {
+        try w.writeAll("you cannot read this repo's secrets — ask a member to `gr key add` you\n");
+        return;
+    }
+    for (plan.sources, plan.outputs) |src, dst| {
+        try w.print("{s} -> {s}\n", .{ src, dst });
+    }
+    try w.print("commit {s} and the sealed file; the plaintext stays out of every change\n", .{seal.manifest_name});
+}
+
+fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const out = keyring.unsealAll(io, alloc, work) catch |e| switch (e) {
+        keyring.Error.NoManifest => {
+            try w.writeAll("nothing is sealed here yet (run `gr seal <path>`)\n");
+            return;
+        },
+        seal.Error.NotAMember => {
+            try w.writeAll("you cannot read this repo's secrets — ask a member to `gr key add` you\n");
+            try w.writeAll("(`gr key show` prints the public key they need)\n");
+            return;
+        },
+        seal.Error.BadToken => {
+            try w.writeAll("a sealed value failed to decrypt — the file may be corrupt or edited\n");
+            return;
+        },
+        else => return e,
+    };
+    try w.print("wrote {d} file(s)", .{out.written});
+    if (out.skipped != 0) try w.print(", skipped {d} with no sealed form", .{out.skipped});
+    try w.writeAll("\n");
+}
+
+fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var work = try openWork(io);
+    defer work.close(io);
+
+    var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+    defer manifest.deinit();
+
+    const old = (try keyring.repoKey(io, alloc, &manifest)) orelse {
+        try w.writeAll("you cannot read this repo's secrets, so you cannot rotate them\n");
+        return;
+    };
+
+    for (manifest.paths.items) |src| {
+        const dst = try seal.sealedPathAlloc(alloc, src);
+        defer alloc.free(dst);
+        if (work.access(io, src, .{})) |_| continue else |_| {}
+        const sealed = work.readFileAlloc(io, dst, alloc, .unlimited) catch continue;
+        defer alloc.free(sealed);
+        const plain = try seal.unsealText(alloc, old, src, sealed);
+        defer alloc.free(plain);
+        try work.writeFile(io, .{
+            .sub_path = src,
+            .data = plain,
+            .flags = .{ .permissions = .fromMode(0o600) },
+        });
+    }
+
+    const fresh = seal.newRepoKey(io);
+    try manifest.rewrapAll(io, fresh);
+    try keyring.saveManifest(io, alloc, work, &manifest);
+
+    for (manifest.paths.items) |src| {
+        const dst = try seal.sealedPathAlloc(alloc, src);
+        defer alloc.free(dst);
+        const plain = work.readFileAlloc(io, src, alloc, .unlimited) catch continue;
+        defer alloc.free(plain);
+        const sealed = try seal.sealText(alloc, fresh, src, plain);
+        defer alloc.free(sealed);
+        try work.writeFile(io, .{ .sub_path = dst, .data = sealed });
+    }
+
+    try w.print("rotated the repo key, re-wrapped to {d} member(s)\n", .{manifest.members.items.len});
+    try w.writeAll("anyone removed earlier still holds the OLD key and any commit they cloned.\n");
+    try w.writeAll("rotate the secrets themselves too — new password, new API key — or they keep working.\n");
+}
+
 test {
     std.testing.refAllDecls(@This());
+    _ = seal;
+    _ = keyring;
+    _ = share;
     _ = oid;
     _ = cdc;
     _ = object;

@@ -51,6 +51,12 @@ const fish_script =
     \\complete -c gr -n __fish_use_subcommand -a redo -d 'reapply what you just undid'
     \\complete -c gr -n __fish_use_subcommand -a serve -d 'share this repo over TCP'
     \\complete -c gr -n __fish_use_subcommand -a fetch -d 'sparse-pull a branch'
+    \\complete -c gr -n __fish_use_subcommand -a seal -d 'seal a .env-style file'
+    \\complete -c gr -n __fish_use_subcommand -a unseal -d 'write the plaintext files back out'
+    \\complete -c gr -n __fish_use_subcommand -a key -d 'manage who can read sealed values'
+    \\complete -c gr -n __fish_use_subcommand -a rotate -d 'new repo key, re-wrapped to members'
+    \\complete -c gr -n __fish_use_subcommand -a share -d 'encrypted share the host cannot read'
+    \\complete -c gr -n __fish_use_subcommand -a bundle -d 'one sealed file'
     \\complete -c gr -n __fish_use_subcommand -a watch -d 'auto-save on every file change'
     \\complete -c gr -n __fish_use_subcommand -a clone -d 'clone a git repo into guardrail'
     \\complete -c gr -n __fish_use_subcommand -a import -d "pull a git repo's HEAD into guardrail"
@@ -101,6 +107,12 @@ const zsh_script =
     \\    'redo:reapply what you just undid'
     \\    'serve:share this repo over TCP'
     \\    'fetch:sparse-pull a branch'
+    \\    'seal:seal a .env-style file'
+    \\    'unseal:write the plaintext files back out'
+    \\    'key:manage who can read sealed values'
+    \\    'rotate:new repo key, re-wrapped to members'
+    \\    'share:encrypted share the host cannot read'
+    \\    'bundle:one sealed file'
     \\    'watch:auto-save on every file change'
     \\    'clone:clone a git repo into guardrail'
     \\    'import:pull a git repo HEAD into guardrail'
@@ -136,7 +148,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve lfs completions version help"
+    \\  local commands="save snapshot snap status st diff log desc new switch sw branch branches work restore merge provenance why undo redo serve fetch watch clone import export sync push pull init config update gc blame resolve lfs completions seal unseal key rotate share bundle version help"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0

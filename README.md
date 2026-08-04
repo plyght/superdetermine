@@ -24,6 +24,8 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Bidirectional git interop | Import and export full history, branches, and tags. Push and pull to GitHub. |
 | Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
+| Sealed secrets | Commit `.env`. Values are encrypted per-variable; the plaintext is never an object. Team access is a wrapped key, not a service. |
+| Encrypted sharing | `gr share` and `gr bundle` hand out a link or a file the host cannot read. |
 
 ## Git, side by side
 
@@ -67,6 +69,51 @@ gr lfs env                # endpoint, cache location, settings
 ```
 
 On import, gr resolves LFS pointers to the real bytes (from `.git/lfs/objects`, else the LFS batch API) and stores them chunked in its own object database, so `gr diff`, `gr blame` and `gr work` all see real files. On export and push it writes the pointers back and uploads any objects the remote is missing. Set `gr config lfs.smudge false` to keep pointers verbatim instead, `lfs.url` to override the endpoint, and `lfs.upload false` to skip uploads.
+
+## Secrets you can actually commit
+
+`.env` is the file everyone gitignores and then mails around anyway. gr commits it instead — sealed.
+
+```
+gr key new                # your keypair, once per machine
+gr seal .env              # writes .env.sealed; .env itself becomes uncommittable
+gr save -m "add config"
+```
+
+`.env.sealed` is a normal tracked file that diffs cleanly:
+
+```
+DATABASE_URL=gr1:csEGYiVIFSnnLn4Q2oJv2TyekUkzChccyeVXlXtF3QQ8TrpS...
+STRIPE_KEY=gr1:HJh0CycJJ4ssQq3epof75ooeomALvzNQPGUo_5gAK3M6FNWS3U...
+```
+
+Each value gets its own key derived from the variable's name and path, and the nonce comes from the plaintext — so an unchanged value re-seals to identical bytes and only real edits show up in a diff. The name and path are authenticated, so moving a `STRIPE_KEY` ciphertext onto the `DATABASE_URL` line fails to decrypt rather than quietly returning the wrong secret. What this reveals, in full: your variable names, how many there are, each value's length, and whether a value repeats at that same name. Nothing else.
+
+Adding a teammate is a pull request, not an account:
+
+```
+gr key show                       # they run this, send you the string
+gr key add dana gr1lPATx6VZ...    # you run this, then commit .grsealed
+gr unseal                         # they run this, and have .env
+```
+
+The repo key is wrapped separately to each member with X25519 **and** ML-KEM-768 — an attacker has to break both, so values committed today stay sealed against a future quantum computer. `gr rotate` issues a new key and re-wraps it. It also tells you the part software cannot do: someone you removed still holds the old key and every commit they already cloned, so rotate the underlying credentials too.
+
+## Sharing without a service
+
+```
+gr share --base https://your-host --out ./share
+#  https://your-host/r/4fcfccde#k=ZRR1ErmnX1-F_oOLp_gd0dg14nY-agXhHZhMt6RiigY
+gr clone '<that url>' ./dir
+```
+
+Every object is encrypted under a fresh key and stored under a blinded name. The key lives after the `#`, which by the URL spec is never sent in a request — so the host serves bytes it cannot read and its terms of service stop being a security question. Object contents are verified against their own hashes on arrival, so a hostile host cannot substitute anything either.
+
+For no network at all, `gr bundle -o repo.grb` makes one sealed file; send the file and the key over different channels.
+
+The two layers compose the way you would want: share a repo and the recipient gets `.env.sealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not — without remembering to scrub anything. Granting the secrets is a separate, deliberate `gr key add`.
+
+Git interop deliberately has no share layer — GitHub sees your code so review works, and only your values stay sealed.
 
 ## Install
 
