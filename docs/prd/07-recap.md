@@ -33,7 +33,7 @@ Summarizes the current run as verified spans.
 ```
 gr recap since yesterday
 gr recap @a3f91c..HEAD
-gr recap last-green..
+gr recap @green..
 ```
 
 Sample output:
@@ -106,8 +106,8 @@ model call outside guardrail where it belongs.
 | --- | --- |
 | `gr recap` | Recap since the last save |
 | `gr recap since <when>` | Time bounded |
-| `gr recap <a>..<b>` | Between two changes, moments, or selectors |
-| `gr recap last-green..` | Everything since it last worked |
+| `gr recap <a>..<b>` | Between any two revspecs |
+| `gr recap @green..` | Everything since it last worked |
 | `gr recap --review` | Include diffs per span |
 | `gr recap --json` | Machine readable |
 

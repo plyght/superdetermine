@@ -94,6 +94,28 @@ before it has earned it.
 The chosen primary is recorded as a fact, so "why is this file the way it is"
 has an answer later.
 
+### It is a toggle, and off is a legitimate choice
+
+```
+merge.superpose = true | false
+```
+
+`false` restores exactly today's behavior: conflict markers in the worktree,
+`gr resolve` to clear them, nothing in a superposed state ever.
+
+This is not a grudging concession. A tree where files can quietly hold a second
+value is a real change to the mental model, and plenty of people will find
+non-sticky state appearing and disappearing more unsettling than useful. That is
+a reasonable preference, not a misunderstanding, and the feature should not
+argue with it.
+
+Consequences of `false` are stated rather than hidden: `remote.autopull = always`
+from [12](12-freshness.md) is refused, because automatic pulling is only safe
+when a conflict cannot break the tree.
+
+The default for v1 is `true` for new repos and `false` for existing ones, so
+nobody's working habits change under them on an upgrade.
+
 ### The tree always builds
 
 The property everything else depends on. No conflict markers are ever written to
@@ -264,6 +286,7 @@ flow so nothing a user already knows breaks.
 | Path granularity loses work when both sides changed different parts of a file | Three-way merge runs first and handles that case, so superposition only sees what genuinely could not be reconciled. Where a user wants a blend, `--edit` is one command |
 | Grading candidates doubles the check load during a merge | On demand or at idle only, capped per path, and memoized. A merge does not trigger a grading storm |
 | The feature is novel-sounding but nobody needs it | Honest risk. It is gated behind 04 and 10 landing and being used, and if parallel agent forks do not become a real workflow, this should not be built |
+| Users dislike files holding a hidden second value | `merge.superpose = false` is a first-class supported configuration, not a compatibility shim, and existing repos default to it |
 
 ## Sources
 

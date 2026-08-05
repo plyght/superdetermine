@@ -58,8 +58,55 @@ Storing a tree rather than a change is the key decision. A tree is already what
 `workspace.snapshot` builds before it wraps it in a change. Skipping the change
 wrapper means moments do not appear in `gr log`, do not have parents to
 maintain, do not need author records, and cannot be confused for commits by any
-existing code path. It also means a moment costs one tree object plus whatever
-blobs actually changed, which for a single file edit is a handful of chunks.
+existing code path.
+
+### Cost, which is where this feature dies if we are careless
+
+People edit code constantly. At an 800ms cadence an agent run generates thousands
+of moments, so anything that costs O(repo) per moment is fatal. Two things in the
+current codebase are exactly that, and both have to be fixed before moments ship.
+
+**Problem 1: the append is quadratic.** `oplog.zig`'s `record` reads the entire
+log into memory and rewrites the whole file on every append, with a comment
+noting that Zig 0.16 has no append helper. At op-log volume that is invisible. At
+moment volume it is O(n^2) in both IO and memory: the ten-thousandth moment of a
+session rewrites ten thousand lines to add one.
+
+Fix: a real append path, opening with `O_APPEND` and writing the single line.
+Same fix applies to `provenance` and `attribution`, which have the same shape and
+the same latent problem.
+
+**Problem 2: a full tree per moment is O(repo), not O(change).** `object.Tree` is
+a flat list of every path in the repo. At roughly 70 bytes per entry, a 10,000
+file repo is about 700 KB per tree. Content addressing means an unchanged tree
+costs nothing, but an agent editing one file changes the tree, so every single
+moment writes a new 700 KB object. One hour at one moment per second is
+multiple gigabytes of tree objects to record a few hundred edited lines. This is
+precisely the "big files" failure and it would be discovered by a user, not by
+us.
+
+Fix: **incremental trees with keyframes.** A moment stores a delta against the
+previous moment's tree, as added, modified, and removed entries, plus a base
+pointer. Every `moments.keyframe_interval` moments, default 200, or whenever the
+delta chain exceeds `moments.max_chain`, write a full tree instead.
+
+- A single-file edit costs one entry, roughly 70 bytes, plus the changed chunks.
+- Fifty edits in a run cost a few kilobytes of metadata rather than 35 MB.
+- Reconstruction is walking back to the nearest keyframe and folding forward,
+  bounded by the keyframe interval, so materializing any moment is O(chain), not
+  O(history).
+
+This is **lossless**. It is a different encoding of exactly the same information,
+verified by the criterion below: reconstructing any moment must produce a tree
+whose Oid equals the Oid of the full tree that would have been written. It is the
+same technique video containers use, for the same reason.
+
+**Retention still matters on top of this.** Cheap per moment is not free forever,
+and `moments.retain` plus `moments.max` bound the total.
+
+Target: **under 1 KB of new metadata per moment for a typical single-file edit**,
+excluding the content chunks, which would have been stored on the next save
+regardless.
 
 ### Stable identity
 
@@ -100,6 +147,8 @@ Cadence, retention, and which sources are live are all config:
 | `moments.sources` | `poll,command,agent` | Which triggers are live |
 | `moments.retain` | `14d` | Older moments are eligible for `gr gc` |
 | `moments.max` | `10000` | Hard cap per branch, oldest dropped first |
+| `moments.keyframe_interval` | `200` | Moments between full trees |
+| `moments.max_chain` | `200` | Force a keyframe if the delta chain grows past this |
 
 Retention is a real requirement, not a nicety. Unbounded fine grained capture on
 a large repo is how this feature becomes a disk usage bug report.
@@ -162,6 +211,13 @@ Sample `gr moments` output:
    a git export and re-import cycle.
 4. Store growth for a 50 write run is bounded by the sum of changed chunks, not
    by 50 worktree copies, verified by object count.
+5. Metadata cost is under 1 KB per moment for a single-file edit on a 10,000 file
+   repo, measured, not estimated.
+6. Reconstruction is lossless: for a sample of at least 500 moments across
+   keyframe boundaries, the folded tree's Oid equals the Oid of the full tree at
+   that state. This is the test that makes the encoding trustworthy.
+7. Appending the ten-thousandth moment costs the same as appending the first,
+   verified by timing, which is the proof the quadratic append is gone.
 5. `gr gc` reclaims moment trees past `moments.retain` and nothing reachable.
 6. Turning `moments.enabled` off returns behavior and disk usage to current.
 
@@ -171,5 +227,7 @@ Sample `gr moments` output:
 | --- | --- |
 | Battery and IO cost of continuous capture | One loop, not two. Reuse the existing signature poll and the stat cache index. Ship `moments.enabled` and measure on a laptop before defaulting on |
 | Disk growth on repos with large generated files | Retention and cap defaults, plus respecting `.grignore` exactly as saves do |
+| Delta chains make reading a moment slow | Bounded by `moments.keyframe_interval`, so reconstruction is O(200) entries in the worst case. Keyframes are the whole point of the interval |
+| A corrupt delta silently yields a wrong tree | Every moment stores the Oid of its full tree even though it stores the delta, so reconstruction is verified against a hash rather than trusted. A mismatch is a hard error, never a best-effort recovery |
 | Users confuse moments with commits | Distinct sigil `@`, distinct command, never in `gr log` without an explicit flag, never exported to git. Trees not changes, so they are structurally incapable of appearing as commits |
 | Poll misses a fast edit-then-revert | Accepted. Agent edit events catch most of it because they are event driven, not polled. Documented rather than pretended away |

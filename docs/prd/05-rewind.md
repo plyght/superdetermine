@@ -49,7 +49,7 @@ asks which one. Not a full TUI, a numbered list and a prompt, in the style of
 `gr resolve`.
 
 ```
-gr rewind --to-last-good
+gr green
 ```
 
 Rewinds to the most recent moment with a green verdict. Under [10](10-verified-states.md)
@@ -63,7 +63,7 @@ demand, bounded by `--max 20`, reporting what it ran and how far it went.
 
 This is the single most useful shape of the feature for agent work, because the
 question is rarely "which moment" and almost always "the last one that built".
-`gr at last-green` and `gr rewind --to-last-good` resolve the same state.
+`gr green`, `gr rewind @green`, and `gr at @green` all resolve the same state.
 
 ### Scoped rewind
 
@@ -83,16 +83,63 @@ This is the surgical case: the agent's work was mostly good, one file went bad.
 | Moment's tree missing from the store, garbage collected | Explicit error with the retention setting that caused it |
 | Rewind while `gr watch` is running | Watcher suppresses capture during the rewind and records one moment after, so a rewind does not generate a storm |
 
+## Addressing: one grammar, no quoted strings
+
+An earlier draft of this used `gr rewind last-green`, with `--to-last-good` as an
+alternative spelling. That is bad UX: a bare word that looks like a branch name,
+a long flag that means the same thing, and no consistency with anything else.
+
+The `@` sigil already means "a moment". Extend it into one small revspec grammar
+that works everywhere a revision is accepted, so there is exactly one thing to
+learn:
+
+| Ref | Means |
+| --- | --- |
+| `@` | The current state |
+| `@green` | The newest green moment |
+| `@red` | The newest red moment |
+| `@green~1` | The green moment before that one. `~n` walks back in any selector |
+| `@~3` | Three moments back |
+| `@2h`, `@30m`, `@yesterday` | By time |
+| `@a3f91c` | By id |
+| `@save` | The last explicit save |
+
+It composes with every command that takes a revision, which is the point:
+
+```
+gr diff @green            # what have I done since it worked
+gr rewind @green          # put it back
+gr work ../try-b --at @green~2
+gr recap @green..@        # what happened since
+gr show @2h
+```
+
+Two verbs exist for the operations frequent enough to deserve one, because
+nobody should type a revspec to do the most common thing:
+
+```
+gr back        # rewind one moment. gr back 3 for three
+gr green       # rewind to the last green state
+```
+
+`gr green` with no arguments is the "undo the last 40 minutes of agent damage"
+button, and it should be short enough to type without thinking.
+
 ## Command surface
 
 | Command | Behavior |
 | --- | --- |
-| `gr rewind @<id>` | Restore the worktree to a moment |
+| `gr green` | Rewind to the newest green state. The common case, one word |
+| `gr back [n]` | Rewind n moments, default 1 |
+| `gr rewind <ref>` | Restore the worktree to any revspec above |
 | `gr rewind` | Interactive picker over recent moments |
-| `gr rewind --to-last-good` | Rewind to the newest green state. Alias of `gr rewind last-green` |
-| `gr rewind @<id> -- <paths>` | Restore only those paths |
+| `gr rewind <ref> -- <paths>` | Restore only those paths |
 | `gr rewind --dry-run` | Show the diff that would be applied, change nothing |
 | `gr undo` | Already exists, now also undoes a rewind |
+
+The revspec grammar is specified here because rewind is where it is felt most,
+but it belongs to the whole tool. `gr diff`, `gr show`, `gr work --at`,
+`gr recap`, and `gr new` all take it.
 
 ## Out of scope
 
@@ -110,8 +157,11 @@ This is the surgical case: the agent's work was mostly good, one file went bad.
    comparing a fresh content signature against the moment's tree.
 2. `gr undo` immediately after a rewind restores the pre-rewind state exactly.
 3. `--dry-run` output equals the diff actually applied without it.
-4. `--to-last-good` on a run with a known breaking edit finds the last building
-   moment, tested against a seeded repo.
+4. `gr green` on a run with a known breaking edit finds the last building moment,
+   tested against a seeded repo.
+7. Every revspec form resolves identically across `rewind`, `diff`, `show`,
+   `work --at`, and `recap`, verified by a table-driven test. One grammar means
+   one implementation
 5. Rewinding with uncommitted changes never loses them, verified by finding them
    in `gr moments` afterwards.
 6. A scoped rewind touches only the named paths, verified by mtimes and status.
@@ -121,6 +171,6 @@ This is the surgical case: the agent's work was mostly good, one file went bad.
 | Risk | Mitigation |
 | --- | --- |
 | A user rewinds and loses work they had not saved | Structurally prevented. Pre-rewind capture is unconditional and happens before any write |
-| `--to-last-good` has to grade on demand and takes minutes | Only in the ungraded fallback. Bounded by `--max`, prints progress per attempt, ctrl-c safe. With 10 running normally this path is never taken |
+| `gr green` has to grade on demand and takes minutes | Only in the ungraded fallback. Bounded by `--max`, prints progress per attempt, ctrl-c safe. With 10 running normally this path is never taken |
 | Rewind and the running agent fight over the worktree | Warn loudly when an agent session has written within the last few seconds. This is a user coordination problem and the honest answer is to tell them, not to lock |
 | Path scoped rewind leaves the tree in a state that does not build | That is inherent to the operation and is what `--dry-run` is for |

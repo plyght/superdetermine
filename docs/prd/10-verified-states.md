@@ -16,6 +16,29 @@ whether it builds.
 
 ## 1. Why, and why it has not been done
 
+### The closest prior art, and what it does not do
+
+Before the argument, the credit. **git-branchless ships `git test`**, which runs a
+command across a revset, executes out of tree, parallelizes, and caches the
+result per commit per command. **Jujutsu has `jj run` designed** to do the same
+across revisions, citing git-branchless, `hg fix`, and Google's internal Mercurial.
+
+So the idea of running a check against a state and remembering the answer is not
+new, and this document previously implied it was. Withdrawn.
+
+Three things separate what follows from `git test`, and they are the reason this
+is a different feature rather than a reimplementation:
+
+1. **A revset is a set of commits.** Every intermediate state of an agent run was
+   never committed, so it cannot appear in a revset and cannot be graded by any
+   commit-shaped tool. Grading states that nobody committed is the whole point.
+2. **`git test` runs when invoked.** Grading here is continuous and unprompted,
+   which is what the research below actually measured.
+3. **For `git test` the cached verdict accelerates a search you started.** Here
+   the verdict decides where boundaries are cut, what `@green` resolves to, and
+   which superposition candidate wins. It is in the data model, not attached to a
+   subcommand.
+
 ### The research says continuous testing works
 
 This is not a new idea. Saff and Ernst measured it in 2003. Two findings, both
@@ -115,12 +138,15 @@ Every state in the log carries a verdict. Verdicts are produced by a background
 grader that never touches the developer's worktree.
 
 ```
-gr at last-green              # resolve to the newest verified-good state
-gr at green-before-red        # the last good state before the current breakage
-gr diff last-green            # what have I done since it worked
-gr rewind last-green          # put the tree back there
-gr log --verdicts             # history, graded
+gr green                  # the common case: put the tree back where it worked
+gr diff @green            # what have I done since it worked
+gr work ../b --at @green~2
+gr log --verdicts         # history, graded
 ```
+
+`@green` is part of one revspec grammar specified in [05](05-rewind.md), which
+composes across every command that takes a revision. There is no `last-green`
+string and no `--to-last-good` flag.
 
 ### Tiered checks
 
@@ -133,9 +159,8 @@ boolean:
 | `fast` | `checks.fast` | compile, typecheck, lint | Every quiet point |
 | `full` | `checks.full` | the test suite | Idle, or on demand, or before a boundary is rendered to git |
 
-A state is `green` at a tier, `red` at a tier, or `ungraded`. `gr at last-green`
-resolves against the strongest tier that has an answer and **says which tier it
-used**, because "last state that typechecked" and "last state that passed the
+A state is `green` at a tier, `red` at a tier, or `ungraded`. `@green` resolves
+against the strongest tier that has an answer and **says which tier it used**, because "last state that typechecked" and "last state that passed the
 suite" are different claims and conflating them would be dishonest.
 
 If the user configures nothing, gr does nothing. No inference of build commands
@@ -268,7 +293,7 @@ machines.
 This is worth far more under agents than it would have been in 2003, because
 agents thrash. Write, run, revert, rewrite, revert again. Every state an agent
 returns to is a state we have already graded, and it costs one hash lookup. A
-rewind to `last-green` followed by a re-run of the check is free by construction.
+rewind to `@green` followed by a re-run of the check is free by construction.
 
 Budget: **under 1ms**, one hash and one file read.
 
@@ -385,8 +410,8 @@ keep working. We are not building a system on top of them.
 3. Memo hit rate above 30 percent on a real agent run, because agents revisit
    states. Measured and reported, since this is the number the whole design bets
    on.
-4. `gr at last-green` is correct on a seeded repo with a known break, at both
-   tiers, and names the tier it answered from.
+4. `@green` is correct on a seeded repo with a known break, at both tiers, and
+   names the tier it answered from.
 5. On a seeded repo where an agent writes both the code and a test that passes on
    the pre-change tree, the verdict reports `co-authored` and `vacuous`. This is
    the case the whole trust model exists for and it gets a fixture.
@@ -420,4 +445,6 @@ keep working. We are not building a system on top of them.
 - [DORA Accelerate State of DevOps 2024](https://dora.dev/research/2024/dora-report/) and the [2025 report](https://cloud.google.com/blog/products/ai-machine-learning/announcing-the-2025-dora-report)
 - Parnin and Rugaber, [Resumption strategies for interrupted programming tasks](http://www.chrisparnin.me/pdf/parnin-sqj11.pdf)
 - Gradle, [Quantifying the Costs of Builds](https://gradle.com/blog/quantifying-the-costs-of-builds/)
+- [git-branchless `git test`](https://github.com/arxanas/git-branchless/wiki/Command:-git-test), the closest prior art
+- [jj run, design doc](https://jj-vcs.github.io/jj/latest/design/run/)
 - [Industry survey on debugging AI-generated code](https://syn-cause.com/blog/debug-time-increased)

@@ -43,8 +43,13 @@ authored. Zero keystrokes. It is also the smallest interval that provably
 contains a break, which is `git bisect`'s job, done in advance and for free. `09`
 
 **5. Address states by describing them, not by bookmarking them.** You never
-place a reference point in advance; you say what you want and the resolver finds
-it. `gr at last-green`, `gr rewind last-green`, `gr diff last-green`. `10`, `05`
+place a reference point in advance; you say what you want and one small revspec
+grammar resolves it. `@green` is the newest green state, `@green~1` the one
+before, `@2h` two hours ago, `@a3f91c` an explicit id, and it composes everywhere
+a revision is taken: `gr diff @green`, `gr work ../b --at @green~2`,
+`gr recap @green..@`. The two most common operations get bare verbs, `gr back`
+and `gr green`, because nobody should type a revspec to undo the last forty
+minutes. `05`
 
 **6. Stop letting conflicts halt anything.** Three-way merge runs first and
 handles most of it. What it cannot reconcile enters **superposition**: the path
@@ -62,30 +67,53 @@ boundaries are green by construction, every commit guardrail exports builds. `08
 Being precise here matters, because most of the parts are not new and claiming
 otherwise would be easy to falsify.
 
-| | git | Pijul | jj | Sapling | DeltaDB | **gr, proposed** |
+| | git | Pijul | jj | git-branchless | DeltaDB | **gr, proposed** |
 | --- | --- | --- | --- | --- | --- | --- |
-| Continuous capture, no explicit save | no | no | working copy auto-snapshot | partial | yes, CRDT ops | yes |
-| Whole-repo undo of any operation | no | no | op log | no | yes | already shipped |
+| Continuous capture, no explicit save | no | no | working copy auto-snapshot | no | yes, CRDT ops | yes |
+| Whole-repo undo of any operation | no | no | op log | yes | yes | already shipped |
 | Stable id that survives rewriting | no | patch identity | change ids | no | delta ids | moments |
 | Conflicts as repository state | no | **yes** | **yes** | no | auto-converged | yes |
-| Boundaries derived, not authored | no | no | no | no | partial | yes |
-| **States carry a verdict** | no | no | no | no | no | **yes** |
+| Run a check across revisions, cached | no | no | `jj run`, designed | **`git test`, shipped** | no | yes |
+| **Grade states nobody committed** | no | no | no | no | no | **yes** |
+| **Grade continuously, unprompted** | no | no | no | no | no | **yes** |
 | **Verdicts carry a warrant** | no | no | no | no | no | **yes** |
+| **Verdicts shape history** | no | no | no | no | no | **yes** |
 | **Conflict candidates are graded** | no | no | no | no | no | **yes** |
 
-Read the columns honestly. Jujutsu already auto-snapshots the working copy, keeps
-an operation log, gives changes stable ids that survive rebasing, and commits
-conflicts as first-class objects, crediting Darcs and Pijul for the last one.
-Pijul got to conflicts-as-state first, with a sounder theory. DeltaDB has
-continuous capture and gives every operation an identity. Content addressing is
-older than all of them.
+Read the columns honestly, because a first draft of this table was wrong.
 
-**The bottom three rows are the claim.** No version control system has ever
-attached a verdict to a state. History has always been a record of what changed,
-never a record of what worked, and every "does it work" answer lives in a
-separate system: CI, which runs late, on a server, on boundaries a human chose.
+Jujutsu already auto-snapshots the working copy, keeps an operation log, gives
+changes stable ids that survive rebasing, and commits conflicts as first-class
+objects, crediting Darcs and Pijul for the last one. Pijul got to
+conflicts-as-state first, with a sounder theory.
 
-Everything else in this plan is the machinery that makes those three rows
+And **git-branchless already ships `git test`**, which runs a command across a
+revset, executes out of tree, parallelizes, and **caches the result per commit
+per command**. Jujutsu has `jj run` designed to do the same, citing git-branchless,
+`hg fix`, and Google's internal Mercurial as prior art. So "run a check against a
+state and remember the answer" is not new, and an earlier version of this
+document claimed it was. That claim is withdrawn.
+
+What survives is narrower and, unlike the withdrawn version, actually holds:
+
+1. **They grade commits. We grade states nobody committed.** A revset is a set of
+   boundaries a human authored. Every intermediate state of a forty-minute agent
+   run is invisible to `git test`, because those states were never commits. That
+   is the entire "between commits" thesis and it is not reachable from a
+   commit-shaped tool.
+2. **They run when you ask. We run continuously.** `git test` is a command you
+   invoke, usually to search a stack you already have. Grading here is unprompted
+   and in the background, which is what Saff and Ernst actually measured and what
+   makes the answer already exist at the moment you want it.
+3. **For them a verdict is a cache. For us it is constitutive.** In git-branchless
+   the cached result speeds up a search you initiated. Here the verdict decides
+   where commit boundaries get cut (09), what `@green` resolves to (05), and which
+   superposition candidate wins (11). It is part of the data model, not an
+   accelerator bolted to a subcommand.
+4. **Nobody warrants the verdict.** Independence, relevance, and discrimination
+   have no counterpart anywhere. Every existing tool reports a bare pass or fail.
+
+Everything else in this plan is the machinery that makes those four things
 affordable.
 
 ### Why it has not been done
@@ -152,7 +180,7 @@ Full citations in [10](10-verified-states.md).
       ┌────────┼──────────────┬───────────────┤
       ▼        ▼              ▼               ▼
   05 rewind  09 cut at    07 recap        11 superposition
-  last-green  green       green/red spans  graded candidates
+  gr green    green       green/red spans  graded candidates
               boundaries
                    │
                    ▼
@@ -169,14 +197,15 @@ is a consequence, and `08` is how it reaches people who never install guardrail.
 
 | # | Feature | Surface | Answers |
 | --- | --- | --- | --- |
-| [10](10-verified-states.md) | **Verified states** | `gr at last-green` | When did this last work, and is that green worth anything |
+| [10](10-verified-states.md) | **Verified states** | `gr green`, `@green` | When did this last work, and is that green worth anything |
 | [03](03-moments.md) | Moments | `gr moments` | Every state between saves, stable ids |
-| [05](05-rewind.md) | Rewind | `gr rewind` | Put the tree back anywhere, undoably |
+| [05](05-rewind.md) | Rewind and revspecs | `gr back`, `gr green` | Put the tree back anywhere, undoably. Owns the `@` grammar |
 | [04](04-branch-at-a-moment.md) | Branch at a moment | `gr work --at` | Fork mid-run, free |
 | [07](07-recap.md) | Recap | `gr recap` | What happened, per verified span |
 | [09](09-commitless-flow.md) | Commitless flow | `flow.*` | Boundaries cut from the record |
 | [11](11-superposition.md) | Superposition | `gr super`, `gr collapse` | Conflicts that do not halt anything |
 | [08](08-git-bridge.md) | Git bridge | `gr git export` | Rendered commits that build |
+| [12](12-freshness.md) | Freshness | `gr status`, `remote.autopull` | Never start work on a stale base, with no daemon |
 | [06](06-live-session.md) | Live session handoff | `gr send --live` | Hand a run in flight to a teammate |
 
 Sequencing:
@@ -185,7 +214,7 @@ Sequencing:
 | --- | --- | --- |
 | 1 | 03 | The only foundation |
 | 2 | 10, then 05 | The thesis, then the payoff a user feels on day one |
-| 3 | 04, 07 | Small once 03 and 10 exist |
+| 3 | 04, 07, 12 | Small once 03 and 10 exist. 12 needs only 03 and pays off immediately |
 | 4 | 09, 11, 08 | Each gated on 10 proving out in real use. 11 additionally on 04 forks becoming a real workflow |
 | 5 | 06 | Distribution |
 
@@ -241,6 +270,7 @@ files.
 | Green is read as proof of quality | Verdicts never render as a bare boolean. `co-authored` and `vacuous` are words the user reads, not flags they go looking for |
 | Someone ships the wrong side of a superposition | Never silent. Always in `gr status`, export refuses by default, primary choice is a recorded fact |
 | Continuous publish sends code off the machine without a command | Opt in, per remote, explicit prompt. A consent problem, not a technical one. See [09](09-commitless-flow.md) |
+| Continuous capture writes enormous files | Two real problems in the current code, a quadratic append in `oplog.zig` and a full O(repo) tree per capture, are named and fixed in [03](03-moments.md) with incremental trees and keyframes. Target is under 1 KB of metadata per moment, verified losslessly against the full-tree hash |
 | The whole model is wrong and nobody wants it | Every phase is opt in and one config key reverts to today's behavior. That is what the staging in 09 is for |
 
 ## Sources
@@ -252,4 +282,7 @@ Full research citations live in [10](10-verified-states.md) and
 - [DeltaDB early access](https://zed.dev/deltadb)
 - [Zed's DeltaDB versions every operation, not every commit, Agent Wars](https://www.agent-wars.com/news/2026-06-13-zed-deltadb)
 - [Jujutsu conflicts and git comparison](https://docs.jj-vcs.dev/latest/technical/conflicts/)
+- [Jujutsu operation log](https://docs.jj-vcs.dev/latest/operation-log/) and [working copy](https://docs.jj-vcs.dev/latest/working-copy/)
+- [jj run, design doc](https://jj-vcs.github.io/jj/latest/design/run/)
+- [git-branchless `git test`](https://github.com/arxanas/git-branchless/wiki/Command:-git-test), the closest prior art to background grading
 - [Pijul model](https://pijul.org/model/)
