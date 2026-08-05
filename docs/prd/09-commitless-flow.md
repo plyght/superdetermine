@@ -1,7 +1,7 @@
 # 09. Commitless flow
 
-Status: draft. Phase 3, gated on 03 landing and proving out. Depends on: 03, 07.
-Blocks: nothing, but changes the default posture of the whole tool.
+Status: draft. Phase 4, gated on 03 and 10 proving out in real use. Depends on:
+03, 10. Blocks: nothing, but changes the default posture of the whole tool.
 
 ## The idea
 
@@ -40,11 +40,11 @@ depend on them. Being specific about which is the whole design.
 | What a commit provides | Can it be automated | How |
 | --- | --- | --- |
 | A durable snapshot so work is not lost | Yes, already | Moments (03). Capture is continuous and content addressed |
-| A named unit of intent for review | Yes | Intents from recap (07) are a better boundary than a manual save, because they are bounded by human turns rather than by whoever remembered to type `gr save` |
-| A stable ref for CI to build | Yes, with care | Auto-cut a change at each intent boundary. CI gets a real ref, the user never typed anything |
-| A unit for git interop | Yes | Derived at export. `gr git export` already synthesizes commits from changes; it synthesizes them from intent boundaries instead |
+| A named unit for review | Yes | A verified span from 10 is a better boundary than a manual save, because it is bounded by states that provably worked rather than by whoever remembered to type `gr save` |
+| A stable ref for CI to build | Yes | Auto-cut a change at each green boundary. CI gets a real ref, the user never typed anything, and the ref is already known to build |
+| A unit for git interop | Yes | Derived at export. `gr git export` already synthesizes commits from changes; it synthesizes them from green boundaries instead |
 | A unit to revert | Already better | `gr undo`, `gr revert`, and `gr rewind` (05) all operate without needing the user to have chosen a boundary in advance |
-| A point to bisect | Yes | Intent boundaries are better bisect points than arbitrary saves, and moments give finer resolution when a bisect narrows to one intent |
+| A point to bisect | Mostly removes the need | A green-to-green span is the smallest interval that provably contains the break, so the bisect is already done. Moments give finer resolution inside a span |
 
 Nothing on that list requires the user to author the boundary. Every one of them
 requires a boundary to *exist*, which is a different claim, and one we can
@@ -60,21 +60,26 @@ out in real use rather than just passing tests.
 
 ### Boundaries are cut, not authored
 
-A change is created automatically when an intent closes, meaning the human sends
-a new message to the agent, or the agent run goes idle past a threshold, or the
-configured check transitions from failing to passing.
+A change is created automatically when the tree transitions from red to green,
+which is to say when the work starts working again.
 
 ```
-flow.cut = intent          # intent | idle | check | manual
+flow.cut = green           # green | idle | manual
 flow.idle_ms = 120000
 ```
 
-The message for an auto-cut change is the human turn that opened the intent,
-which is usually a better commit message than what a person types at the end of
-an hour, because it is what they actually asked for.
+`green` is the default and the interesting one. Every change it cuts is verified
+by construction, so a history produced this way has the property that git
+histories are always claimed to have and never do: every commit builds.
 
-`gr describe` already exists to retitle a change, so correcting an auto-cut
-message is one command and is expected to be normal.
+`idle` cuts after a quiet period regardless of verdict, for projects with no
+check configured. `manual` is today's behavior.
+
+An auto-cut change is titled from the files and the span, for example
+`merge: 3 files, green after 6m red`. That is a worse sentence than a careful
+human would write and a better one than most people actually write at the end of
+an hour. `gr describe` already exists to retitle, so correcting it is one command
+and is expected to be normal rather than exceptional.
 
 ### Publishing is continuous
 
@@ -93,7 +98,7 @@ Destinations, in order of practicality:
    Continuous publish to a git remote pushes to a shadow ref namespace,
    `refs/gr/moments/<branch>`, which is invisible to normal git users and does not
    touch `refs/heads`. The real branch is updated only at cut boundaries. So a
-   teammate on plain git sees clean commits at intent boundaries, and a teammate
+   teammate on plain git sees clean commits at green boundaries, and a teammate
    on guardrail can fetch the full moment stream.
 2. **LAN peers.** Discovery already exists in `src/discovery.zig`. A peer on the
    same network gets the stream directly with no round trip to a remote.
@@ -113,7 +118,7 @@ prompt, not a default someone discovers later.
 
 | Before | After |
 | --- | --- |
-| `gr save -m "fix merge"` | Nothing. The intent boundary cuts it and titles it from your own words |
+| `gr save -m "fix merge"` | Nothing. The tree going green cuts it |
 | `gr push` | Nothing. Objects are already there |
 | `gr status` to see what is uncommitted | `gr status` shows the live position in the stream and what has been published |
 | Open a PR to show someone | `gr send --live`, or the branch is already visible |
@@ -129,10 +134,10 @@ Three stages, each shippable alone, each reversible with one config key. This
 matters because guardrail's core promise is that adopting it is reversible, and
 a flow change is the easiest place to accidentally break that promise.
 
-**Stage 1: opt in, capture only.** `flow.cut = intent`, publish off. The user
+**Stage 1: opt in, capture only.** `flow.cut = green`, publish off. The user
 stops typing `gr save`. Everything else is unchanged, git interop is unchanged,
 and turning it off returns to exactly today's behavior. This is small and mostly
-falls out of 03 and 07.
+falls out of 03 and 10.
 
 **Stage 2: opt in publishing.** `flow.publish = remote`. Shadow refs, background
 replication, and a `gr status` that reports publish state. The bulk of the new
@@ -169,9 +174,9 @@ pitch is that adopting it is reversible, that is the right side of the trade.
 
 ## Success criteria
 
-1. A full agent run with `flow.cut = intent` produces changes at the same
+1. A full agent run with `flow.cut = green` produces changes at the same
    boundaries a careful human would have chosen, evaluated by hand on ten real
-   runs.
+   runs, and every resulting change passes its check when rebuilt from scratch.
 2. A teammate using only git sees a normal branch with clean commits and no
    shadow refs in their default fetch.
 3. Continuous publish keeps a remote within `flow.publish_interval_ms` of local

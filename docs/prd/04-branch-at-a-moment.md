@@ -58,21 +58,20 @@ the mid-run case: the primary worktree keeps going, and the fork is a directory
 you can point a second agent at. No branch bookkeeping until you decide the fork
 was worth keeping.
 
-### Fork the run, not just the tree
+### Grading both forks
+
+Because forks are workspaces and 10 grades workspaces, the two attempts get
+verdicts without anyone running anything:
 
 ```
-gr work ../try-b --at @a3f91c --with-conversation
+gr work ../try-a --at @a3f91c
+gr work ../try-b --at @a3f91c
+gr status --all          # both forks, both verdicts
 ```
 
-Additionally writes the conversation up to that moment's message id (01) into
-the new workspace as `.gr/session-context.md`, so the second agent can be started
-with the same context the first one had at that instant. This is the piece that
-makes it a fork of the *work* rather than a fork of the *files*, and it is the
-part that is hard for anyone who does not store conversations.
-
-Explicitly not: resuming the agent's own internal session state. We cannot do
-that and should not claim to. We hand the new agent a transcript, which is what a
-human would do.
+This is the honest version of "compare two approaches". Not a judgment about
+which is better designed, but the one fact that is actually machine-decidable and
+that you would otherwise have to check by hand, twice.
 
 ### Compare forks
 
@@ -90,7 +89,6 @@ parallel agent attempts is one command instead of a manual dance.
 | --- | --- |
 | `gr new <name> @<moment>` | Branch from a moment |
 | `gr work <dir> --at @<moment>` | COW workspace at a moment, no branch |
-| `gr work <dir> --at @<moment> --with-conversation` | Same, plus transcript context |
 | `gr diff @<a> @<b>` | Diff two moments |
 | `gr diff <workspace> <workspace>` | Diff two workspaces |
 | `gr branch --origins` | Show which moment each branch forked from |
@@ -102,9 +100,8 @@ sigil disambiguating. `gr restore`, `gr revert`, and `gr merge` all take them.
 
 - A virtual filesystem or FUSE mount. COW copies are fast enough and do not
   require a kernel module or a daemon.
-- Automatically running a second agent. We create the workspace and the context
-  file. Launching the agent is the user's business, and every agent has a
-  different invocation.
+- Automatically running a second agent. We create the workspace. Launching the
+  agent is the user's business, and every agent has a different invocation.
 - Merging two forks automatically. `gr merge` already exists and already does
   three way merge with `gr resolve`. Forks merge like anything else.
 
@@ -116,8 +113,8 @@ sigil disambiguating. `gr restore`, `gr revert`, and `gr merge` all take them.
    the changed bytes, verified with `du`, not the size of the tree.
 3. Branching from a moment mid-run does not disturb the running agent's worktree,
    verified by running an agent and forking under it.
-4. `--with-conversation` produces a transcript that a fresh agent can be started
-   from, tested by hand with at least two different agents.
+4. Two forks of the same moment are graded independently by 10 without either
+   grading run touching the other's worktree.
 5. A branch created from a moment exports to git cleanly and round trips.
 
 ## Risks
@@ -127,4 +124,4 @@ sigil disambiguating. `gr restore`, `gr revert`, and `gr merge` all take them.
 | Filesystem does not support reflink or clonefile | `gr work` already handles this. Fall back to a plain copy and say so, as it does today |
 | Forking mid-run races the agent writing files | The moment's tree is already in the store, so materialization reads from the store and never from the live worktree. No race by construction |
 | Moment aged out by retention before someone branches from it | `gr new` from a moment pins it, and the retention sweep skips pinned moments. Also warn when branching from a moment near expiry |
-| Users expect the forked agent to remember | Documentation is explicit that this is a transcript handoff, not session resumption. The command name says `--with-conversation`, not `--resume` |
+| Users expect a fork to carry the agent's memory | It does not, and nothing here claims it does. A fork is a fork of the tree. Starting an agent on it is the user's business |

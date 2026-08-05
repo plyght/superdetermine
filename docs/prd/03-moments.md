@@ -1,6 +1,7 @@
 # 03. Moments
 
-Status: draft. Phase 1, foundation. Depends on: nothing. Blocks: 04, 05, 06.
+Status: draft. Phase 1, the only foundation. Depends on: nothing.
+Blocks: 04, 05, 06, 10.
 
 ## Problem
 
@@ -32,8 +33,9 @@ We want the same property one level finer.
 
 ## What it is
 
-A moment is a captured worktree state between saves, with a stable short id, a
-cause, and a link to the conversation position when one is known.
+A moment is a captured worktree state between saves, with a stable short id and
+a cause. Moments are what [10](10-verified-states.md) grades, so this is the
+foundation everything else stands on.
 
 ### Record
 
@@ -41,7 +43,7 @@ Appended to `.gr/moments`, one line per moment, in the same escaped line format
 as `provenance` and `attribution`:
 
 ```
-<moment-id> <tree-oid> <unix_ms> <cause> <branch>\t<agent>\t<session>\t<message-id>\t<summary>
+<moment-id> <tree-oid> <unix_ms> <cause> <branch>\t<agent>\t<session>\t<summary>
 ```
 
 | Field | Notes |
@@ -49,7 +51,7 @@ as `provenance` and `attribution`:
 | `moment-id` | 8 bytes hex, see below |
 | `tree-oid` | The tree object for the whole worktree at that instant. Not a change. No parent, no author, no message |
 | `cause` | `agent-edit`, `human-edit`, `command`, `save`, `manual` |
-| `agent`, `session`, `message-id` | Populated when `agentscan` can attribute the capture, empty otherwise |
+| `agent`, `session` | Populated when `attribution.zig` can attribute the capture, empty otherwise. Existing machinery, no new integrations |
 | `summary` | Short human string, for example `wrote src/merge.zig` or `3 files` |
 
 Storing a tree rather than a change is the key decision. A tree is already what
@@ -78,15 +80,16 @@ to guess whether an argument is a change or a moment.
 
 Three sources, all optional and all configurable:
 
-1. **Agent edit events.** `agentscan.zig` already surfaces edits with timestamps.
-   A capture triggered by a new edit event carries full attribution, including
-   the message id from 01. This is the highest value source and the one that
-   makes moments meaningfully different from a dumb autosave.
-2. **The signature poll.** `watch.zig`'s existing 800ms loop, redirected to
-   record a moment instead of calling `doSave`. This catches human edits and
-   agents whose logs we cannot read.
-3. **Command boundaries.** Before any mutating `gr` command, capture a moment so
+1. **The signature poll.** `watch.zig`'s existing 800ms loop, redirected to
+   record a moment instead of calling `doSave`. This is the primary source and it
+   works for every editor, every agent, and every tool, because it watches the
+   filesystem and nothing else.
+2. **Command boundaries.** Before any mutating `gr` command, capture a moment so
    `gr rewind` (05) always has a pre-command state.
+3. **Agent edit events.** `agentscan.zig` already surfaces edits with timestamps,
+   so where it happens to know who wrote a file, the moment records it. This is a
+   labeling nicety over existing code, not a dependency. Every source above works
+   with it switched off, and no feature may require it.
 
 Cadence, retention, and which sources are live are all config:
 
@@ -94,7 +97,7 @@ Cadence, retention, and which sources are live are all config:
 | --- | --- | --- |
 | `moments.enabled` | `true` | Master switch |
 | `moments.interval_ms` | `800` | Poll cadence, shared with the watcher, not a second loop |
-| `moments.sources` | `agent,poll,command` | Which triggers are live |
+| `moments.sources` | `poll,command,agent` | Which triggers are live |
 | `moments.retain` | `14d` | Older moments are eligible for `gr gc` |
 | `moments.max` | `10000` | Hard cap per branch, oldest dropped first |
 
@@ -103,10 +106,14 @@ a large repo is how this feature becomes a disk usage bug report.
 
 ### Relationship to saves
 
-A save is still the unit of intent. Moments are the unit of observation. When
-`gr save` runs, the moments since the previous save are marked as belonging to
-that change, which is what lets 02 tighten its diffs and 07 group its recap.
-They are not deleted at save time, they age out by retention.
+Moments are the unit of observation. A save, for as long as saves exist, is the
+unit a human chose. When `gr save` runs, the moments since the previous save are
+marked as belonging to that change, which is what lets 07 group its recap. They
+are not deleted at save time, they age out by retention.
+
+Under 10 the interesting boundary stops being the save and becomes the pair of
+moments that bracket a verified-good stretch of work. Moments have to exist first
+either way.
 
 `gr watch` is redesignated: it stops auto-saving and starts recording moments,
 which is what it should have been doing. The experimental label comes off. This

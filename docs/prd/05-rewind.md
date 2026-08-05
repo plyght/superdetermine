@@ -52,14 +52,18 @@ asks which one. Not a full TUI, a numbered list and a prompt, in the style of
 gr rewind --to-last-good
 ```
 
-Rewinds to the most recent moment where the configured check passed. `checks.cmd`
-is a config key holding a command, typically a build or test invocation.
-Moments do not run checks at capture time, that would be far too expensive, so
-this walks backwards from the current moment running the check until one passes,
-with a bound of `--max 20`. It reports what it ran and how far it went.
+Rewinds to the most recent moment with a green verdict. Under [10](10-verified-states.md)
+this is a lookup, not a search: states are graded continuously in the background,
+so the answer is already known and rewinding to it costs one hash lookup and a
+tree materialization.
+
+Where a stretch of moments is ungraded, for instance because grading was off or
+the machine was on battery, it falls back to walking backwards and grading on
+demand, bounded by `--max 20`, reporting what it ran and how far it went.
 
 This is the single most useful shape of the feature for agent work, because the
 question is rarely "which moment" and almost always "the last one that built".
+`gr at last-green` and `gr rewind --to-last-good` resolve the same state.
 
 ### Scoped rewind
 
@@ -85,15 +89,16 @@ This is the surgical case: the agent's work was mostly good, one file went bad.
 | --- | --- |
 | `gr rewind @<id>` | Restore the worktree to a moment |
 | `gr rewind` | Interactive picker over recent moments |
-| `gr rewind --to-last-good` | Walk back until `checks.cmd` passes |
+| `gr rewind --to-last-good` | Rewind to the newest green state. Alias of `gr rewind last-green` |
 | `gr rewind @<id> -- <paths>` | Restore only those paths |
 | `gr rewind --dry-run` | Show the diff that would be applied, change nothing |
 | `gr undo` | Already exists, now also undoes a rewind |
 
 ## Out of scope
 
-- Rewinding a conversation. Messages are a record of what happened and are not
-  rewound. Redaction (01) is the only thing that alters a conversation.
+- Rewinding verdicts. A verdict is a fact about a tree hash and stays true
+  forever. Rewinding to a green state does not re-run anything, because the
+  memo in 10 already holds the answer.
 - Automatic rewind on a failing check. Deciding to throw away work is a human
   decision, and an automatic version of this would be a very effective way to
   lose work.
@@ -116,6 +121,6 @@ This is the surgical case: the agent's work was mostly good, one file went bad.
 | Risk | Mitigation |
 | --- | --- |
 | A user rewinds and loses work they had not saved | Structurally prevented. Pre-rewind capture is unconditional and happens before any write |
-| `--to-last-good` runs a check 20 times and takes minutes | Bounded by `--max`, prints progress per attempt, ctrl-c safe. Documented as potentially slow because it is running the user's build |
+| `--to-last-good` has to grade on demand and takes minutes | Only in the ungraded fallback. Bounded by `--max`, prints progress per attempt, ctrl-c safe. With 10 running normally this path is never taken |
 | Rewind and the running agent fight over the worktree | Warn loudly when an agent session has written within the last few seconds. This is a user coordination problem and the honest answer is to tell them, not to lock |
 | Path scoped rewind leaves the tree in a state that does not build | That is inherent to the operation and is what `--dry-run` is for |
