@@ -142,6 +142,112 @@ If the user configures nothing, gr does nothing. No inference of build commands
 from the presence of a `package.json`, because guessing wrong here means running
 an arbitrary command the user did not ask for.
 
+### Green is not enough, and a boolean cannot say why
+
+The obvious objection, and the correct one: an agent writes the code, writes the
+test, the test passes. Green means the agent agreed with itself. A tree can
+compile cleanly, pass a suite, and still be bad work.
+
+There are two bad answers to this. One is to trust the boolean anyway, which
+means shipping a metric the agent can trivially satisfy. The other is to point a
+model at the diff and ask if it is good, which is a solved and crowded problem,
+costs an API key, is not fast, is not deterministic, and is not a version control
+system's job.
+
+The middle ground is to stop treating a verdict as a boolean and start treating
+it as **a claim with a provenance**. Three properties, all computed
+deterministically, none requiring a model, and two of them free because we are
+already computing the inputs for other reasons.
+
+#### Independence: who wrote the check
+
+`src/attribution.zig` already records, per file, whether a human or an agent
+authored it, with confidence. So for any verdict we can ask whether the code and
+the check that blessed it were authored by the same actor within the same span.
+
+| Independence | Meaning |
+| --- | --- |
+| `independent` | Source changed, check files did not, and the check is human-authored. The strongest green available |
+| `co-authored` | The same agent touched both the source and the check in this span. Self-certification, and the user should see the word |
+| `unattributed` | No attribution data. Say so rather than assuming either way |
+
+This costs nothing. The data is already in the repo and the join is a set
+intersection.
+
+#### Relevance: did the check touch what changed
+
+Layer 2 below records the exact set of files a check reads while it runs. That
+same read-set answers a question coverage tools normally charge a lot for: **did
+anything the check executed actually read the file you changed?**
+
+If the check ran green but never opened `src/merge.zig`, then green says nothing
+whatsoever about the change to `src/merge.zig`. That is a common and completely
+invisible failure today, and here it falls out of a mechanism we are building
+anyway.
+
+Reported as a fraction: `relevance 2/5 changed files exercised`.
+
+#### Discrimination: would the check have failed before
+
+The strongest signal and the only one that costs a run. A test that passes on the
+code from *before* your change is not testing your change.
+
+gr can check this and almost nothing else can, because gr has every prior state
+content-addressed and can materialize one into a COW clone in milliseconds. When
+a span adds or modifies check files, run the new check against the previous
+tree:
+
+- Check fails on the old tree, passes on the new one: it **discriminates**. It is
+  a real test of this change.
+- Check passes on both: it is **vacuous** with respect to this change. It may
+  still be a fine test of something else, but it did not earn the green you are
+  about to trust.
+
+This is a cheap approximation of mutation testing that skips the expensive part.
+Instead of synthesizing mutants, use the mutant history already gave you. One
+extra run, only when check files changed, memoized by tree hash like everything
+else so it never repeats.
+
+The research supports the substitution. Mutation analysis is the standard for
+evaluating whether a test suite is actually any good, because seeded faults are
+empirically coupled to real ones, while **coverage is not**: a line can be
+executed with no assertion checking its behavior, and the suite still reports
+green. Google's mutation testing work, deployed across their codebase, exists
+precisely because coverage was not telling them what they needed. Full mutation
+testing is far too slow to run continuously. Discrimination against the previous
+tree is one mutant, chosen for free, and it is exactly the mutant that matters
+for the change in front of you.
+
+For the failure mode that prompted this, an agent writing a test that only its
+own new code satisfies and that never fails on anything, `vacuous` plus
+`co-authored` names it exactly, deterministically, in milliseconds.
+
+#### What this produces
+
+A verdict reads as a claim and its warrant:
+
+```
+@a3f91c   green   full     independent   relevance 5/5   discriminating
+@8b0d27   green   full     co-authored   relevance 5/5   vacuous
+@41c8ea   green   fast     unattributed  relevance 0/3   n/a
+```
+
+The second line is the case the user was worried about, surfaced as text, with no
+model involved.
+
+#### It labels, it does not block
+
+Nothing here refuses an operation, fails a build, or gates a push. It is a
+routing signal: it tells a reviewer with forty minutes of agent output in front
+of them **where to spend their attention**, which is the actual scarce resource.
+Turning any of this into a gate would make it a metric, and a metric an agent is
+optimized against stops being a signal.
+
+And the honest boundary: this says nothing about whether the design is good, the
+abstraction is right, or the code is worth keeping. It cannot and it should not
+pretend to. It answers a narrower question well, which is whether the green in
+front of you is worth anything.
+
 ## 3. Making it fast
 
 This is the part that decides whether anyone uses it. The design is five layers
@@ -227,6 +333,8 @@ not a slogan, and it is enforced rather than hoped for.
 | Operation | Target | Why it is achievable |
 | --- | --- | --- |
 | Record a state | < 5ms at 10k files | Stat-cache index, existing |
+| Independence and relevance | < 10ms | Set intersection over attribution and the read-set, both already computed |
+| Discrimination | One extra check run | Only when check files changed in the span, memoized so it never repeats |
 | Verdict lookup | < 1ms | One BLAKE3 and one read |
 | Decide whether a grade is needed | < 10ms | Read-set intersection against changed paths |
 | COW clone for a grade | < 200ms at 10k files | clonefile / reflink, existing `gr work` |
@@ -256,6 +364,15 @@ keep working. We are not building a system on top of them.
 - Per-test granularity in v1. Grading is per check, whole suite. Per-test needs
   the runner's cooperation and is per language, which is exactly the trap that
   killed 01.
+- Full mutation testing. Discrimination is one mutant, taken from history for
+  free. Synthesizing mutants is orders of magnitude more expensive and belongs in
+  a dedicated tool, not in a VCS's background budget.
+- Any judgment about design, architecture, or whether the code is worth keeping.
+  Not computable without a model, and pointing a model at a diff is a crowded
+  solved problem that is not this tool's job.
+- Gating. Nothing here blocks a push, fails a build, or refuses an operation. The
+  moment a signal becomes a gate, it becomes a target, and an agent optimized
+  against it stops producing signal.
 - Running checks on a remote or in CI. Local, spare capacity, that is it.
 - Automatically reverting on red. Deciding to throw away work stays human.
 
@@ -270,6 +387,11 @@ keep working. We are not building a system on top of them.
    on.
 4. `gr at last-green` is correct on a seeded repo with a known break, at both
    tiers, and names the tier it answered from.
+5. On a seeded repo where an agent writes both the code and a test that passes on
+   the pre-change tree, the verdict reports `co-authored` and `vacuous`. This is
+   the case the whole trust model exists for and it gets a fixture.
+6. A green verdict from a check that never opened the changed file reports
+   `relevance 0/N` rather than a bare green.
 5. `gr status` latency is unchanged with grading on, within noise.
 6. Killing the grader mid-run leaves no partial state and no lost verdicts.
 7. With `checks.enabled = false`, CPU, disk, and latency are identical to today.
@@ -278,6 +400,9 @@ keep working. We are not building a system on top of them.
 
 | Risk | Mitigation |
 | --- | --- |
+| Green is treated as proof of quality when it is only proof of agreement | Verdicts are never rendered as a bare boolean. Independence, relevance, and discrimination print alongside, and `co-authored` is a word the user reads rather than a flag they have to go looking for |
+| Trust dimensions get gamed once people know about them | They label rather than gate, so there is no threshold to optimize against. If any of them is later wired to block something, that decision should be revisited against this row |
+| Discrimination is wrong for tests that legitimately pass on old code | Correct and expected. A regression guard added alongside unrelated work is vacuous *with respect to that change* and the wording says so. It is a statement about this span, not a judgment of the test |
 | A slow or flaky suite makes continuous grading useless | Tiering. `checks.fast` carries the interactive experience, `checks.full` runs at idle. A flaky check poisons the memo, so a verdict records the check's exit code and duration, and `gr doctor` flags checks whose verdict flips on an identical tree hash, which is the definition of flaky and worth surfacing anyway |
 | Read-set tracing is unavailable or blocked by a hardened environment | Detect and fall back to layer 3, report it in `gr doctor`. Never pretend to a precision we do not have |
 | A check with side effects runs constantly, hitting a network or a database | The COW clone is isolated for the filesystem but not for the network. Off by default, and the first-run prompt states plainly that the command will be executed repeatedly |
@@ -288,6 +413,8 @@ keep working. We are not building a system on top of them.
 
 - Saff and Ernst, [Reducing wasted development time via continuous testing](https://homes.cs.washington.edu/~mernst/pubs/wasted-time-issre2003.pdf), ISSRE 2003
 - Saff and Ernst, [Continuous Testing in Eclipse](https://www.sciencedirect.com/science/article/pii/S1571066104051941)
+- Petrović and Just, [Does mutation testing improve testing practices?](https://homes.cs.washington.edu/~rjust/publ/mutation_testing_practices_icse_2021.pdf), ICSE 2021, Google's deployment
+- [Practical Mutation Testing at Scale](https://arxiv.org/pdf/2102.11378)
 - Memon et al., [Taming Google-Scale Continuous Testing](https://research.google.com/pubs/archive/45861.pdf), ICSE-SEIP 2017
 - Machalica et al., [Predictive Test Selection](https://arxiv.org/abs/1810.05286), and the [engineering write-up](https://engineering.fb.com/2018/11/21/developer-tools/predictive-test-selection/)
 - [DORA Accelerate State of DevOps 2024](https://dora.dev/research/2024/dora-report/) and the [2025 report](https://cloud.google.com/blog/products/ai-machine-learning/announcing-the-2025-dora-report)

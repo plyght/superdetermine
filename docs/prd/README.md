@@ -38,6 +38,15 @@ in a throwaway copy-on-write clone, and the natural unit of history becomes the
 span between two states that passed. Derived, not authored. Zero keystrokes.
 Smallest interval that provably contains a break.
 
+Green alone is a weak signal, because an agent that writes both the code and the
+test has only proved it agrees with itself. So a verdict is never a bare boolean.
+It carries **independence** (did the same actor author the code and the check),
+**relevance** (did the check actually read the changed files), and
+**discrimination** (would the check have failed on the previous tree). All three
+are deterministic, none involves a model, and two are free because their inputs
+are already being computed. They label rather than gate, because a signal an agent
+is optimized against stops being a signal.
+
 The research says this works and has said so since 2003. The reason it never
 reached a VCS is that isolating a test run and memoizing its verdict were both
 expensive, and guardrail already solved both for unrelated reasons: millisecond
