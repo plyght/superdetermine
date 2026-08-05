@@ -169,7 +169,8 @@ pitch is that adopting it is reversible, that is the right side of the trade.
 - Removing `gr save` and `gr push`. They stay, permanently, as the explicit path.
 - Continuous publish as a default in v1. See stage 3.
 - Automatic conflict resolution across concurrent writers. Single writer per
-  branch, same as 06. Forking is free and merging is `gr merge`.
+  branch, same as 06. Forking is free, merging is `gr merge`, and what merge
+  cannot reconcile superposes rather than halting. See [11](11-superposition.md).
 - Publishing to a remote the user has not explicitly configured for it.
 
 ## Success criteria

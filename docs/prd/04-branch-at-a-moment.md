@@ -103,7 +103,9 @@ sigil disambiguating. `gr restore`, `gr revert`, and `gr merge` all take them.
 - Automatically running a second agent. We create the workspace. Launching the
   agent is the user's business, and every agent has a different invocation.
 - Merging two forks automatically. `gr merge` already exists and already does
-  three way merge with `gr resolve`. Forks merge like anything else.
+  three way merge with `gr resolve`. Forks merge like anything else, and what
+  cannot be reconciled superposes rather than halting. See
+  [11](11-superposition.md).
 
 ## Success criteria
 
