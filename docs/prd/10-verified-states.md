@@ -320,16 +320,91 @@ Implementation: `ptrace` or an `LD_PRELOAD` shim on Linux, and the same trick vi
 `DYLD_INSERT_LIBRARIES` on macOS. Where tracing is unavailable or refused, fall
 back to layer 3 alone and say so in `gr doctor`, rather than silently degrading.
 
-### Layer 3: debounce, coalesce, supersede
+### Layer 3: grade the transition, not the timeline
 
-- Grade at **quiet points**, not at every state. A quiet point is
-  `checks.quiet_ms` of no writes, default 400ms for fast and 3000ms for full.
+The layer that decides how much work there is at all, and the one where the naive
+design is badly wrong.
+
+Grading every captured state is a **sweep**: 500 moments in a run means 500 check
+runs, which is absurd and would make the feature unusable. But sweeping was never
+necessary, because the thing anyone actually wants is not a verdict on every
+state. It is two answers:
+
+- Where is the newest green state, so `@green` resolves correctly.
+- Where exactly did it break, so the red span in `gr recap` is accurate.
+
+Both are **boundaries**, and finding a boundary is a search, not a sweep. If the
+state 500 moments ago was green and the current one is red, the transition is
+findable in about nine runs instead of five hundred.
+
+Prior art, credited: `git test --search binary` in git-branchless already bisects
+over a revset with caching and speculative parallel jobs, `git bisect run`
+automates the same thing on demand, and nightly suites that launch a bisect on
+regression are long-standing practice. Binary search over history is not the new
+part. What is new is the **trigger and the domain**: it fires automatically,
+nobody invokes it, the endpoints come from continuous capture rather than from a
+human marking good and bad, and it searches states that were never committed and
+therefore cannot appear in any revset.
+
+Three trigger classes, in order of obligation:
+
+**1. Necessary: grade the head, at rest.** When the tree goes quiet, meaning
+`checks.quiet_ms` with no writes, grade the current state. This is the only
+mandatory grade and it answers "does it work right now."
+
+Even this is usually free. If nothing in the check's recorded read-set changed
+since the last grade, layer 2 carries the previous verdict forward and nothing
+runs. For an agent editing one subsystem, most quiet points cost nothing.
+
+**2. On transition: localize by binary search.** When the head flips from green to
+red, the interesting question becomes which state broke it. Search between the
+last known green and now, halving each time, memoizing every result.
+
+For a gap of 150 moments that is about 8 runs, and it produces something no other
+tool has at all: the exact state that broke the build, found automatically,
+without anyone noticing the breakage or invoking anything.
+
+**3. Opportunistic: fill the largest gap.** With budget left over and the machine
+otherwise idle, grade the **midpoint of the largest ungraded interval**. That is
+the single run with the most information in it, because it halves the biggest
+unknown. Repeat while there is spare capacity.
+
+This is what makes the policy adaptive rather than fixed. On an idle machine the
+history fills in densely and you get a lot of testing, which is the point. On a
+busy machine it does the floor only: keep `@green` correct, localize breakages,
+nothing else. The user never has to tune this, because the tuning is
+"is there spare capacity right now."
+
+**Never interpolate.** A state between two green states is `ungraded`, not green.
+Verdicts are facts about states that were actually run, never inferences from
+neighbours. That rule is what makes the search safe to be incomplete: code is not
+monotonic, it can go red then green then red inside one run, so binary search may
+land on *a* boundary rather than *the first* one. Every answer it gives is still
+literally true, because it was measured. So the UI says **"last known green"**,
+refinement sharpens it over time, and nothing ever claims more than it ran.
+
+**What it costs.** A 500 moment run with three breakages:
+
+| Policy | Check runs |
+| --- | --- |
+| Sweep every moment | 500 |
+| Necessary only | ~15 idle points, most skipped by read-set, so ~5 |
+| Plus localization | 3 breakages x ~8 = 24 |
+| Plus opportunistic, within budget | whatever fits |
+
+Roughly **30 runs instead of 500**, with the floor being about 5, and the extra
+spent only when the machine has nothing better to do.
+
+**Debounce and supersede**, which still apply on top:
+
 - If a new state arrives while a grade is running, that grade is now grading
   history. **Kill it** unless it is past `checks.finish_threshold` of its
   historical duration, in which case let it finish, because a nearly done run is
   a memo entry worth having.
 - Never queue more than one pending grade per tier. A queue means you are grading
   states nobody will ever ask about.
+- `gr green` when the answer is unknown runs the search on demand, bounded and
+  with visible progress, rather than reporting nothing.
 
 ### Layer 4: stay out of the way
 
@@ -365,6 +440,7 @@ not a slogan, and it is enforced rather than hoped for.
 | COW clone for a grade | < 200ms at 10k files | clonefile / reflink, existing `gr work` |
 | Steady-state CPU with an idle developer | 0 percent | Nothing to grade means nothing runs |
 | Steady-state CPU during an agent run | <= `checks.budget`, default 25 percent of one core | Enforced ceiling, not an average |
+| Check runs per 500 moment agent run | ~30, floor ~5 | Search the transitions, never sweep the timeline. Layer 3 |
 | Added latency to any interactive `gr` command | 0 | The grader is out of process and never holds a lock the CLI needs |
 
 The last row is the one that matters most for adoption. If `gr status` ever gets
@@ -407,6 +483,12 @@ keep working. We are not building a system on top of them.
    grading is under 10 percent of the run's wall clock, measured.
 2. Read-set skipping avoids execution for at least 80 percent of captured states
    on a repo where the agent is editing one subsystem.
+8. A 500 moment run with three breakages costs under 40 check runs at default
+   budget, and `@green` is correct throughout, measured against a sweep of the
+   same run as ground truth.
+9. No state is ever reported green or red without a recorded run that produced
+   that verdict. Verified by asserting every non-`ungraded` verdict has a
+   corresponding execution record.
 3. Memo hit rate above 30 percent on a real agent run, because agents revisit
    states. Measured and reported, since this is the number the whole design bets
    on.
@@ -428,6 +510,8 @@ keep working. We are not building a system on top of them.
 | Green is treated as proof of quality when it is only proof of agreement | Verdicts are never rendered as a bare boolean. Independence, relevance, and discrimination print alongside, and `co-authored` is a word the user reads rather than a flag they have to go looking for |
 | Trust dimensions get gamed once people know about them | They label rather than gate, so there is no threshold to optimize against. If any of them is later wired to block something, that decision should be revisited against this row |
 | Discrimination is wrong for tests that legitimately pass on old code | Correct and expected. A regression guard added alongside unrelated work is vacuous *with respect to that change* and the wording says so. It is a statement about this span, not a judgment of the test |
+| Binary search lands on the wrong boundary because code is not monotonic | Every verdict is measured, never inferred, so a wrong *boundary* still consists of true *verdicts*. Reported as "last known green" and refined opportunistically. The alternative, interpolating, would be fast and dishonest |
+| Opportunistic grading is perceived as the tool burning CPU for no reason | It only runs inside `checks.budget` on an otherwise idle machine, and `gr status` can show what it is doing. Setting the budget to zero leaves only the necessary floor |
 | A slow or flaky suite makes continuous grading useless | Tiering. `checks.fast` carries the interactive experience, `checks.full` runs at idle. A flaky check poisons the memo, so a verdict records the check's exit code and duration, and `gr doctor` flags checks whose verdict flips on an identical tree hash, which is the definition of flaky and worth surfacing anyway |
 | Read-set tracing is unavailable or blocked by a hardened environment | Detect and fall back to layer 3, report it in `gr doctor`. Never pretend to a precision we do not have |
 | A check with side effects runs constantly, hitting a network or a database | The COW clone is isolated for the filesystem but not for the network. Off by default, and the first-run prompt states plainly that the command will be executed repeatedly |

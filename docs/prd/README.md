@@ -20,8 +20,16 @@ unsaved, so there is no moment at which code "needs to be" committed. `03`
 **2. Grade states in the background.** Take a moment, clone it into a
 copy-on-write worktree in milliseconds, run the project's own check inside the
 clone, throw the clone away. The developer's tree is never touched and their
-terminal is never blocked. Every state ends up carrying a verdict: green, red, or
-ungraded. `10`
+terminal is never blocked.
+
+Crucially this is a **search, not a sweep**. Grading all 500 moments of a run
+would be 500 check runs and absurd, but nobody wants a verdict on every state.
+They want two boundaries: where it last worked, and where exactly it broke. So
+grade the head when the tree goes quiet, binary search backwards when it flips
+green to red, and spend any leftover budget on the midpoint of the largest
+ungraded gap. About **30 runs instead of 500**, with a floor near 5, and the
+extra spent only when the machine is idle anyway. A state between two green
+states is `ungraded`, never green: verdicts are measured, never interpolated. `10`
 
 **3. Never trust a bare green.** An agent that writes both the code and the test
 has proved only that it agrees with itself. So a verdict is a claim plus its
@@ -74,6 +82,7 @@ otherwise would be easy to falsify.
 | Stable id that survives rewriting | no | patch identity | change ids | no | delta ids | moments |
 | Conflicts as repository state | no | **yes** | **yes** | no | auto-converged | yes |
 | Run a check across revisions, cached | no | no | `jj run`, designed | **`git test`, shipped** | no | yes |
+| Binary search for the breaking revision | `git bisect` | no | no | **`git test -b`, shipped** | no | yes |
 | **Grade states nobody committed** | no | no | no | no | no | **yes** |
 | **Grade continuously, unprompted** | no | no | no | no | no | **yes** |
 | **Verdicts carry a warrant** | no | no | no | no | no | **yes** |
@@ -102,9 +111,12 @@ What survives is narrower and, unlike the withdrawn version, actually holds:
    is the entire "between commits" thesis and it is not reachable from a
    commit-shaped tool.
 2. **They run when you ask. We run continuously.** `git test` is a command you
-   invoke, usually to search a stack you already have. Grading here is unprompted
-   and in the background, which is what Saff and Ernst actually measured and what
-   makes the answer already exist at the moment you want it.
+   invoke, usually to search a stack you already have, and `git bisect` needs you
+   to mark a good and a bad end. Grading here is unprompted: the endpoints come
+   from continuous capture, the search fires on a transition nobody noticed yet,
+   and the answer already exists at the moment you want it. Binary search over
+   history is old; having it run itself, over states that were never committed,
+   is not.
 3. **For them a verdict is a cache. For us it is constitutive.** In git-branchless
    the cached result speeds up a search you initiated. Here the verdict decides
    where commit boundaries get cut (09), what `@green` resolves to (05), and which
