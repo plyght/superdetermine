@@ -27,11 +27,11 @@ ungraded. `10`
 has proved only that it agrees with itself. So a verdict is a claim plus its
 warrant, along three deterministic axes with no model anywhere:
 
-- **independence** — did the same actor author the code and the check in this
+- **independence**, did the same actor author the code and the check in this
   span? `attribution.zig` already knows. Free.
-- **relevance** — did the check process actually open the files that changed? The
+- **relevance**, did the check process actually open the files that changed? The
   read-set tracing from the speed work already knows. Free.
-- **discrimination** — would the check have failed on the *previous* tree? If it
+- **discrimination**, would the check have failed on the *previous* tree? If it
   passes on both, it is vacuous with respect to this change. One extra run, only
   when check files changed, memoized forever.
 
