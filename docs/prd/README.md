@@ -128,6 +128,62 @@ What survives is narrower and, unlike the withdrawn version, actually holds:
 Everything else in this plan is the machinery that makes those four things
 affordable.
 
+### The obvious objection: why not just use CI
+
+Because CI answers a different question, at a different time, and it structurally
+cannot answer this one.
+
+**CI runs on commits.** That is the whole thing. CI can only grade what you
+committed and pushed. Every intermediate state of a forty-minute agent run was
+never a commit, so CI cannot see it, cannot grade it, and cannot tell you which
+of those 300 edits broke the build. This is not a speed difference that a faster
+runner fixes. It is a domain difference.
+
+**CI runs last, which is the worst possible time.** Gradle's data is the
+mechanism: the later a failure surfaces, the more changes are candidates for
+having caused it, so investigation time grows exponentially. CI is the latest
+point in the pipeline. Forty minutes of agent work, one push, one red X, three
+hundred candidate edits. CI is not the cure for that case, it is the thing that
+produces it.
+
+**You could not afford to do this in CI even if it could.** Grading 500
+intermediate states at five minutes of runner time each is thousands of billable
+minutes to check one hour of work. Locally it is about thirty runs of an already
+warm build on spare CPU, memoized so repeats are free. That is three or four
+orders of magnitude, and it is why nobody has ever tried the CI version.
+
+**CI's verdict is a notification. This one is a coordinate.** CI hands you a red
+X on a pull request. Here the verdict belongs to an addressable state, so the
+answer is `gr green`: not "something is broken", but "here is the tree from
+before it broke, restored." Different artifact entirely.
+
+**CI has no warrant.** It reports pass or fail. It does not tell you the agent
+wrote both the code and the test, that the suite never opened the file you
+changed, or that the new test also passes on the old code. Nothing does, which is
+the point of section 1's third move.
+
+The analogy that settles it: **CI is to background grading what a compile in CI
+is to the type checker in your editor.** Nobody argues that red squiggles are
+redundant because CI would have caught it. The value was never in replacing the
+authoritative check, it was in latency and locality. Inline type checking did not
+kill CI builds, and this does not either.
+
+**So this is not instead of CI, and the plan does not compete with it.** CI does
+things local grading cannot and should not attempt: a clean room with none of your
+local state, multiple platforms, real integrations, and the authority to gate a
+merge, which a verdict computed on someone's laptop should never have.
+
+They compose, and the composition makes CI *cheaper*. Because boundaries are cut
+at green states ([09](09-commitless-flow.md)), **every commit that reaches CI has
+already passed locally**, so red CI runs get rare and the minutes stop being
+burned on failures that were knowable an hour earlier. [08](08-git-bridge.md)
+takes it further with a `Gr-Verified` trailer that CI can treat as a cache key it
+independently verifies.
+
+The one-line version: **CI answers "is this mergeable." This answers "when did
+this last work." No CI system has ever answered the second question, because it
+was never designed to.**
+
 ### Why it has not been done
 
 Not because nobody thought of continuous testing. Saff and Ernst measured it in
