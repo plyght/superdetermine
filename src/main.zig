@@ -11,6 +11,16 @@ const branches = @import("branches.zig");
 const config = @import("config.zig");
 const merge = @import("merge.zig");
 const watch = @import("watch.zig");
+const moment = @import("moment.zig");
+const verdict = @import("verdict.zig");
+const revspec = @import("revspec.zig");
+const checks = @import("checks.zig");
+const readset = @import("readset.zig");
+const warrant = @import("warrant.zig");
+const tracer = @import("tracer.zig");
+const grade = @import("grade.zig");
+const sched = @import("sched.zig");
+const rewind = @import("rewind.zig");
 const net = @import("net.zig");
 const ignore = @import("ignore.zig");
 const provenance = @import("provenance.zig");
@@ -66,6 +76,14 @@ const sections = [_]Section{
     .{ .title = "undo is never scary", .entries = &.{
         .{ .name = "undo", .alias = "u", .desc = "revert the last operation, whole repo" },
         .{ .name = "redo", .alias = "r", .desc = "reapply what you just undid" },
+    } },
+    .{ .title = "history that knows what worked", .entries = &.{
+        .{ .name = "green", .alias = "gn", .desc = "rewind to the last state that passed" },
+        .{ .name = "back", .alias = "bk", .args = "[n]", .desc = "rewind n moments, default 1" },
+        .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
+        .{ .name = "moments", .alias = "mo", .args = "[-n N]", .desc = "captured states and their verdicts" },
+        .{ .name = "grade", .alias = "gd", .desc = "run checks in the background (--install)" },
+        .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
     } },
     .{ .title = "secrets you can actually commit", .entries = &.{
         .{ .name = "seal", .alias = "sl", .args = "<path>", .desc = "seal a .env-style file" },
@@ -166,6 +184,12 @@ const aliases = [_]Alias{
     .{ .short = "prov", .full = "provenance" },
     .{ .short = "u", .full = "undo" },
     .{ .short = "r", .full = "redo" },
+    .{ .short = "gn", .full = "green" },
+    .{ .short = "bk", .full = "back" },
+    .{ .short = "rw", .full = "rewind" },
+    .{ .short = "mo", .full = "moments" },
+    .{ .short = "gd", .full = "grade" },
+    .{ .short = "doc", .full = "doctor" },
     .{ .short = "srv", .full = "serve" },
     .{ .short = "f", .full = "fetch" },
     .{ .short = "cl", .full = "clone" },
@@ -306,6 +330,18 @@ pub fn main(init: std.process.Init) !void {
         try cmdFetch(io, alloc, w, rest);
     } else if (eq(cmd, "watch")) {
         try cmdWatch(io, alloc, w);
+    } else if (eq(cmd, "moments")) {
+        try cmdMoments(io, alloc, w, rest);
+    } else if (eq(cmd, "grade")) {
+        try cmdGrade(io, alloc, w, rest);
+    } else if (eq(cmd, "doctor")) {
+        try cmdDoctor(io, alloc, w);
+    } else if (eq(cmd, "rewind")) {
+        try cmdRewind(io, alloc, w, rest);
+    } else if (eq(cmd, "back")) {
+        try cmdBack(io, alloc, w, rest);
+    } else if (eq(cmd, "green")) {
+        try cmdGreen(io, alloc, w);
     } else if (eq(cmd, "undo")) {
         try cmdUndo(io, alloc, w);
     } else if (eq(cmd, "redo")) {
@@ -1228,10 +1264,376 @@ fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     try watch.watch(&s, work, .{ .author = author });
 }
 
+// --- verified history ---
+
+fn momentSettings(s: *Store, alloc: std.mem.Allocator) moment.Settings {
+    var mset = moment.settings(s, alloc);
+    // The CLI captures on demand rather than on a poll, so an unconfigured repo
+    // still gets a moment when it explicitly asks for one.
+    mset.enabled = true;
+    return mset;
+}
+
+fn gradeContext(
+    alloc: std.mem.Allocator,
+    s: *Store,
+    work: std.Io.Dir,
+    set: checks.Settings,
+    rules: warrant.PathRules,
+) grade.Context {
+    return .{
+        .store = s,
+        .work_dir = work,
+        .alloc = alloc,
+        .set = set,
+        .rules = rules,
+    };
+}
+
+fn nowMillis(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1_000_000));
+}
+
+/// Resolve a revspec with verdicts wired in, so `@green` can answer.
+fn resolveSpec(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    s: *Store,
+    spec: []const u8,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+) !revspec.Resolved {
+    return revspec.resolve(.{
+        .store = s,
+        .alloc = alloc,
+        .verdicts = ix,
+        .command_fast = verdict.commandHash(set.command(.fast)),
+        .command_full = verdict.commandHash(set.command(.full)),
+        .now_ms = nowMillis(io),
+    }, spec);
+}
+
+fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    var limit: usize = 20;
+    if (flagValue(rest, "-n", "--number").len != 0) {
+        limit = std.fmt.parseInt(usize, flagValue(rest, "-n", "--number"), 10) catch 20;
+    }
+
+    const all = try moment.readAll(&s, alloc);
+    defer moment.freeMoments(alloc, all);
+    if (all.len == 0) {
+        try w.writeAll("no moments captured yet\n");
+        try ui.hint(w, "run `gr grade --once`, or `gr watch`, to start capturing");
+        return;
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const start = if (all.len > limit) all.len - limit else 0;
+    for (all[start..]) |m| {
+        var id_hex: [16]u8 = undefined;
+        _ = m.shortId(&id_hex);
+        const v = ix.best(
+            m.full_tree,
+            verdict.commandHash(set.command(.fast)),
+            verdict.commandHash(set.command(.full)),
+        );
+        try w.print("{s}@{s}{s}  ", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
+        if (v) |got| {
+            const colour: ui.Color = if (got.result == .green) .green else .red;
+            try w.print("{s}{s}{s} {s}{s}{s}", .{
+                ui.on(colour), got.result.label(), ui.off(),
+                ui.on(.dim),   got.tier.label(),   ui.off(),
+            });
+            // A green is never shown bare: the warrant travels with the claim.
+            if (got.result == .green) {
+                try w.print("  {s}{s}  relevance {d}/{d}  {s}{s}", .{
+                    ui.on(.dim),
+                    got.independence.label(),
+                    got.relevance_hit,
+                    got.relevance_total,
+                    got.discrimination.label(),
+                    ui.off(),
+                });
+            }
+        } else {
+            try w.print("{s}ungraded{s}", .{ ui.on(.dim), ui.off() });
+        }
+        try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), m.cause.label(), ui.off() });
+    }
+}
+
+fn rewindTo(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    spec: []const u8,
+    dry_run: bool,
+    paths: ?[]const []const u8,
+) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const resolved = resolveSpec(io, alloc, &s, spec, &ix, set) catch |e| {
+        switch (e) {
+            revspec.Error.NoSuchMoment => {
+                try w.print("{s}{s}{s} nothing matches {s}{s}{s}\n", .{
+                    ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+                });
+                if (std.mem.indexOf(u8, spec, "green") != null) {
+                    try ui.hint(w, "no state has been graded green yet; set `checks.full` and run `gr grade`");
+                }
+            },
+            revspec.Error.UnknownSelector => try w.print("not a revspec: {s}\n", .{spec}),
+            revspec.Error.AmbiguousMoment => try w.print("{s} matches more than one moment\n", .{spec}),
+            else => return e,
+        }
+        return;
+    };
+    defer resolved.deinit(alloc);
+
+    const target_moment = switch (resolved.target) {
+        .live => {
+            try w.writeAll("already there\n");
+            return;
+        },
+        .at => |m| m,
+    };
+
+    const entries = try moment.entriesOf(&s, target_moment);
+    defer workspace.freeTreeEntries(alloc, entries);
+
+    var id_hex: [16]u8 = undefined;
+    _ = target_moment.shortId(&id_hex);
+
+    if (dry_run) {
+        const pv = try rewind.preview(&s, alloc, work, entries, paths);
+        defer pv.deinit(alloc);
+        if (pv.changes.len == 0) {
+            try w.writeAll("nothing would change\n");
+            return;
+        }
+        try w.print("would rewind to {s}@{s}{s}\n", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
+        for (pv.changes) |c| {
+            try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.dim), c.label(), ui.off(), c.path });
+        }
+        return;
+    }
+
+    const applied = try rewind.apply(&s, work, entries, momentSettings(&s, alloc), paths);
+
+    try w.print("{s}{s}{s} rewound to {s}@{s}{s}", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), id_hex[0..12], ui.off(),
+    });
+    if (resolved.verdict) |v| {
+        try w.print(" {s}({s} {s}){s}", .{ ui.on(.dim), v.result.label(), v.tier.label(), ui.off() });
+    }
+    try w.print(", {d} file{s} changed\n", .{ applied.changed, if (applied.changed == 1) "" else "s" });
+    try ui.hint(w, "`gr undo` puts it back; the state you left is still addressable");
+}
+
+fn cmdRewind(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var spec: []const u8 = "";
+    var dry_run = false;
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(alloc);
+
+    var after_sep = false;
+    for (rest) |a| {
+        if (eq(a, "--")) {
+            after_sep = true;
+        } else if (after_sep) {
+            try paths.append(alloc, a);
+        } else if (eq(a, "--dry-run") or eq(a, "-n")) {
+            dry_run = true;
+        } else if (spec.len == 0) {
+            spec = a;
+        }
+    }
+
+    if (spec.len == 0) {
+        try w.writeAll("usage: gr rewind <ref> [--dry-run] [-- <paths>]\n");
+        try ui.hint(w, "try `gr rewind @green`, `gr rewind @2h`, or `gr back`");
+        return;
+    }
+
+    try rewindTo(io, alloc, w, spec, dry_run, if (paths.items.len == 0) null else paths.items);
+}
+
+fn cmdBack(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var n: usize = 1;
+    for (rest) |a| {
+        if (a.len != 0 and a[0] != '-') {
+            n = std.fmt.parseInt(usize, a, 10) catch 1;
+            break;
+        }
+    }
+    const spec = try std.fmt.allocPrint(alloc, "@~{d}", .{n});
+    defer alloc.free(spec);
+    try rewindTo(io, alloc, w, spec, false, null);
+}
+
+fn cmdGreen(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    try rewindTo(io, alloc, w, "@green", false, null);
+}
+
+fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const repo_abs = try work.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(repo_abs);
+
+    for (rest) |a| {
+        if (eq(a, "--install")) {
+            const exe = update.selfExePathAlloc(alloc) catch |e| {
+                try w.print("could not locate the gr binary: {s}\n", .{@errorName(e)});
+                return;
+            };
+            defer alloc.free(exe);
+            sched.install(io, alloc, exe, repo_abs, .{}) catch |e| {
+                try w.print("{s}{s}{s} could not install the agent: {s}\n", .{
+                    ui.on(.red), ui.cross, ui.off(), @errorName(e),
+                });
+                try ui.hint(w, "`gr watch` does the same work in the foreground");
+                return;
+            };
+            try w.print("{s}{s}{s} grading on change, with no resident process\n", .{
+                ui.on(.green), ui.check, ui.off(),
+            });
+            try ui.hint(w, "launchd watches the worktree and starts gr only when it changes");
+            return;
+        }
+        if (eq(a, "--uninstall")) {
+            sched.uninstall(io, alloc, repo_abs) catch {};
+            try w.writeAll("background grading off\n");
+            return;
+        }
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    if (!set.enabled) {
+        try w.writeAll("no check configured, so nothing to grade\n");
+        try ui.hint(w, "set one with `gr config checks.full \"zig build test\"`");
+        return;
+    }
+
+    const rules = warrant.pathRules(&s, alloc);
+    defer rules.deinit(alloc);
+
+    const ctx = gradeContext(alloc, &s, work, set, rules);
+    const r = try sched.tick(&s, work, ctx, momentSettings(&s, alloc), .{});
+
+    if (r.skipped) |why| {
+        try w.print("{s}skipped: {s}{s}\n", .{ ui.on(.dim), why, ui.off() });
+        return;
+    }
+    if (r.captured) try w.writeAll("captured a moment\n");
+    if (r.graded == 0) {
+        try w.writeAll("nothing needed running\n");
+    } else {
+        try w.print("ran {d} check{s}\n", .{ r.graded, if (r.graded == 1) "" else "s" });
+    }
+    if (r.boundary) |b| {
+        try w.print("{s}broke between moment {d} and {d}{s}\n", .{
+            ui.on(.yellow), b.last_green, b.first_red, ui.off(),
+        });
+        try ui.hint(w, "`gr green` rewinds to the last state that worked");
+    }
+}
+
+fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    try w.print("{s}guardrail doctor{s}\n\n", .{ ui.on(.bold), ui.off() });
+
+    const mset = moment.settings(&s, alloc);
+    const count = moment.count(&s, alloc) catch 0;
+    // `moments.enabled` governs only the polling loop. Commands capture on
+    // demand regardless, so reporting a bare "off" beside a moment count would
+    // read as a contradiction.
+    try w.print("  capture      {s} ({d} moment{s}, keyframe every {d})\n", .{
+        if (mset.enabled) "continuous" else "on demand",
+        count,
+        if (count == 1) "" else "s",
+        mset.keyframe_interval,
+    });
+    if (mset.enabled) {
+        try w.print("               polling every {d}ms\n", .{mset.interval_ms});
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    if (!set.enabled) {
+        try w.writeAll("  checks       none configured, so nothing is ever run\n");
+    } else {
+        if (set.has(.fast)) try w.print("  checks.fast  {s}\n", .{set.fast});
+        if (set.has(.full)) try w.print("  checks.full  {s}\n", .{set.full});
+        try w.print("  budget       {d}% of one core, nice {d}, battery floor {d}%\n", .{
+            set.budget_percent, set.nice, set.battery_floor,
+        });
+    }
+
+    // Read-set tracing, probed here rather than assumed, since the honest
+    // answer differs per filesystem.
+    const work_abs = try work.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(work_abs);
+    const av = tracer.detect(io, alloc, work, work_abs);
+    const tracer_colour: ui.Color = if (av.mode.isExact()) .green else .yellow;
+    try w.print("  read-sets    {s}{s}{s} ({s})\n", .{
+        ui.on(tracer_colour), av.mode.label(), ui.off(), av.reason,
+    });
+    if (!av.mode.isExact()) {
+        try ui.hint(w, "every tracked file is assumed read, which costs extra runs but is never wrong");
+    }
+
+    const status = sched.agentStatus(io, alloc, work_abs) catch .unsupported;
+    try w.print("  background   {s}\n", .{switch (status) {
+        .installed => "on, via launchd, with no resident process",
+        .not_installed => "off (`gr grade --install`, or run `gr watch`)",
+        .unsupported => "not available here; use `gr watch` in a terminal",
+    }});
+
+    const verdicts = try verdict.readAll(&s, alloc);
+    defer alloc.free(verdicts);
+    var greens: usize = 0;
+    var hollow: usize = 0;
+    for (verdicts) |v| {
+        if (v.isGreen()) greens += 1;
+        if (v.isHollow()) hollow += 1;
+    }
+    try w.print("  verdicts     {d} recorded, {d} green", .{ verdicts.len, greens });
+    if (hollow != 0) {
+        try w.print(", {s}{d} green but hollow{s}", .{ ui.on(.yellow), hollow, ui.off() });
+    }
+    try w.writeAll("\n");
+}
+
 fn cmdUndo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
-    oplog.undo(&s) catch |e| switch (e) {
+    var undo_work = openWork(io) catch null;
+    defer if (undo_work) |*d| d.close(io);
+    oplog.undo(&s, undo_work) catch |e| switch (e) {
         error.NothingToUndo => {
             try w.writeAll("nothing to undo\n");
             return;
@@ -1244,7 +1646,9 @@ fn cmdUndo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 fn cmdRedo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
-    oplog.redo(&s) catch |e| switch (e) {
+    var redo_work = openWork(io) catch null;
+    defer if (redo_work) |*d| d.close(io);
+    oplog.redo(&s, redo_work) catch |e| switch (e) {
         error.NothingToRedo => {
             try w.writeAll("nothing to redo\n");
             return;

@@ -648,9 +648,9 @@ fn scanAider(ctx: *Ctx) anyerror!void {
 // --- generic permissive tool-call harvester (Gemini / Cline / future JSON) ---
 
 const write_tool_names = [_][]const u8{
-    "write_file",   "write_to_file",     "replace",  "edit",
-    "create_file",  "editedExistingFile", "newFileCreated",
-    "str_replace",  "apply_diff",        "insert_content",
+    "write_file",  "write_to_file",      "replace",        "edit",
+    "create_file", "editedExistingFile", "newFileCreated", "str_replace",
+    "apply_diff",  "insert_content",
 };
 const path_keys = [_][]const u8{ "file_path", "path", "filePath", "filename" };
 const content_keys = [_][]const u8{ "content", "new_string", "newText", "new_content", "fileContent" };

@@ -1,5 +1,6 @@
 const std = @import("std");
 const oid = @import("oid.zig");
+const applog = @import("applog.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -44,7 +45,7 @@ fn unescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// Append a provenance record for `change`. Read-modify-write append.
+/// Append a provenance record for `change`, in time independent of log length.
 pub fn record(store: *Store, change: Oid, agent: []const u8, prompt: []const u8, timestamp: i64) !void {
     const alloc = store.alloc;
 
@@ -56,16 +57,11 @@ pub fn record(store: *Store, change: Oid, agent: []const u8, prompt: []const u8,
     var hex: [Oid.len * 2]u8 = undefined;
     _ = change.toHex(&hex);
 
-    const old = store.root.readFileAlloc(store.io, "provenance", alloc, .unlimited) catch
-        try alloc.dupe(u8, "");
-    defer alloc.free(old);
-
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    try out.appendSlice(alloc, old);
     try out.print(alloc, "{s} {d} {s}\t{s}\n", .{ &hex, timestamp, agent_esc, prompt_esc });
 
-    try store.root.writeFile(store.io, .{ .sub_path = "provenance", .data = out.items });
+    try applog.append(store, "provenance", out.items);
 }
 
 /// Return the LAST record for `change` (so an amend/re-record overrides), or

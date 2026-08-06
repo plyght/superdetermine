@@ -33,7 +33,7 @@ pub fn sha256Hex(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
     return alloc.dupe(u8, &hex);
 }
 
-fn selfExePathAlloc(alloc: std.mem.Allocator) ![]u8 {
+pub fn selfExePathAlloc(alloc: std.mem.Allocator) ![]u8 {
     switch (builtin.os.tag) {
         .macos => {
             var buf: [4096]u8 = undefined;

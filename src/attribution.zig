@@ -1,5 +1,6 @@
 const std = @import("std");
 const oid = @import("oid.zig");
+const applog = @import("applog.zig");
 const Store = @import("store.zig").Store;
 const workspace = @import("workspace.zig");
 const agentscan = @import("agentscan.zig");
@@ -75,7 +76,7 @@ fn unescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 
 // --- record / read ---
 
-/// Append one per-file attribution record. Read-modify-write append.
+/// Append one per-file attribution record, in time independent of log length.
 pub fn record(store: *Store, change: Oid, entry: FileEntry) !void {
     const alloc = store.alloc;
 
@@ -91,13 +92,8 @@ pub fn record(store: *Store, change: Oid, entry: FileEntry) !void {
     var hex: [Oid.len * 2]u8 = undefined;
     _ = change.toHex(&hex);
 
-    const old = store.root.readFileAlloc(store.io, "attribution", alloc, .unlimited) catch
-        try alloc.dupe(u8, "");
-    defer alloc.free(old);
-
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    try out.appendSlice(alloc, old);
     try out.print(alloc, "{s} {d} {s} {s} {s}\t{s}\t{s}\t{s}\n", .{
         &hex,
         entry.timestamp_ms,
@@ -109,7 +105,7 @@ pub fn record(store: *Store, change: Oid, entry: FileEntry) !void {
         prompt_esc,
     });
 
-    try store.root.writeFile(store.io, .{ .sub_path = "attribution", .data = out.items });
+    try applog.append(store, "attribution", out.items);
 }
 
 const Parsed = struct { change: [Oid.len * 2]u8, entry: FileEntry };
@@ -339,12 +335,22 @@ test "human record and per-path last-wins" {
     defer s.deinit();
 
     try record(&s, Oid.ofBytes("c1"), .{
-        .kind = .agent,   .confidence = .likely, .agent = "pi",
-        .session = "x",   .prompt = "p", .path = "f.txt", .timestamp_ms = 1,
+        .kind = .agent,
+        .confidence = .likely,
+        .agent = "pi",
+        .session = "x",
+        .prompt = "p",
+        .path = "f.txt",
+        .timestamp_ms = 1,
     });
     try record(&s, Oid.ofBytes("c2"), .{
-        .kind = .human,   .confidence = .none, .agent = "",
-        .session = "",    .prompt = "", .path = "f.txt", .timestamp_ms = 2,
+        .kind = .human,
+        .confidence = .none,
+        .agent = "",
+        .session = "",
+        .prompt = "",
+        .path = "f.txt",
+        .timestamp_ms = 2,
     });
 
     const last = (try lastForPath(&s, alloc, "f.txt")).?;

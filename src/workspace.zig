@@ -114,6 +114,30 @@ fn freeEntries(alloc: std.mem.Allocator, entries: []object.TreeEntry) void {
     alloc.free(entries);
 }
 
+/// The working tree as sorted tree entries, with the stat-cache consulted and
+/// refreshed exactly as a save would. Callers that want the tree's shape without
+/// creating a change (moment capture) use this instead of `snapshot`.
+/// Free with `freeTreeEntries`.
+pub fn captureEntries(store: *Store, work_dir: std.Io.Dir) ![]object.TreeEntry {
+    const alloc = store.alloc;
+
+    var cache = try idx.Index.load(store, alloc);
+    defer cache.deinit();
+    var fresh = idx.Index.empty(alloc);
+    defer fresh.deinit();
+
+    var plan = try keyring.prepare(store.io, alloc, work_dir);
+    defer plan.deinit();
+
+    const entries = try scan(store, work_dir, &cache, &fresh, &plan);
+    fresh.save(store) catch {};
+    return entries;
+}
+
+pub fn freeTreeEntries(alloc: std.mem.Allocator, entries: []object.TreeEntry) void {
+    freeEntries(alloc, entries);
+}
+
 pub fn snapshot(store: *Store, work_dir: std.Io.Dir, author: []const u8, message: []const u8, timestamp: i64) !Oid {
     const alloc = store.alloc;
 

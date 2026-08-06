@@ -1,5 +1,8 @@
 const std = @import("std");
 const oid = @import("oid.zig");
+const object = @import("object.zig");
+const applog = @import("applog.zig");
+const checks = @import("checks.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -8,6 +11,10 @@ pub const OpKind = enum {
     undo,
     redo,
     import,
+    /// A worktree rewind. Unlike every other kind, `prev` and `new` are tree
+    /// Oids rather than change Oids, because a rewind moves the working tree
+    /// and not a branch pointer. Undoing one materializes `prev` back.
+    rewind,
     other,
 
     pub fn label(self: OpKind) []const u8 {
@@ -16,6 +23,7 @@ pub const OpKind = enum {
             .undo => "undo",
             .redo => "redo",
             .import => "import",
+            .rewind => "rewind",
             .other => "other",
         };
     }
@@ -25,6 +33,7 @@ pub const OpKind = enum {
         if (std.mem.eql(u8, s, "undo")) return .undo;
         if (std.mem.eql(u8, s, "redo")) return .redo;
         if (std.mem.eql(u8, s, "import")) return .import;
+        if (std.mem.eql(u8, s, "rewind")) return .rewind;
         return .other;
     }
 };
@@ -43,16 +52,9 @@ pub const OpRecord = struct {
 //   <kind> <prevhex> <newhex> <timestamp> <branch>\n
 // branch comes last so it may contain any byte except '\n'.
 
-/// Append a record to `.gr/oplog`. 0.16 has no append helper, so read + rewrite.
+/// Append a record to `.gr/oplog`, in time independent of the log's length.
 pub fn record(store: *Store, op: OpRecord) !void {
-    const io = store.io;
     const alloc = store.alloc;
-
-    const existing = store.root.readFileAlloc(io, "oplog", alloc, .unlimited) catch |e| switch (e) {
-        error.FileNotFound => try alloc.dupe(u8, ""),
-        else => return e,
-    };
-    defer alloc.free(existing);
 
     var prev_hex: [Oid.len * 2]u8 = undefined;
     var new_hex: [Oid.len * 2]u8 = undefined;
@@ -68,12 +70,7 @@ pub fn record(store: *Store, op: OpRecord) !void {
     });
     defer alloc.free(line);
 
-    const combined = try alloc.alloc(u8, existing.len + line.len);
-    defer alloc.free(combined);
-    @memcpy(combined[0..existing.len], existing);
-    @memcpy(combined[existing.len..], line);
-
-    try store.root.writeFile(io, .{ .sub_path = "oplog", .data = combined });
+    try applog.append(store, "oplog", line);
 }
 
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) !OpRecord {
@@ -140,6 +137,18 @@ fn nowSeconds(store: *Store) i64 {
     return @intCast(@divTrunc(std.Io.Clock.now(.real, store.io).nanoseconds, std.time.ns_per_s));
 }
 
+/// Apply the effect of an op in the direction of `target`. Ref-shaped ops move
+/// a branch; a rewind puts the working tree back, which is what makes rewinding
+/// something people reach for rather than fear.
+fn applyOp(store: *Store, op: OpRecord, target: Oid, work_dir: ?std.Io.Dir) !void {
+    if (op.kind != .rewind) return applyRef(store, op.branch, target);
+
+    const wd = work_dir orelse return error.WorktreeRequired;
+    const tree = try store.readTree(target);
+    defer object.freeTree(store.alloc, tree);
+    try checks.reconcile(store, wd, tree.entries);
+}
+
 fn applyRef(store: *Store, branch: []const u8, target: Oid) !void {
     if (target.isZero()) {
         var buf: [256]u8 = undefined;
@@ -163,7 +172,7 @@ fn applyRef(store: *Store, branch: []const u8, target: Oid) !void {
 /// Limitation: real ops that were undone and then superseded by a new real op
 /// remain in the flat real-op list, so undoing past such a boundary walks the
 /// historical ops rather than reconstructing a branching timeline.
-pub fn undo(store: *Store) !void {
+pub fn undo(store: *Store, work_dir: ?std.Io.Dir) !void {
     const alloc = store.alloc;
 
     const records = try readAll(store, alloc);
@@ -178,7 +187,7 @@ pub fn undo(store: *Store) !void {
 
     const target = nthReal(records, pointer - 1).?;
 
-    try applyRef(store, target.branch, target.prev);
+    try applyOp(store, target, target.prev, work_dir);
 
     try record(store, .{
         .kind = .undo,
@@ -193,7 +202,7 @@ pub fn undo(store: *Store) !void {
 /// op was an undo (i.e. the log ends in a trailing undo with nothing new after);
 /// sets the branch forward to that op's `new` and appends a redo record. Errors
 /// `NothingToRedo` otherwise.
-pub fn redo(store: *Store) !void {
+pub fn redo(store: *Store, work_dir: ?std.Io.Dir) !void {
     const alloc = store.alloc;
 
     const records = try readAll(store, alloc);
@@ -210,7 +219,7 @@ pub fn redo(store: *Store) !void {
 
     const target = nthReal(records, pointer).?;
 
-    try applyRef(store, target.branch, target.new);
+    try applyOp(store, target, target.new, work_dir);
 
     try record(store, .{
         .kind = .redo,
@@ -293,7 +302,7 @@ test "record, lastOp, and single-level undo" {
         try testing.expectEqual(OpKind.snapshot, lo.kind);
     }
 
-    try undo(&store);
+    try undo(&store, null);
     try testing.expect((try store.readRef("main")).eql(a));
 
     // Undo op was logged.
@@ -326,13 +335,13 @@ test "multi-level undo then redo" {
 
     try testing.expect((try store.readRef("main")).eql(c));
 
-    try undo(&store);
+    try undo(&store, null);
     try testing.expect((try store.readRef("main")).eql(b));
 
-    try undo(&store);
+    try undo(&store, null);
     try testing.expect((try store.readRef("main")).eql(a));
 
-    try redo(&store);
+    try redo(&store, null);
     try testing.expect((try store.readRef("main")).eql(b));
 }
 
@@ -350,7 +359,7 @@ test "undo of unborn branch deletes the ref" {
     try record(&store, .{ .kind = .snapshot, .branch = "feature", .prev = Oid.zero(), .new = a, .timestamp = 1 });
 
     try testing.expect(store.refExists("feature"));
-    try undo(&store);
+    try undo(&store, null);
     try testing.expect(!store.refExists("feature"));
 }
 
