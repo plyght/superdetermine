@@ -117,7 +117,40 @@ fn findAssetUrl(assets: std.json.Array, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Make sure an `sdt` command exists beside a binary invoked under the old name.
+///
+/// Someone who installed `gr` and runs `gr update` gets the new binary in place,
+/// but the command they type is still `gr` and nothing else on their machine is
+/// called `sdt`. This runs before the up-to-date check on purpose: once the
+/// binary has already been replaced there is no version change left to trigger
+/// on, and without this the alias would never appear.
+fn ensureAlias(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) void {
+    const exe = selfExePathAlloc(alloc) catch return;
+    defer alloc.free(exe);
+
+    const invoked = std.fs.path.basename(exe);
+    if (std.mem.eql(u8, invoked, "sdt")) return;
+
+    const dir = std.fs.path.dirname(exe) orelse return;
+    const sibling = std.fs.path.join(alloc, &.{ dir, "sdt" }) catch return;
+    defer alloc.free(sibling);
+    if (std.Io.Dir.cwd().access(io, sibling, .{})) |_| return else |_| {}
+
+    const data = std.Io.Dir.cwd().readFileAlloc(io, exe, alloc, .unlimited) catch return;
+    defer alloc.free(data);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sibling, .data = data }) catch return;
+
+    const sib_z = alloc.dupeZ(u8, sibling) catch return;
+    defer alloc.free(sib_z);
+    _ = std.c.chmod(sib_z, 0o755);
+
+    w.print("this tool is now called {s}sdt{s} (superdetermine).\n", .{ "\x1b[1m", "\x1b[0m" }) catch {};
+    w.print("installed as {s}/sdt; `{s}` still works and is the same binary.\n\n", .{ dir, invoked }) catch {};
+}
+
 pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_version: []const u8, nightly: bool) !void {
+    ensureAlias(io, alloc, w);
+
     const asset = assetName() orelse {
         try w.writeAll("sdt update: unsupported platform (no prebuilt release for this OS/arch)\n");
         return;
