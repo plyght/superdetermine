@@ -570,6 +570,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
 fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
     const branch = try s.headBranch();
     defer alloc.free(branch);
     const tip = s.readRef(branch) catch {
@@ -637,6 +638,7 @@ fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
 fn cmdAbsorb(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
     var work = try openWork(io);
     defer work.close(io);
     try absorb.run(&s, alloc, work, w);
@@ -752,6 +754,7 @@ fn cmdConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
 fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
     const change = try doSave(io, alloc, &s, messageFlag(rest));
     recordProvenance(io, alloc, &s, change, rest);
     const branch = try s.headBranch();
@@ -1101,6 +1104,7 @@ fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
 
     // Never lose work: auto-save the current tree before moving.
     var work = try openWork(io);
@@ -1154,6 +1158,7 @@ fn cmdRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
     var work = try openWork(io);
     defer work.close(io);
     workspace.restoreFile(&s, work, rest[0]) catch |e| switch (e) {
@@ -1173,6 +1178,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
     const into = try s.headBranch();
     defer alloc.free(into);
     const author = try config.author(&s, alloc);
@@ -1255,13 +1261,29 @@ fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
 fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
-    const author = try config.author(&s, alloc);
-    defer alloc.free(author);
     var work = try openWork(io);
     defer work.close(io);
-    try w.writeAll("watching for changes, auto-saving (ctrl-c to stop)\n");
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    const rules = warrant.pathRules(&s, alloc);
+    defer rules.deinit(alloc);
+
+    var mset = moment.settings(&s, alloc);
+    mset.enabled = true;
+
+    try w.print("{s}watching{s} ", .{ ui.on(.bold), ui.off() });
+    if (set.enabled) {
+        try w.print("and grading, every {d}ms\n", .{mset.interval_ms});
+    } else {
+        try w.print("every {d}ms; no check configured, so nothing is ever run\n", .{mset.interval_ms});
+        try ui.hint(w, "set one with `gr config checks.full \"zig build test\"`");
+    }
+    try ui.hint(w, "ctrl-c to stop; `gr grade --on` does this with no terminal and no daemon");
     try w.flush();
-    try watch.watch(&s, work, .{ .author = author });
+
+    const ctx = gradeContext(alloc, &s, work, set, rules);
+    try watch.live(&s, work, ctx, mset, .{});
 }
 
 // --- verified history ---
@@ -1642,6 +1664,20 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     try w.writeAll("\n");
 }
 
+/// Capture the working tree before a command that will change it.
+///
+/// Every mutating command is a defensive capture point: whatever the command
+/// then does, the state it was asked to leave stays addressable as a moment, so
+/// `gr back` and `@~1` reach it even if the command itself has no undo of its
+/// own. Failure is deliberately silent — a capture that cannot happen must
+/// never stop the command the user actually asked for.
+fn captureBefore(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
+    var work = openWork(io) catch return;
+    defer work.close(io);
+    const r = moment.capture(s, work, .command, momentSettings(s, alloc)) catch return;
+    if (r == .captured) alloc.free(r.captured.branch);
+}
+
 fn cmdUndo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
@@ -1821,6 +1857,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    captureBefore(io, alloc, &s);
     const remote_name = if (rest.len >= 1) rest[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
         try w.print("unknown remote '{s}'. pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });

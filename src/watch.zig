@@ -1,6 +1,10 @@
 const std = @import("std");
 const oid = @import("oid.zig");
 const workspace = @import("workspace.zig");
+const moment = @import("moment.zig");
+const sched = @import("sched.zig");
+const grade = @import("grade.zig");
+const ui = @import("ui.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -63,6 +67,63 @@ pub fn signature(store: *Store, work_dir: std.Io.Dir) !Oid {
 
 fn nowSeconds(store: *Store) i64 {
     return @intCast(@divTrunc(std.Io.Clock.now(.real, store.io).nanoseconds, 1_000_000_000));
+}
+
+/// The foreground path for continuous capture and grading.
+///
+/// This does exactly what the launchd agent does, in a terminal you can watch,
+/// for machines where an OS scheduler is unavailable or unwanted. It is the same
+/// `sched.tick` either way, so there is one implementation of the policy and no
+/// second code path to drift.
+///
+/// Unlike `watch`, this creates moments rather than changes: nothing here ever
+/// writes to `gr log`, because a captured state is not a commit.
+pub fn live(
+    store: *Store,
+    work_dir: std.Io.Dir,
+    ctx: grade.Context,
+    mset: moment.Settings,
+    sset: sched.Settings,
+) !void {
+    const io = store.io;
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    const out = &w.interface;
+
+    var last = signature(store, work_dir) catch oid.Oid.zero();
+
+    while (true) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(mset.interval_ms), .awake) catch {};
+
+        // The content signature is the cheap gate: unchanged tree, no work, and
+        // therefore no CPU at all while the developer is thinking.
+        const sig = signature(store, work_dir) catch continue;
+        if (sig.eql(last)) continue;
+        last = sig;
+
+        if (!sched.due(store, sset)) continue;
+
+        const r = sched.tick(store, work_dir, ctx, mset, sset) catch continue;
+        if (r.skipped != null) continue;
+
+        if (r.captured) {
+            out.print("{s}captured{s}", .{ ui.on(.dim), ui.off() }) catch {};
+            if (r.graded != 0) {
+                out.print(", ran {d} check{s}", .{ r.graded, if (r.graded == 1) "" else "s" }) catch {};
+            }
+            out.writeAll("\n") catch {};
+        }
+        if (r.boundary) |b| {
+            out.print("{s}broke between moment {d} and {d}{s}  ", .{
+                ui.on(.yellow), b.last_green, b.first_red, ui.off(),
+            }) catch {};
+            out.print("{s}`gr green` rewinds to the last state that worked{s}\n", .{
+                ui.on(.dim), ui.off(),
+            }) catch {};
+        }
+        out.flush() catch {};
+    }
 }
 
 /// Poll the working tree forever, auto-saving a snapshot whenever it changes.
