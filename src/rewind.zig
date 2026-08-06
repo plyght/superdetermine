@@ -11,7 +11,7 @@ const Oid = oid.Oid;
 /// Putting the working tree back.
 ///
 /// Before touching anything, the current state is captured as a moment and the
-/// rewind is written to the op log, so `gr undo` reverses it and the state you
+/// rewind is written to the op log, so `sdt undo` reverses it and the state you
 /// left is still addressable afterwards. Nothing is destroyed, which is the
 /// property that makes rewinding something people reach for rather than fear.
 ///
@@ -97,7 +97,7 @@ fn selected(paths: ?[]const []const u8, path: []const u8) bool {
 
 pub const Applied = struct {
     /// The tree the working copy held before the rewind, captured and stored so
-    /// it stays reachable and `gr undo` can put it back.
+    /// it stays reachable and `sdt undo` can put it back.
     left: Oid,
     to: Oid,
     changed: usize,
@@ -246,7 +246,7 @@ test "rewind restores the tree and leaves the state it left addressable" {
     try testing.expect(saw_junk);
 }
 
-test "gr undo reverses a rewind" {
+test "sdt undo reverses a rewind" {
     const alloc = testing.allocator;
     const io = std.testing.io;
     var f = try fixture(alloc);

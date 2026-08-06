@@ -18,7 +18,7 @@ const Oid = oid.Oid;
 /// boundary, so every commit superdetermine exports to git builds by construction,
 /// which is the property git histories are always claimed to have and never do.
 ///
-/// Nothing here removes anything. `gr save` and `gr push` never go away: a cut
+/// Nothing here removes anything. `sdt save` and `sdt push` never go away: a cut
 /// mode is a default for the moments nobody bothered to name, not a replacement
 /// for naming them. `.manual` is the default and cuts nothing at all.
 ///
@@ -129,11 +129,11 @@ pub fn shouldCut(mode: CutMode, prev: ?verdict.Result, now: verdict.Result) bool
 ///
 /// Parent is the current branch tip when it exists, so an unborn branch cuts a
 /// root change. An `oplog` record with `OpKind.snapshot` is appended last, which
-/// is what makes an automatic cut as reversible as a manual one: `gr undo` puts
+/// is what makes an automatic cut as reversible as a manual one: `sdt undo` puts
 /// the ref straight back.
 ///
 /// `work_dir` is in the signature so callers pass their worktree handle without
-/// special-casing this path against `gr save`; the cut itself reads no files.
+/// special-casing this path against `sdt save`; the cut itself reads no files.
 pub fn cutAt(
     store: *Store,
     work_dir: std.Io.Dir,
@@ -331,7 +331,7 @@ pub fn appendTrailers(alloc: std.mem.Allocator, message: []const u8, t: Trailers
 }
 
 /// The exact inverse of `appendTrailers`, so a message survives a round trip
-/// through `gr git export` and `gr git import` unchanged.
+/// through `sdt git export` and `sdt git import` unchanged.
 ///
 /// Every line of the message is considered, not just the last paragraph, because
 /// a message that arrived through another tool may have been reflowed. Lines

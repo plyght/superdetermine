@@ -6,7 +6,7 @@ const Oid = oid.Oid;
 
 /// Prompt-level provenance: which agent instruction produced which change.
 ///
-/// Stored in an append-only sidecar `.gr/provenance`, one record per line, so
+/// Stored in an append-only sidecar `.sdt/provenance`, one record per line, so
 /// it never touches the object model or git interop. Each line is:
 ///   <change-hex-64> <unix_ts> <agent-escaped>\t<prompt-escaped>\n
 /// Agent and prompt are escaped (`\`→`\\`, `\n`→`\n`, `\t`→`\t`) so neither can

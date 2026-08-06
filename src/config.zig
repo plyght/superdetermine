@@ -58,7 +58,7 @@ fn upsert(old: []const u8, key: []const u8, value: []const u8, alloc: std.mem.Al
     return out.toOwnedSlice(alloc);
 }
 
-// --- local scope (repo `.gr/config`) ---
+// --- local scope (repo `.sdt/config`) ---
 
 /// Read a key from local config, falling back to global. Caller frees.
 pub fn get(store: *Store, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -87,7 +87,7 @@ pub fn set(store: *Store, key: []const u8, value: []const u8) !void {
     try store.root.writeFile(store.io, .{ .sub_path = "config", .data = new });
 }
 
-// --- global scope (`${XDG_CONFIG_HOME:-~/.config}/gr/config`) ---
+// --- global scope (`${XDG_CONFIG_HOME:-~/.config}/sdt/config`) ---
 
 /// Absolute path to the global config directory, or null if HOME is unset.
 /// Caller frees.
@@ -162,7 +162,7 @@ pub fn author(store: *Store, alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, "you <you@localhost>");
 }
 
-/// The default branch name for `gr init`, from global `init.defaultBranch`,
+/// The default branch name for `sdt init`, from global `init.defaultBranch`,
 /// else "main". Caller frees.
 pub fn defaultBranch(io: std.Io, alloc: std.mem.Allocator) ![]u8 {
     if (try globalGet(io, alloc, "init.defaultBranch")) |v| {

@@ -14,9 +14,9 @@ const Oid = oid.Oid;
 /// longer exists. Git's answer is a habit ("fetch first"), which is exactly the
 /// kind of answer that fails whenever the person is busy or is an agent.
 ///
-/// The answer here is a record. Every `gr` command that runs after the last
+/// The answer here is a record. Every `sdt` command that runs after the last
 /// look has gone stale fires a refs-only probe alongside its real work, and the
-/// result is appended to `.gr/remote-refs`. Because the snapshot is timestamped
+/// result is appended to `.sdt/remote-refs`. Because the snapshot is timestamped
 /// and durable, "was this written on top of current code?" is a question you can
 /// ask about any moment after the fact, rather than a question you had to think
 /// to ask beforehand.
@@ -25,7 +25,7 @@ const Oid = oid.Oid;
 /// hundred bytes of refs and zero objects, which is cheap enough to hang off
 /// ordinary commands and stay invisible.
 ///
-/// Log format, one snapshot per line in `.gr/remote-refs`:
+/// Log format, one snapshot per line in `.sdt/remote-refs`:
 ///   <unix_ms> <remote-escaped> <name-escaped>=<oid_hex> <name-escaped>=<oid_hex>...\n
 /// Remote and ref names are escaped the way `provenance.zig` escapes free text
 /// (`\`→`\\`, newline→`\n`, tab→`\t`) plus the two delimiters this format adds
@@ -101,7 +101,7 @@ fn unescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 // --- the refs log ---
 
 /// Append a refs snapshot for `remote`, taken at unix-milliseconds `ms`.
-/// Append-only and O(1) in the log's length, like every other `.gr` log.
+/// Append-only and O(1) in the log's length, like every other log.
 pub fn record(store: *Store, remote: []const u8, refs: RemoteRefs, ms: i64) !void {
     const alloc = store.alloc;
 
@@ -407,7 +407,7 @@ pub fn autopullAllowed(store: *Store, alloc: std.mem.Allocator, superpose_enable
     return settings(store, alloc).autopull == .always;
 }
 
-/// Log an autopull as an op, so `gr undo` reverses it completely.
+/// Log an autopull as an op, so `sdt undo` reverses it completely.
 ///
 /// This is the second half of what makes an unasked pull acceptable: it is not
 /// merely survivable, it is undoable by the same single command the user

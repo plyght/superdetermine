@@ -18,7 +18,7 @@ pub const Error = error{
     CloneFailed,
 };
 
-/// List branch names under `.gr/refs/heads`. Caller frees each name and the slice.
+/// List branch names under `.sdt/refs/heads`. Caller frees each name and the slice.
 pub fn list(store: *Store, alloc: std.mem.Allocator) ![][]u8 {
     const io = store.io;
     var dir = try store.root.openDir(io, "refs/heads", .{ .iterate = true });
@@ -59,8 +59,8 @@ pub fn switchTo(store: *Store, work_dir: std.Io.Dir, name: []const u8) !void {
 }
 
 /// Instant copy-on-write worktree via macOS clonefile(2). `dst_dir_path` must
-/// NOT already exist. Clones the entire src tree (including `.gr`) for the MVP;
-/// a later refinement can exclude/redirect `.gr` to share one repo.
+/// NOT already exist. Clones the entire src tree (including `.sdt`) for the MVP;
+/// a later refinement can exclude/redirect the repo dir to share one repo.
 pub fn work(io: std.Io, src_dir_path: []const u8, dst_dir_path: []const u8) !void {
     if (builtin.os.tag == .macos) {
         var src_buf: [std.fs.max_path_bytes]u8 = undefined;

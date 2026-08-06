@@ -10,11 +10,11 @@ const Oid = oid.Oid;
 /// Continuous capture.
 ///
 /// A moment is a content-addressed tree with a stable id, a timestamp, and a
-/// cause. It is not a change: moments never enter `gr log`, have no parents, no
+/// cause. It is not a change: moments never enter `sdt log`, have no parents, no
 /// author, and no message, so nothing can promote one into history by accident.
 ///
 /// Storage is split in two:
-///   `.gr/moments/log`  one appended line per moment (metadata only)
+///   `.sdt/moments/log`  one appended line per moment (metadata only)
 ///   the object store   the tree representation, either a keyframe or a delta
 ///
 /// The representation is what keeps capture affordable. A flat tree of a 10k

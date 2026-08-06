@@ -135,7 +135,7 @@ pub const VerdictFrame = struct {
     discrimination: verdict.Discrimination,
 };
 
-/// An annotation sent back at a point in a file: `gr note src/foo.zig:42`.
+/// An annotation sent back at a point in a file: `sdt note src/foo.zig:42`.
 ///
 /// This is the follower's whole write vocabulary. A note changes no tree and
 /// takes no authority, which is why a read-only end is allowed to send one.
@@ -380,7 +380,7 @@ pub fn rejectWrite(session: Session) error{ReadOnlyFollower}!void {
 // --- persisted notes ---
 
 /// Notes outlive the session that produced them. They go to an append-only
-/// `.gr/notes` log, one record per line:
+/// `.sdt/notes` log, one record per line:
 ///   <unix_ms> <line> <path-escaped>\t<text-escaped>\n
 /// Path and text are escaped (`\`→`\\`, `\n`→`\n`, `\t`→`\t`) so neither can
 /// contain a literal tab or newline and the framing stays unambiguous.

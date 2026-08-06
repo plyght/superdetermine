@@ -559,7 +559,7 @@ fn greenestLabel(s: Superposed, ev: ?Evidence) ?u8 {
 /// and every candidate stays readable from the store afterwards.
 ///
 /// A collapse also appends an `oplog` record so it lands on the undo stack and
-/// `gr undo` walks back over it like any other operation.
+/// `sdt undo` walks back over it like any other operation.
 pub fn collapse(
     store: *Store,
     work_dir: std.Io.Dir,
@@ -600,7 +600,7 @@ pub fn collapse(
     // rewind: `prev` and `new` are the trees on either side of the write, and
     // undoing one materializes the earlier tree back. Recording it against a
     // branch tip instead would put the collapse on the undo stack without
-    // making `gr undo` actually reverse it.
+    // making `sdt undo` actually reverse it.
     const before = try workspace.captureEntries(store, work_dir);
     const before_tree = try store.writeTree(.{ .entries = before });
     workspace.freeTreeEntries(alloc, before);
@@ -652,7 +652,7 @@ fn writeVerdictCells(w: *std.Io.Writer, v: ?verdict.Verdict) !void {
     }
 }
 
-/// The `gr super` listing: every superposed path and every candidate under it.
+/// The `sdt super` listing: every superposed path and every candidate under it.
 ///
 /// Verdict information is optional; a candidate with no verdict prints
 /// `ungraded`. The header names when the alternatives were frozen, because they
@@ -687,14 +687,14 @@ pub fn renderStatus(w: *std.Io.Writer, items: []const Superposed, ev: ?Evidence)
     }
 }
 
-/// The one-line warning `gr status` prints whenever anything is superposed.
+/// The one-line warning `sdt status` prints whenever anything is superposed.
 ///
 /// Safety property: a superposed path must never be invisible. The worktree
 /// builds, so nothing else will tell you a decision is still outstanding; this
 /// line is the thing that keeps the listing reachable.
 pub fn statusLine(w: *std.Io.Writer, n: usize) !void {
     if (n == 0) return;
-    try w.print("{d} path{s} superposed (worktree holds the primary) - run `gr super`\n", .{
+    try w.print("{d} path{s} superposed (worktree holds the primary) - run `sdt super`\n", .{
         n,
         if (n == 1) "" else "s",
     });
@@ -1054,7 +1054,7 @@ test "statusLine warns only when something is superposed" {
     defer loud.deinit();
     try statusLine(&loud.writer, 3);
     try testing.expect(std.mem.indexOf(u8, loud.written(), "3 paths superposed") != null);
-    try testing.expect(std.mem.indexOf(u8, loud.written(), "gr super") != null);
+    try testing.expect(std.mem.indexOf(u8, loud.written(), "sdt super") != null);
 }
 
 test "record rejects a primary that is not one of its candidates" {

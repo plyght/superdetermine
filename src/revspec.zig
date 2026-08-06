@@ -218,7 +218,7 @@ pub const Range = struct {
 };
 
 /// Parse `A..B`, `A..` (to the live tree) or a bare `B` (from the beginning).
-/// This is what makes `gr recap @green..` read the way it looks.
+/// This is what makes `sdt recap @green..` read the way it looks.
 pub fn resolveRange(ctx: Context, spec: []const u8) !Range {
     if (std.mem.indexOf(u8, spec, "..")) |i| {
         const lhs = spec[0..i];

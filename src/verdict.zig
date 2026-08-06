@@ -229,7 +229,7 @@ pub fn lookup(store: *Store, alloc: std.mem.Allocator, key: Key) !?Verdict {
 }
 
 /// An in-memory index for callers that ask about many trees at once (the
-/// grading policy, `gr recap`, the moment listing). One pass over the log
+/// grading policy, `sdt recap`, the moment listing). One pass over the log
 /// instead of one pass per question.
 pub const Index = struct {
     map: std.AutoHashMap([Oid.len + 1 + Oid.len]u8, Verdict),

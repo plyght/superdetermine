@@ -50,7 +50,7 @@ const ipnet = std.Io.net;
 const Oid = oid.Oid;
 const Store = store.Store;
 
-const version = "0.1.2";
+const version = "0.3.0";
 
 const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
 const Section = struct { title: []const u8, entries: []const Entry };
@@ -2241,11 +2241,11 @@ fn relayFlag(rest: []const []const u8, host: *[]const u8, port: *u16) void {
 fn sendUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\usage: sdt send                    hand it to someone on this network
-        \\       gr send --file <path>      one sealed file, no network at all
-        \\       gr send --link <dir>       static files you upload anywhere
-        \\       gr send --relay <host:port>  across the internet, via a relay
+        \\       sdt send --file <path>      one sealed file, no network at all
+        \\       sdt send --link <dir>       static files you upload anywhere
+        \\       sdt send --relay <host:port>  across the internet, via a relay
         \\
-        \\       gr get <code | url | file>   the other side of all of these
+        \\       sdt get <code | url | file>   the other side of all of these
         \\
     );
 }
@@ -2326,7 +2326,7 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
     try w.print("  {s}{s}{s}\n\n", .{ ui.on(.bold), code, ui.off() });
     try w.writeAll("on the other machine, on this same network, run:\n\n");
-    try w.print("  gr get {s}\n\n", .{code});
+    try w.print("  sdt get {s}\n\n", .{code});
     try ui.hint(w, "say the words out loud. they never touch the network.");
     try w.print("{s}waiting for a peer on this network...{s}\n", .{ ui.on(.dim), ui.off() });
     try w.flush();
@@ -2381,7 +2381,7 @@ fn sendFile(
         ui.on(.dim),   ui.off(), ui.on(.bold),
         url[frag..],   ui.off(),
     });
-    try w.print("open it with:  gr get '{s}{s}'\n", .{ path, url[frag..] });
+    try w.print("open it with:  sdt get '{s}{s}'\n", .{ path, url[frag..] });
     try ui.hint(w, "send the file and the key over different channels. either alone is useless.");
 }
 
@@ -2426,7 +2426,7 @@ fn sendViaRelay(
     wanted: []const []const u8,
 ) !void {
     try w.print("  {s}{s}{s}\n\n", .{ ui.on(.bold), code, ui.off() });
-    try w.print("  gr get {s} --relay {s}:{d}\n\n", .{ code, host, port });
+    try w.print("  sdt get {s} --relay {s}:{d}\n\n", .{ code, host, port });
     try w.print("{s}waiting via {s}:{d}...{s}\n", .{ ui.on(.dim), host, port, ui.off() });
     try w.flush();
 
@@ -2674,10 +2674,10 @@ fn cloneShare(
 fn sealUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\usage: sdt seal <path>       start sealing a file (creates .grsealed)
-        \\       gr seal             re-seal every tracked path now
-        \\       gr seal status      show sealed paths and who can read them
-        \\       gr unseal           write the plaintext files back out
-        \\       gr rotate           new repo key, re-wrapped to every member
+        \\       sdt seal             re-seal every tracked path now
+        \\       sdt seal status      show sealed paths and who can read them
+        \\       sdt unseal           write the plaintext files back out
+        \\       sdt rotate           new repo key, re-wrapped to every member
         \\
     );
 }
@@ -2685,10 +2685,10 @@ fn sealUsage(w: *std.Io.Writer) !void {
 fn keyUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\usage: sdt key new                 create your keypair
-        \\       gr key show                print your public key (share this)
-        \\       gr key add <name> <pubkey> grant someone access to the secrets
-        \\       gr key remove <name>       revoke (then `sdt rotate`)
-        \\       gr key list                who can read the sealed values
+        \\       sdt key show                print your public key (share this)
+        \\       sdt key add <name> <pubkey> grant someone access to the secrets
+        \\       sdt key remove <name>       revoke (then `sdt rotate`)
+        \\       sdt key list                who can read the sealed values
         \\
     );
 }
@@ -2710,7 +2710,7 @@ fn loadRepoManifest(
 
 fn requireIdentity(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?seal.Identity {
     return (try keyring.loadIdentity(io, alloc)) orelse {
-        try w.print("{s}{s}{s} no keypair yet. run {s}gr key new{s}\n", .{ ui.on(.red), ui.cross, ui.off(), ui.on(.cyan), ui.off() });
+        try w.print("{s}{s}{s} no keypair yet. run {s}sdt key new{s}\n", .{ ui.on(.red), ui.cross, ui.off(), ui.on(.cyan), ui.off() });
         return null;
     };
 }

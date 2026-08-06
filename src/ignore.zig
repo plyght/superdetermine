@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// A parsed `.sdtignore` file (`.grignore` is still read). Rules are matched in order; the last matching
 /// rule decides, so a later `!pattern` can re-include a path an earlier rule
-/// excluded. `.gr` and `.git` are always ignored regardless of the ruleset.
+/// excluded. The repo dir and `.git` are always ignored regardless of ruleset.
 pub const IgnoreList = struct {
     alloc: std.mem.Allocator,
     rules: []Rule,
@@ -222,7 +222,7 @@ test "ignore rules: dir, glob, negation, anchored, nested" {
     try testing.expect(list.isIgnored("src/foo.o", false));
 }
 
-test "always ignore .gr and .git" {
+test "always ignore the repo dir and .git" {
     const alloc = testing.allocator;
     var list = try IgnoreList.loadFromText(alloc, "");
     defer list.deinit();

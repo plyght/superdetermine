@@ -142,7 +142,7 @@ pub const TickResult = struct {
 /// apply the three grading triggers in priority order.
 ///
 /// This is the whole background story. It is called by the launchd agent, by
-/// `gr watch`, or by hand; nothing about it assumes a long-lived process.
+/// `sdt watch`, or by hand; nothing about it assumes a long-lived process.
 pub fn tick(
     store: *Store,
     work_dir: std.Io.Dir,
@@ -169,7 +169,7 @@ pub fn tick(
     // Freshness rides the tick rather than any interactive command.
     //
     // The design calls for a refs-only probe fired concurrently with a
-    // command's real work. Doing that from `gr status` would mean either
+    // command's real work. Doing that from `sdt status` would mean either
     // blocking on the network or spawning a process behind the user's back,
     // and the hard rule is that no interactive command gets slower. The tick
     // is already background, already rate-limited, and already the thing that

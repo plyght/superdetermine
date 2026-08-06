@@ -1,7 +1,7 @@
 const std = @import("std");
 const Store = @import("store.zig").Store;
 
-/// O(1) appends to a line-oriented log inside `.gr/`.
+/// O(1) appends to a line-oriented log inside `.sdt/`.
 ///
 /// The read-modify-write shape these logs used before was invisible at op-log
 /// volume and quadratic at moment volume: appending the n-th record rewrote all
@@ -10,7 +10,7 @@ const Store = @import("store.zig").Store;
 /// written at that offset. Cost is independent of how long the log already is.
 ///
 /// The lock is held only for the length-then-write pair, which is what makes
-/// two `gr` processes appending concurrently interleave whole records rather
+/// two `sdt` processes appending concurrently interleave whole records rather
 /// than shredding each other's bytes.
 pub fn append(store: *Store, sub_path: []const u8, bytes: []const u8) !void {
     if (bytes.len == 0) return;

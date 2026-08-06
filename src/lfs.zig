@@ -877,7 +877,7 @@ pub fn attributesFromTree(store: *Store, tree: object.Tree) !Attributes {
     return Attributes.empty(store.alloc);
 }
 
-// --- the `gr lfs` command ---
+// --- the `sdt lfs` command ---
 
 pub const Context = struct {
     store: *Store,
@@ -888,7 +888,7 @@ pub const Context = struct {
 };
 
 const usage =
-    \\usage: gr lfs <command>
+    \\usage: sdt lfs <command>
     \\
     \\  track <pattern>    store matching files as LFS objects on git export
     \\  untrack <pattern>  stop tracking a pattern
@@ -994,7 +994,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
 
     if (std.mem.eql(u8, sub, "track") or std.mem.eql(u8, sub, "untrack")) {
         if (rest.len < 2) {
-            try w.print("usage: gr lfs {s} <pattern>\n", .{sub});
+            try w.print("usage: sdt lfs {s} <pattern>\n", .{sub});
             return;
         }
         const pattern = rest[1];
@@ -1051,7 +1051,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         defer attrs.deinit();
 
         if (attrs.rules.len == 0 and tracked.len == 0) {
-            try w.writeAll("nothing tracked by LFS. try `gr lfs track \"*.psd\"`\n");
+            try w.writeAll("nothing tracked by LFS. try `sdt lfs track \"*.psd\"`\n");
             return;
         }
         if (std.mem.eql(u8, sub, "status")) {
@@ -1125,7 +1125,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         var session = try Session.open(store, ctx.git_dir_abs, ctx.remote_url);
         defer session.deinit();
         if (session.endpoint == null) {
-            try w.writeAll("no LFS endpoint. set a remote, or `gr config lfs.url <endpoint>`\n");
+            try w.writeAll("no LFS endpoint. set a remote, or `sdt config lfs.url <endpoint>`\n");
             return;
         }
         var reqs: std.ArrayList(Request) = .empty;

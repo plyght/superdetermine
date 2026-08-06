@@ -29,7 +29,7 @@ const Oid = oid.Oid;
 ///
 /// A branch is the *second* step, and an explicit one. `newBranchAt` turns a
 /// moment into real history once you have decided the fork was worth keeping;
-/// until then nothing enters `gr log`.
+/// until then nothing enters `sdt log`.
 pub const Error = error{
     BranchExists,
 };

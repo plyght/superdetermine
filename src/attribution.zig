@@ -16,7 +16,7 @@ const Oid = oid.Oid;
 ///   certain — the file's current content BLAKE3 matched an agent write event.
 ///   likely  — the path matched an agent edit but content couldn't be confirmed.
 ///
-/// Stored append-only in `.gr/attribution`, one record per line, in the same
+/// Stored append-only in `.sdt/attribution`, one record per line, in the same
 /// spirit and escaping as `provenance`:
 ///   <change-hex-64> <unix_ms> <kind> <conf> <path>\t<agent>\t<session>\t<prompt>\n
 /// Every free-text field is escaped so tabs/newlines can't break the framing.

@@ -103,7 +103,7 @@ fn findAssetUrl(assets: std.json.Array, name: []const u8) ?[]const u8 {
 
 pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_version: []const u8, nightly: bool) !void {
     const asset = assetName() orelse {
-        try w.writeAll("gr update: unsupported platform (no prebuilt release for this OS/arch)\n");
+        try w.writeAll("sdt update: unsupported platform (no prebuilt release for this OS/arch)\n");
         return;
     };
 
@@ -116,7 +116,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
             try w.writeAll("no nightly build available yet\n");
             return;
         }
-        try w.writeAll("gr update: could not reach GitHub (network? curl available?)\n");
+        try w.writeAll("sdt update: could not reach GitHub (network? curl available?)\n");
         return;
     };
     defer alloc.free(body);
@@ -124,7 +124,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{
         .ignore_unknown_fields = true,
     }) catch {
-        try w.writeAll("gr update: could not parse the release metadata\n");
+        try w.writeAll("sdt update: could not parse the release metadata\n");
         return;
     };
     defer parsed.deinit();
@@ -132,7 +132,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     const root = switch (parsed.value) {
         .object => |o| o,
         else => {
-            try w.writeAll("gr update: unexpected release metadata\n");
+            try w.writeAll("sdt update: unexpected release metadata\n");
             return;
         },
     };
@@ -143,20 +143,20 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
                 try w.writeAll("no nightly build available yet\n");
                 return;
             }
-            try w.writeAll("gr update: release has no tag_name\n");
+            try w.writeAll("sdt update: release has no tag_name\n");
             return;
         },
     };
     const assets = switch (root.get("assets") orelse .null) {
         .array => |a| a,
         else => {
-            try w.writeAll("gr update: release has no assets\n");
+            try w.writeAll("sdt update: release has no assets\n");
             return;
         },
     };
 
     if (!nightly and isUpToDate(current_version, tag)) {
-        try w.print("gr is already up to date ({s})\n", .{tag});
+        try w.print("sdt is already up to date ({s})\n", .{tag});
         return;
     }
 
@@ -169,13 +169,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     } else tag;
 
     const bin_url = findAssetUrl(assets, asset) orelse {
-        try w.print("gr update: no asset '{s}' in release {s}\n", .{ asset, tag });
+        try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
         return;
     };
     var sha_name_buf: [128]u8 = undefined;
     const sha_name = try std.fmt.bufPrint(&sha_name_buf, "{s}.sha256", .{asset});
     const sha_url = findAssetUrl(assets, sha_name) orelse {
-        try w.print("gr update: no checksum '{s}' in release {s}\n", .{ sha_name, tag });
+        try w.print("sdt update: no checksum '{s}' in release {s}\n", .{ sha_name, tag });
         return;
     };
 
@@ -186,14 +186,14 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     defer alloc.free(tmp);
 
     curlToFile(io, alloc, bin_url, tmp) catch {
-        try w.writeAll("gr update: download failed\n");
+        try w.writeAll("sdt update: download failed\n");
         return;
     };
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
 
     const expected_raw = curlCapture(io, alloc, sha_url, false) catch {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        try w.writeAll("gr update: checksum download failed\n");
+        try w.writeAll("sdt update: checksum download failed\n");
         return;
     };
     defer alloc.free(expected_raw);
@@ -202,7 +202,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
 
     const data = std.Io.Dir.cwd().readFileAlloc(io, tmp, alloc, .unlimited) catch {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        try w.writeAll("gr update: could not read downloaded binary\n");
+        try w.writeAll("sdt update: could not read downloaded binary\n");
         return;
     };
     defer alloc.free(data);
@@ -211,7 +211,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
 
     if (!std.ascii.eqlIgnoreCase(expected, actual)) {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        try w.writeAll("gr update: checksum mismatch, refusing to install\n");
+        try w.writeAll("sdt update: checksum mismatch, refusing to install\n");
         return;
     }
 
@@ -222,12 +222,12 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
 
     if (std.c.chmod(tmp_z, 0o755) != 0) {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        try w.writeAll("gr update: could not set permissions\n");
+        try w.writeAll("sdt update: could not set permissions\n");
         return;
     }
     if (std.c.rename(tmp_z, exe_z) != 0) {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        try w.writeAll("gr update: could not replace the running binary\n");
+        try w.writeAll("sdt update: could not replace the running binary\n");
         return;
     }
 

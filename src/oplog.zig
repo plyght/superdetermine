@@ -52,7 +52,7 @@ pub const OpRecord = struct {
 //   <kind> <prevhex> <newhex> <timestamp> <branch>\n
 // branch comes last so it may contain any byte except '\n'.
 
-/// Append a record to `.gr/oplog`, in time independent of the log's length.
+/// Append a record to `.sdt/oplog`, in time independent of the log's length.
 pub fn record(store: *Store, op: OpRecord) !void {
     const alloc = store.alloc;
 
@@ -107,7 +107,7 @@ pub fn lastOp(store: *Store, alloc: std.mem.Allocator) !?OpRecord {
     return try parseLine(alloc, trimmed[start..]);
 }
 
-/// Parse every record in `.gr/oplog`, in order. Caller frees each `.branch`
+/// Parse every record in `.sdt/oplog`, in order. Caller frees each `.branch`
 /// and the returned slice.
 pub fn readAll(store: *Store, alloc: std.mem.Allocator) ![]OpRecord {
     const data = store.root.readFileAlloc(store.io, "oplog", alloc, .unlimited) catch |e| switch (e) {

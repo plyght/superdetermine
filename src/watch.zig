@@ -77,7 +77,7 @@ fn nowSeconds(store: *Store) i64 {
 /// second code path to drift.
 ///
 /// Unlike `watch`, this creates moments rather than changes: nothing here ever
-/// writes to `gr log`, because a captured state is not a commit.
+/// writes to `sdt log`, because a captured state is not a commit.
 pub fn live(
     store: *Store,
     work_dir: std.Io.Dir,
@@ -118,7 +118,7 @@ pub fn live(
             out.print("{s}broke between moment {d} and {d}{s}  ", .{
                 ui.on(.yellow), b.last_green, b.first_red, ui.off(),
             }) catch {};
-            out.print("{s}`gr green` rewinds to the last state that worked{s}\n", .{
+            out.print("{s}`sdt green` rewinds to the last state that worked{s}\n", .{
                 ui.on(.dim), ui.off(),
             }) catch {};
         }

@@ -21,7 +21,7 @@ const Oid = oid.Oid;
 /// everything the project ignores (`node_modules`, `zig-cache`, `target`) comes
 /// along for free, so the check runs against a warm build instead of a cold one.
 ///
-/// If nothing is configured, gr does nothing. There is no guessing a build
+/// If nothing is configured, sdt does nothing. There is no guessing a build
 /// command from the presence of a `package.json`.
 extern "c" fn fork() std.c.pid_t;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
@@ -269,7 +269,7 @@ pub const Graded = struct {
     /// What the check actually opened, when it could be measured.
     read_set: ?readset.ReadSet = null,
     tracer_mode: tracer.Mode = .conservative,
-    /// Why tracing landed where it did, for `gr doctor`.
+    /// Why tracing landed where it did, for `sdt doctor`.
     tracer_reason: []const u8 = "",
 
     pub fn deinit(self: Graded, alloc: std.mem.Allocator) void {

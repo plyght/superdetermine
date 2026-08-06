@@ -31,7 +31,7 @@ const Oid = oid.Oid;
 /// is never touched.
 ///
 /// Where access times are not reported or not updated, this degrades to a
-/// conservative over-approximation and says so in `gr doctor`, rather than
+/// conservative over-approximation and says so in `sdt doctor`, rather than
 /// quietly pretending it measured something.
 extern "c" fn utimensat(
     dirfd: c_int,
@@ -71,7 +71,7 @@ pub const Mode = enum {
 
 pub const Availability = struct {
     mode: Mode,
-    /// A one-line explanation for `gr doctor`. Never empty.
+    /// A one-line explanation for `sdt doctor`. Never empty.
     reason: []const u8,
 };
 
@@ -238,7 +238,7 @@ test "detect reports a usable mode with a reason either way" {
     defer alloc.free(abs);
 
     const av = detect(io, alloc, tmp.dir, abs);
-    // Whichever way it lands, the reason is always sayable in `gr doctor`.
+    // Whichever way it lands, the reason is always sayable in `sdt doctor`.
     try testing.expect(av.reason.len != 0);
     // The probe file must never survive detection.
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, ".gr-atime-probe", .{}));

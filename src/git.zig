@@ -108,7 +108,7 @@ fn gitOidHex(o: *const c.git_oid) [40]u8 {
 }
 
 /// Absolute path of a repo's git directory (`.git/`, or the repo itself when
-/// bare). That is where git-lfs keeps `lfs/objects`, so gr shares it. Caller
+/// bare). That is where git-lfs keeps `lfs/objects`, so sdt shares it. Caller
 /// frees.
 fn repoGitDir(alloc: std.mem.Allocator, repo: ?*c.git_repository) !?[]u8 {
     const p = c.git_repository_path(repo);
@@ -155,8 +155,8 @@ fn lfsSessionFor(store: *Store, repo: ?*c.git_repository, remote_url: ?[]const u
 }
 
 /// Persistent, bidirectional map between git commit ids (40-hex SHA-1) and
-/// superdetermine change Oids (64-hex BLAKE3), stored at `.gr/gitmap` as
-/// "<git-hex> <gr-hex>\n" lines. Loaded at the start of every import/export op
+/// superdetermine change Oids (64-hex BLAKE3), stored at `.sdt/gitmap` as
+/// "<git-hex> <sdt-hex>\n" lines. Loaded at the start of every import/export op
 /// so the operations are incremental and consistent across runs.
 const Gitmap = struct {
     alloc: std.mem.Allocator,
@@ -498,7 +498,7 @@ pub fn importAll(store: *Store, git_repo_path: []const u8) !void {
         _ = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
     }
 
-    // Create gr branch refs.
+    // Create sdt branch refs.
     {
         var iter: ?*c.git_branch_iterator = null;
         try check(c.git_branch_iterator_new(&iter, repo, c.GIT_BRANCH_LOCAL));
@@ -875,7 +875,7 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
     var session = lfsSessionFor(store, repo, null);
     defer if (session) |*s| s.deinit();
 
-    // Export every gr branch.
+    // Export every sdt branch.
     {
         var dir = try store.root.openDir(store.io, "refs/heads", .{ .iterate = true });
         defer dir.close(store.io);
@@ -1034,7 +1034,7 @@ pub fn cloneGit(store: *Store, url_or_path: []const u8, into_dir: []const u8) !v
     try importAll(store, into_dir);
 }
 
-/// Ensure `.gr/gitmirror` exists as a real git repo and return its absolute path.
+/// Ensure `.sdt/gitmirror` exists as a real git repo and return its absolute path.
 /// Caller frees the returned slice.
 fn mirrorRepoPath(store: *Store) ![:0]u8 {
     const io = store.io;
@@ -1121,7 +1121,7 @@ fn uploadLfsForBranch(
 }
 
 /// Push superdetermine HEAD to an actual git remote (https/ssh/file://) via libgit2's
-/// smart protocol. Exports HEAD into the managed `.gr/gitmirror` repo, then
+/// smart protocol. Exports HEAD into the managed `.sdt/gitmirror` repo, then
 /// pushes `refspec` (default `refs/heads/<branch>:refs/heads/<branch>`) to
 /// `remote_url`. Auth: GIT_TOKEN/GITHUB_TOKEN as https userpass, else ssh agent.
 pub fn pushRemote(store: *Store, remote_url: []const u8, branch_opt: ?[]const u8) !void {
@@ -1220,7 +1220,7 @@ pub fn pushColocated(store: *Store, work_dir_path: []const u8, remote_url: []con
 }
 
 /// Pull from an actual git remote (https/ssh/file://) into superdetermine. Fetches
-/// heads into the managed `.gr/gitmirror` repo, points its HEAD at the current
+/// heads into the managed `.sdt/gitmirror` repo, points its HEAD at the current
 /// branch, then imports that HEAD so the superdetermine ref updates.
 pub fn pullRemote(store: *Store, remote_url: []const u8) !void {
     ensureInit();
@@ -1278,13 +1278,13 @@ pub fn pullHead(store: *Store, target: []const u8) !void {
 }
 
 /// Mirror superdetermine HEAD into a colocated git repo at `work_dir_path`, so `git log`
-/// there reflects superdetermine's current change ("gr and git coexist live").
+/// there reflects superdetermine's current change ("sdt and git coexist live").
 pub fn syncColocated(store: *Store, work_dir_path: []const u8) !void {
     try exportHead(store, work_dir_path);
     // gr wrote the commit straight to the branch ref, which leaves git's index
     // stale relative to the new HEAD (so `git status`/`git diff` show garbage).
     // Reset the index (MIXED: HEAD + index, working tree untouched) so git stays
-    // consistent and `git status` shows exactly what changed since the gr save.
+    // consistent and `git status` shows exactly what changed since the sdt save.
     resetIndexToHead(store, work_dir_path) catch {};
 }
 
