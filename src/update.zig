@@ -303,8 +303,12 @@ test "assetName matches current build target" {
         else => return,
     };
     var buf: [64]u8 = undefined;
-    const want = try std.fmt.bufPrint(&buf, "gr-{s}-{s}", .{ os, arch });
+    const want = try std.fmt.bufPrint(&buf, "sdt-{s}-{s}", .{ os, arch });
     try std.testing.expectEqualStrings(want, got.?);
+
+    var legacy_buf: [64]u8 = undefined;
+    const want_legacy = try std.fmt.bufPrint(&legacy_buf, "gr-{s}-{s}", .{ os, arch });
+    try std.testing.expectEqualStrings(want_legacy, legacyAssetName().?);
 }
 
 test "sha256Hex known vector" {
