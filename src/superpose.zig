@@ -2,6 +2,7 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const applog = @import("applog.zig");
 const oplog = @import("oplog.zig");
+const workspace = @import("workspace.zig");
 const config = @import("config.zig");
 const verdict = @import("verdict.zig");
 const Store = @import("store.zig").Store;
@@ -595,20 +596,29 @@ pub fn collapse(
     }
     defer alloc.free(data);
 
+    // A collapse changes the working tree, not a ref, so it is recorded as a
+    // rewind: `prev` and `new` are the trees on either side of the write, and
+    // undoing one materializes the earlier tree back. Recording it against a
+    // branch tip instead would put the collapse on the undo stack without
+    // making `gr undo` actually reverse it.
+    const before = try workspace.captureEntries(store, work_dir);
+    const before_tree = try store.writeTree(.{ .entries = before });
+    workspace.freeTreeEntries(alloc, before);
+
     try writeWorktree(store, work_dir, path, data);
     try tombstone(store, path);
 
+    const after = try workspace.captureEntries(store, work_dir);
+    const after_tree = try store.writeTree(.{ .entries = after });
+    workspace.freeTreeEntries(alloc, after);
+
     const branch = try store.headBranch();
     defer alloc.free(branch);
-    // The collapse moves no ref, so `prev` and `new` are the current tip: the
-    // record exists to put the collapse on the undo stack, and undoing it is
-    // safe precisely because no candidate blob was destroyed.
-    const tip = store.readRef(branch) catch Oid.zero();
     try oplog.record(store, .{
-        .kind = .other,
+        .kind = .rewind,
         .branch = branch,
-        .prev = tip,
-        .new = tip,
+        .prev = before_tree,
+        .new = after_tree,
         .timestamp = nowSeconds(store),
     });
 

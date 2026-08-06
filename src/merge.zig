@@ -3,6 +3,7 @@ const oid = @import("oid.zig");
 const object = @import("object.zig");
 const diff = @import("diff.zig");
 const store_mod = @import("store.zig");
+const superpose = @import("superpose.zig");
 const Oid = oid.Oid;
 const Store = store_mod.Store;
 
@@ -125,6 +126,13 @@ pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid
         conflicts.deinit(alloc);
     }
 
+    // Superposition is off unless the repo asks for it, and defaults off for
+    // existing repos: a file quietly holding a second value is a real change to
+    // the mental model, and disliking that is a preference, not a
+    // misunderstanding.
+    const sset = superpose.settings(store, alloc);
+    var superposed: usize = superpose.count(store, alloc) catch 0;
+
     var pit = paths.keyIterator();
     while (pit.next()) |kp| {
         const path = kp.*;
@@ -132,7 +140,7 @@ pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid
         const o = ours_map.get(path);
         const t = theirs_map.get(path);
 
-        const result: ?Oid = try resolvePath(store, alloc, path, b, o, t, &conflicts);
+        const result: ?Oid = try resolvePath(store, alloc, path, b, o, t, &conflicts, sset, &superposed);
         if (result) |blob| {
             try entries.append(alloc, .{
                 .mode = .regular,
@@ -161,7 +169,17 @@ fn oidEqOpt(a: ?Oid, b: ?Oid) bool {
 
 /// Resolve one path across base/ours/theirs. Returns the chosen blob Oid, or
 /// null when the path should be absent (deleted) in the merged tree.
-fn resolvePath(store: *Store, alloc: std.mem.Allocator, path: []const u8, base: ?Oid, ours: ?Oid, theirs: ?Oid, conflicts: *std.ArrayList([]u8)) !?Oid {
+fn resolvePath(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    base: ?Oid,
+    ours: ?Oid,
+    theirs: ?Oid,
+    conflicts: *std.ArrayList([]u8),
+    sset: superpose.Settings,
+    superposed: *usize,
+) !?Oid {
     // Both sides agree.
     if (oidEqOpt(ours, theirs)) return ours;
     // One side unchanged relative to base → take the other side.
@@ -194,14 +212,65 @@ fn resolvePath(store: *Store, alloc: std.mem.Allocator, path: []const u8, base: 
     defer alloc.free(base_data);
 
     if (looksBinary(ours_data) or looksBinary(theirs_data) or looksBinary(base_data)) {
+        if (try superposeCandidates(store, alloc, path, ours.?, theirs.?, sset, superposed)) |primary| {
+            return primary;
+        }
         try conflicts.append(alloc, try alloc.dupe(u8, path));
         return ours;
     }
 
     const merged = try threeWayMerge(alloc, base_data, ours_data, theirs_data);
     defer alloc.free(merged.text);
-    if (merged.conflict) try conflicts.append(alloc, try alloc.dupe(u8, path));
+    if (merged.conflict) {
+        // The three-way merge ran first and could not reconcile this path.
+        // Only now does superposition apply, and it replaces the conflict
+        // markers rather than the merge: markers are syntactically invalid in
+        // every language, so a tree carrying them cannot compile, cannot be
+        // graded, and cannot be handed to an agent.
+        if (try superposeCandidates(store, alloc, path, ours.?, theirs.?, sset, superposed)) |primary| {
+            return primary;
+        }
+        try conflicts.append(alloc, try alloc.dupe(u8, path));
+    }
     return try store.writeFileContent(merged.text);
+}
+
+/// Record both whole-file versions of an irreconcilable path and return the
+/// primary, so the worktree materializes exactly one complete, valid file and
+/// therefore still builds.
+///
+/// Returns null when superposition is off or the cap is reached, in which case
+/// the caller falls back to today's conflict-marker behaviour unchanged.
+fn superposeCandidates(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    ours: Oid,
+    theirs: Oid,
+    sset: superpose.Settings,
+    superposed: *usize,
+) !?Oid {
+    if (!sset.superpose) return null;
+    if (superposed.* >= sset.max_superposed) return null;
+
+    const candidates = [_]superpose.Candidate{
+        .{ .label = 'A', .origin = "ours", .blob = ours, .moment_id = "", .author = "" },
+        .{ .label = 'B', .origin = "theirs", .blob = theirs, .moment_id = "", .author = "" },
+    };
+
+    // `merge.primary` defaults to `ours`, deliberately not `greenest`: making
+    // evidence the automatic tiebreak on day one trains people to trust a
+    // signal before it has earned it.
+    const primary: u8 = switch (sset.primary) {
+        .ours => 'A',
+        .theirs => 'B',
+        .greenest => 'A',
+    };
+
+    superpose.record(store, path, &candidates, primary) catch return null;
+    superposed.* += 1;
+    _ = alloc;
+    return if (primary == 'A') ours else theirs;
 }
 
 const MergedText = struct { text: []u8, conflict: bool };
@@ -415,6 +484,7 @@ pub fn loadState(store: *Store, alloc: std.mem.Allocator) !?MergeState {
         for (conflicts.items) |p| alloc.free(p);
         conflicts.deinit(alloc);
     }
+
     while (lines.next()) |l| {
         if (l.len == 0) continue;
         try conflicts.append(alloc, try alloc.dupe(u8, l));

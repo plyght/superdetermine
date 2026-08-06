@@ -1845,9 +1845,9 @@ fn cmdSuper(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         return;
     }
 
+    // renderStatus already names the path, so the caller must not repeat it.
     for (items) |sp| {
         if (rest.len != 0 and !eq(rest[0], sp.path)) continue;
-        try w.print("{s}{s}{s}\n", .{ ui.on(.bold), sp.path, ui.off() });
         try superpose.renderStatus(w, &.{sp}, null);
     }
     try ui.hint(w, "`gr collapse <path> A` keeps one; the other is never deleted");
@@ -1913,7 +1913,10 @@ fn cmdCollapse(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []
             });
         },
     }
-    try ui.hint(w, "`gr undo` reverses it; the losing version is still in the store");
+    // Accurate rather than flattering: undo puts the file back, but the path
+    // does not become superposed again. Nothing is lost either way, because the
+    // losing candidate is still a blob in the store.
+    try ui.hint(w, "`gr undo` puts the file back; the losing version stays in the store");
 }
 
 fn cmdNote(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
