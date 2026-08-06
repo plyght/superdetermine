@@ -155,7 +155,7 @@ fn lfsSessionFor(store: *Store, repo: ?*c.git_repository, remote_url: ?[]const u
 }
 
 /// Persistent, bidirectional map between git commit ids (40-hex SHA-1) and
-/// guardrail change Oids (64-hex BLAKE3), stored at `.gr/gitmap` as
+/// superdetermine change Oids (64-hex BLAKE3), stored at `.gr/gitmap` as
 /// "<git-hex> <gr-hex>\n" lines. Loaded at the start of every import/export op
 /// so the operations are incremental and consistent across runs.
 const Gitmap = struct {
@@ -300,7 +300,7 @@ fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
     }
 }
 
-/// Import a single git commit (by id) into `store` as a guardrail change, reusing
+/// Import a single git commit (by id) into `store` as a superdetermine change, reusing
 /// the gitmap if already imported. Parents must already be present in `map`
 /// (guaranteed by a topological, oldest-first walk). Returns the gr change Oid.
 fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *const c.git_oid, sess: ?*lfs.Session) !Oid {
@@ -369,7 +369,7 @@ fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *con
 
 /// Import the FULL history of the git repo's HEAD branch into `store`. Walks the
 /// commit DAG oldest-first (topological + reverse) so every commit's parents are
-/// imported before it, reproducing the full ancestry as guardrail changes.
+/// imported before it, reproducing the full ancestry as superdetermine changes.
 /// Returns the tip change Oid and updates the store's current branch ref.
 pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
     ensureInit();
@@ -615,14 +615,14 @@ fn splitAuthor(author: []const u8) struct { name: []const u8, email: []const u8 
         const name = std.mem.trim(u8, author[0..lt], " \t");
         const email = if (gt > lt + 1) author[lt + 1 .. gt] else "";
         return .{
-            .name = if (name.len == 0) "guardrail" else name,
-            .email = if (email.len == 0) "none@guardrail" else email,
+            .name = if (name.len == 0) "superdetermine" else name,
+            .email = if (email.len == 0) "none@superdetermine" else email,
         };
     }
-    return .{ .name = if (author.len == 0) "guardrail" else author, .email = "none@guardrail" };
+    return .{ .name = if (author.len == 0) "superdetermine" else author, .email = "none@superdetermine" };
 }
 
-/// Build a git tree object in `repo` from a guardrail flat Tree, returning the
+/// Build a git tree object in `repo` from a superdetermine flat Tree, returning the
 /// looked-up git tree (caller frees). Reuses the nested ExportNode builder.
 fn buildGitTree(store: *Store, repo: ?*c.git_repository, tree: object.Tree, sess: ?*lfs.Session) !?*c.git_tree {
     const alloc = store.alloc;
@@ -780,7 +780,7 @@ fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, 
     return last;
 }
 
-/// Export the guardrail store's HEAD branch (FULL history) into a git repo at
+/// Export the superdetermine store's HEAD branch (FULL history) into a git repo at
 /// `dest_git_repo_path`, creating (init) the repo if absent. Into a fresh repo
 /// this reproduces the whole branch history losslessly (git assigns new SHAs).
 pub fn exportHead(store: *Store, dest_git_repo_path: []const u8) !void {
@@ -792,7 +792,7 @@ pub fn exportHead(store: *Store, dest_git_repo_path: []const u8) !void {
 ///   - if `git_branch` is non-null, that branch is used verbatim;
 ///   - else if the dest repo has a resolvable HEAD, its current branch shorthand
 ///     is used (e.g. "master") so a colocated repo updates its own branch;
-///   - else it falls back to the guardrail branch name.
+///   - else it falls back to the superdetermine branch name.
 /// If the target branch already exists, the gr root(s) are grafted onto its tip
 /// so the update fast-forwards rather than replacing existing history.
 pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8) !void {
@@ -1017,7 +1017,7 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
 }
 
 /// Clone a git repo (local path or file:// URL) into `into_dir`, then import its
-/// HEAD into `store` so the guardrail ref is populated.
+/// HEAD into `store` so the superdetermine ref is populated.
 pub fn cloneGit(store: *Store, url_or_path: []const u8, into_dir: []const u8) !void {
     ensureInit();
     const alloc = store.alloc;
@@ -1120,7 +1120,7 @@ fn uploadLfsForBranch(
     return session.uploadObjects(reqs.items) catch 0;
 }
 
-/// Push guardrail HEAD to an actual git remote (https/ssh/file://) via libgit2's
+/// Push superdetermine HEAD to an actual git remote (https/ssh/file://) via libgit2's
 /// smart protocol. Exports HEAD into the managed `.gr/gitmirror` repo, then
 /// pushes `refspec` (default `refs/heads/<branch>:refs/heads/<branch>`) to
 /// `remote_url`. Auth: GIT_TOKEN/GITHUB_TOKEN as https userpass, else ssh agent.
@@ -1162,7 +1162,7 @@ pub fn pushRemote(store: *Store, remote_url: []const u8, branch_opt: ?[]const u8
         _ = c.git_remote_fetch(remote, &fr_strarr, &fopts, null);
     }
 
-    // Export guardrail HEAD onto the target branch in the mirror. If the fetch
+    // Export superdetermine HEAD onto the target branch in the mirror. If the fetch
     // above populated refs/heads/<branch>, exportTipOnto chains onto that tip.
     lfs_uploaded = 0;
     var session = lfsSessionFor(store, repo, remote_url);
@@ -1219,9 +1219,9 @@ pub fn pushColocated(store: *Store, work_dir_path: []const u8, remote_url: []con
     try check(c.git_remote_push(remote, &strarr, &opts));
 }
 
-/// Pull from an actual git remote (https/ssh/file://) into guardrail. Fetches
+/// Pull from an actual git remote (https/ssh/file://) into superdetermine. Fetches
 /// heads into the managed `.gr/gitmirror` repo, points its HEAD at the current
-/// branch, then imports that HEAD so the guardrail ref updates.
+/// branch, then imports that HEAD so the superdetermine ref updates.
 pub fn pullRemote(store: *Store, remote_url: []const u8) !void {
     ensureInit();
     const alloc = store.alloc;
@@ -1262,7 +1262,7 @@ pub fn pullRemote(store: *Store, remote_url: []const u8) !void {
     _ = try importHead(store, mirror_abs);
 }
 
-/// Push guardrail HEAD. If `target` looks like a URL/remote (contains "://",
+/// Push superdetermine HEAD. If `target` looks like a URL/remote (contains "://",
 /// "git@", or scp-style "user@host:"), performs a real remote push; otherwise
 /// exports HEAD into a local git repo path (backward-compatible behavior).
 pub fn pushHead(store: *Store, target: []const u8) !void {
@@ -1270,15 +1270,15 @@ pub fn pushHead(store: *Store, target: []const u8) !void {
     try exportHead(store, target);
 }
 
-/// Pull into guardrail. If `target` looks like a URL/remote, performs a real
+/// Pull into superdetermine. If `target` looks like a URL/remote, performs a real
 /// remote fetch; otherwise imports HEAD from a local git repo path.
 pub fn pullHead(store: *Store, target: []const u8) !void {
     if (looksRemote(target)) return pullRemote(store, target);
     _ = try importHead(store, target);
 }
 
-/// Mirror guardrail HEAD into a colocated git repo at `work_dir_path`, so `git log`
-/// there reflects guardrail's current change ("gr and git coexist live").
+/// Mirror superdetermine HEAD into a colocated git repo at `work_dir_path`, so `git log`
+/// there reflects superdetermine's current change ("gr and git coexist live").
 pub fn syncColocated(store: *Store, work_dir_path: []const u8) !void {
     try exportHead(store, work_dir_path);
     // gr wrote the commit straight to the branch ref, which leaves git's index
@@ -1362,7 +1362,7 @@ test "importHead from a libgit2-created repo" {
         null,
     ));
 
-    // Now set up a guardrail store in a different subdir and import.
+    // Now set up a superdetermine store in a different subdir and import.
     try tmp.dir.createDirPath(io, "grrepo");
     var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
     defer gr_dir.close(io);
@@ -1402,7 +1402,7 @@ test "exportHead reproduces files, author and message in a git repo" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Build a guardrail store directly.
+    // Build a superdetermine store directly.
     try tmp.dir.createDirPath(io, "grrepo");
     var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
     defer gr_dir.close(io);
@@ -1583,7 +1583,7 @@ test "pushRemote/pullRemote over file:// to a bare repo" {
     try testing.expectEqual(@as(usize, 2), ptree.entries.len);
 }
 
-test "cloneGit populates the guardrail ref" {
+test "cloneGit populates the superdetermine ref" {
     ensureInit();
     const io = std.testing.io;
     const alloc = testing.allocator;

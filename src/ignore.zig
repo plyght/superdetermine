@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// A parsed `.grignore` file. Rules are matched in order; the last matching
+/// A parsed `.sdtignore` file (`.grignore` is still read). Rules are matched in order; the last matching
 /// rule decides, so a later `!pattern` can re-include a path an earlier rule
 /// excluded. `.gr` and `.git` are always ignored regardless of the ruleset.
 pub const IgnoreList = struct {
@@ -19,19 +19,20 @@ pub const IgnoreList = struct {
         self.alloc.free(self.rules);
     }
 
-    /// Read `.grignore` from `dir` if present; an absent file yields an empty
+    /// Read `.sdtignore` from `dir` if present, falling back to `.grignore`; an absent file yields an empty
     /// (but valid) list.
     pub fn load(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io) !IgnoreList {
-        const text = dir.readFileAlloc(io, ".grignore", alloc, .unlimited) catch {
+        const text = dir.readFileAlloc(io, ".sdtignore", alloc, .unlimited) catch
+            dir.readFileAlloc(io, ".grignore", alloc, .unlimited) catch {
             return .{ .alloc = alloc, .rules = try alloc.alloc(Rule, 0) };
         };
         defer alloc.free(text);
         return loadFromText(alloc, text);
     }
 
-    /// Read `.grignore` from `dir`, and — only when a colocated `.git` is
+    /// Read the ignore file from `dir`, and — only when a colocated `.git` is
     /// present (i.e. git interop is in play) — also read `.gitignore` first so
-    /// its rules apply but `.grignore`, being later, wins on conflict (last
+    /// its rules apply but ours, being later, wins on conflict (last
     /// matching rule decides). Any file may be absent.
     pub fn loadMerged(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io) !IgnoreList {
         var rules: std.ArrayList(Rule) = .empty;
@@ -41,9 +42,9 @@ pub const IgnoreList = struct {
         }
         const colocated_git = if (dir.access(io, ".git", .{})) |_| true else |_| false;
         const names: []const []const u8 = if (colocated_git)
-            &[_][]const u8{ ".gitignore", ".grignore" }
+            &[_][]const u8{ ".gitignore", ".sdtignore", ".grignore" }
         else
-            &[_][]const u8{".grignore"};
+            &[_][]const u8{ ".sdtignore", ".grignore" };
         for (names) |name| {
             const text = dir.readFileAlloc(io, name, alloc, .unlimited) catch continue;
             defer alloc.free(text);
@@ -113,7 +114,8 @@ pub const IgnoreList = struct {
     /// `rel_path` is repo-root-relative and forward-slash separated.
     pub fn isIgnored(self: IgnoreList, rel_path: []const u8, is_dir: bool) bool {
         const base = basename(rel_path);
-        if (std.mem.eql(u8, base, ".gr") or std.mem.eql(u8, base, ".git")) return true;
+        if (std.mem.eql(u8, base, ".sdt") or std.mem.eql(u8, base, ".gr") or
+            std.mem.eql(u8, base, ".git")) return true;
 
         var ignored = false;
         for (self.rules) |r| {

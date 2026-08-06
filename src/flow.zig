@@ -15,14 +15,14 @@ const Oid = oid.Oid;
 /// than whenever somebody remembers to type a command, so every change this
 /// module creates is verified by construction: the tree it points at is exactly
 /// the tree a check just went green on. A commit is *rendered* at the same
-/// boundary, so every commit guardrail exports to git builds by construction,
+/// boundary, so every commit superdetermine exports to git builds by construction,
 /// which is the property git histories are always claimed to have and never do.
 ///
 /// Nothing here removes anything. `gr save` and `gr push` never go away: a cut
 /// mode is a default for the moments nobody bothered to name, not a replacement
 /// for naming them. `.manual` is the default and cuts nothing at all.
 ///
-/// Nothing here blocks anything either. `Gr-Verified` is a HINT that a CI system
+/// Nothing here blocks anything either. `Sdt-Verified` is a HINT that a CI system
 /// may treat as an independently verifiable cache key: it can re-run the check
 /// itself and, finding the same tree and the same command, skip the work. It is
 /// NEVER an authority. A verdict produced on somebody's laptop must never gate a
@@ -204,22 +204,25 @@ pub fn publishAllowed(store: *Store, alloc: std.mem.Allocator) bool {
     return boolOf(value);
 }
 
-/// The git ref a branch replicates under: `refs/gr/<branch>`.
+/// The git ref a branch replicates under: `refs/sdt/<branch>`.
 ///
-/// Under `refs/gr/` rather than `refs/heads/`, so a publish never moves a branch
+/// Under `refs/sdt/` rather than `refs/heads/`, so a publish never moves a branch
 /// anybody is working on and a teammate who fetches it sees nothing new unless
 /// they go looking. Caller frees.
 pub fn refName(alloc: std.mem.Allocator, branch: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "refs/gr/{s}", .{branch});
+    return std.fmt.allocPrint(alloc, "refs/sdt/{s}", .{branch});
 }
 
 // --- git bridge trailers ---
 
-const verified_key = "Gr-Verified";
-const span_key = "Gr-Span";
-const check_key = "Gr-Check";
+const verified_key = "Sdt-Verified";
+const legacy_verified_key = "Gr-Verified";
+const span_key = "Sdt-Span";
+const legacy_span_key = "Gr-Span";
+const check_key = "Sdt-Check";
+const legacy_check_key = "Gr-Check";
 
-/// What guardrail knows about a commit, in a form git will carry for free.
+/// What superdetermine knows about a commit, in a form git will carry for free.
 ///
 /// `verified_full` / `verified_fast` are the per-tier verdicts, `span` is the
 /// moment range the commit covers (`<moment-id>..<moment-id>`), `check` is the
@@ -341,7 +344,10 @@ pub fn parseTrailers(alloc: std.mem.Allocator, message: []const u8) !Trailers {
     var it = std.mem.splitScalar(u8, message, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, " \t\r");
-        if (keyOf(line, verified_key)) |value| {
+        // Both spellings are accepted on read: commits exported before the
+        // rename must keep round-tripping, and a trailer is inert text to git
+        // either way.
+        if (keyOf(line, verified_key) orelse keyOf(line, legacy_verified_key)) |value| {
             var parts = std.mem.splitScalar(u8, value, ' ');
             while (parts.next()) |part| {
                 if (part.len == 0) continue;
@@ -351,11 +357,11 @@ pub fn parseTrailers(alloc: std.mem.Allocator, message: []const u8) !Trailers {
                     out.verified_fast = resultOf(part["fast=".len..]) orelse out.verified_fast;
                 }
             }
-        } else if (keyOf(line, span_key)) |value| {
+        } else if (keyOf(line, span_key) orelse keyOf(line, legacy_span_key)) |value| {
             if (value.len == 0) continue;
             if (out.span.len != 0) alloc.free(out.span);
             out.span = try alloc.dupe(u8, value);
-        } else if (keyOf(line, check_key)) |value| {
+        } else if (keyOf(line, check_key) orelse keyOf(line, legacy_check_key)) |value| {
             if (value.len == 0) continue;
             if (out.check.len != 0) alloc.free(out.check);
             out.check = try alloc.dupe(u8, value);
@@ -534,15 +540,15 @@ test "publishing is off until explicitly enabled" {
     try testing.expect(publishAllowed(&store, alloc));
 }
 
-test "refName puts a branch under refs/gr" {
+test "refName puts a branch under refs/sdt" {
     const alloc = testing.allocator;
     const r = try refName(alloc, "main");
     defer alloc.free(r);
-    try testing.expectEqualStrings("refs/gr/main", r);
+    try testing.expectEqualStrings("refs/sdt/main", r);
 
     const f = try refName(alloc, "feature/x");
     defer alloc.free(f);
-    try testing.expectEqualStrings("refs/gr/feature/x", f);
+    try testing.expectEqualStrings("refs/sdt/feature/x", f);
 }
 
 test "trailers round trip with every field set" {
@@ -559,9 +565,9 @@ test "trailers round trip with every field set" {
     try testing.expectEqualStrings(
         \\make the thing work
         \\
-        \\Gr-Verified: full=green fast=green
-        \\Gr-Span: 0011223344556677..8899aabbccddeeff
-        \\Gr-Check: zig build test
+        \\Sdt-Verified: full=green fast=green
+        \\Sdt-Span: 0011223344556677..8899aabbccddeeff
+        \\Sdt-Check: zig build test
         \\
     , msg);
 
@@ -579,7 +585,7 @@ test "trailers round trip with only some fields set" {
     const msg = try appendTrailers(alloc, "wip\n", t);
     defer alloc.free(msg);
 
-    try testing.expectEqualStrings("wip\n\nGr-Verified: fast=red\nGr-Check: bun test\n", msg);
+    try testing.expectEqualStrings("wip\n\nSdt-Verified: fast=red\nSdt-Check: bun test\n", msg);
 
     const back = try parseTrailers(alloc, msg);
     defer back.deinit(alloc);
@@ -607,12 +613,12 @@ test "appending to a message with no trailing newline is well formed" {
     const alloc = testing.allocator;
     const msg = try appendTrailers(alloc, "no newline here", .{ .span = "aa..bb" });
     defer alloc.free(msg);
-    try testing.expectEqualStrings("no newline here\n\nGr-Span: aa..bb\n", msg);
+    try testing.expectEqualStrings("no newline here\n\nSdt-Span: aa..bb\n", msg);
 
     // And so is one drowning in them.
     const many = try appendTrailers(alloc, "trailing\n\n\n", .{ .span = "aa..bb" });
     defer alloc.free(many);
-    try testing.expectEqualStrings("trailing\n\nGr-Span: aa..bb\n", many);
+    try testing.expectEqualStrings("trailing\n\nSdt-Span: aa..bb\n", many);
 }
 
 test "appending twice neither duplicates nor corrupts" {
@@ -635,15 +641,15 @@ test "appending twice neither duplicates nor corrupts" {
         \\
         \\body text
         \\
-        \\Gr-Verified: full=red
-        \\Gr-Span: cc..dd
-        \\Gr-Check: make
+        \\Sdt-Verified: full=red
+        \\Sdt-Span: cc..dd
+        \\Sdt-Check: make
         \\
     , twice);
 
     // Exactly one of each key survived.
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, twice, "Gr-Verified:"));
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, twice, "Gr-Span:"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, twice, "Sdt-Verified:"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, twice, "Sdt-Span:"));
 
     const back = try parseTrailers(alloc, twice);
     defer back.deinit(alloc);
@@ -664,7 +670,7 @@ test "appending joins an existing trailer paragraph rather than starting one" {
         \\subject
         \\
         \\Signed-off-by: Someone <s@x.com>
-        \\Gr-Check: cargo test
+        \\Sdt-Check: cargo test
         \\
     , msg);
 }
@@ -708,4 +714,37 @@ test "a repeated key takes its last value" {
     defer back.deinit(alloc);
     try testing.expectEqualStrings("second", back.check);
     try testing.expectEqual(verdict.Result.green, back.verified_full.?);
+}
+
+test "trailers written before the rename still parse" {
+    const alloc = testing.allocator;
+    const old =
+        \\shipped
+        \\
+        \\Gr-Verified: full=green fast=red
+        \\Gr-Span: aaaa..bbbb
+        \\Gr-Check: make test
+        \\
+    ;
+    const t = try parseTrailers(alloc, old);
+    defer t.deinit(alloc);
+    try testing.expectEqual(verdict.Result.green, t.verified_full.?);
+    try testing.expectEqual(verdict.Result.red, t.verified_fast.?);
+    try testing.expectEqualStrings("aaaa..bbbb", t.span);
+    try testing.expectEqualStrings("make test", t.check);
+}
+
+test "a message carrying both spellings resolves without losing either field" {
+    const alloc = testing.allocator;
+    const mixed =
+        \\mixed
+        \\
+        \\Gr-Span: old..span
+        \\Sdt-Check: zig build test
+        \\
+    ;
+    const t = try parseTrailers(alloc, mixed);
+    defer t.deinit(alloc);
+    try testing.expectEqualStrings("old..span", t.span);
+    try testing.expectEqualStrings("zig build test", t.check);
 }

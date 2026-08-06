@@ -1064,7 +1064,7 @@ test "end to end transfer through a live rendezvous" {
 
     const port: u16 = 47931;
     const code = "13-hexagon-hickory";
-    const payload = "a small pack of guardrail objects" ** 512;
+    const payload = "a small pack of superdetermine objects" ** 512;
 
     const server_alloc = std.heap.page_allocator;
     const server = try std.Thread.spawn(.{}, rendezvousThread, .{ io, server_alloc, port });

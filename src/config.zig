@@ -2,8 +2,8 @@ const std = @import("std");
 const Store = @import("store.zig").Store;
 
 /// `key = value` config. Two scopes:
-///   local  — `.gr/config` inside a repo
-///   global — `${XDG_CONFIG_HOME:-~/.config}/gr/config`
+///   local  — `.sdt/config` inside a repo
+///   global — `${XDG_CONFIG_HOME:-~/.config}/sdt/config`
 ///
 /// Blank lines and lines whose first non-space character is `#` are ignored.
 /// Whitespace around key and value is trimmed. Lookups fall back local → global.
@@ -76,7 +76,7 @@ pub fn getLocal(store: *Store, alloc: std.mem.Allocator, key: []const u8) !?[]u8
     return parseValue(data, key, alloc);
 }
 
-/// Upsert a key in `.gr/config`.
+/// Upsert a key in `.sdt/config`.
 pub fn set(store: *Store, key: []const u8, value: []const u8) !void {
     const alloc = store.alloc;
     const old = store.root.readFileAlloc(store.io, "config", alloc, .unlimited) catch
@@ -94,11 +94,11 @@ pub fn set(store: *Store, key: []const u8, value: []const u8) !void {
 pub fn globalDir(alloc: std.mem.Allocator) !?[]u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const v = std.mem.span(xdg);
-        if (v.len != 0) return try std.fmt.allocPrint(alloc, "{s}/gr", .{v});
+        if (v.len != 0) return try std.fmt.allocPrint(alloc, "{s}/sdt", .{v});
     }
     if (std.c.getenv("HOME")) |home| {
         const v = std.mem.span(home);
-        if (v.len != 0) return try std.fmt.allocPrint(alloc, "{s}/.config/gr", .{v});
+        if (v.len != 0) return try std.fmt.allocPrint(alloc, "{s}/.config/sdt", .{v});
     }
     return null;
 }
@@ -136,14 +136,18 @@ pub fn globalSet(io: std.Io, alloc: std.mem.Allocator, key: []const u8, value: [
 // --- resolved settings ---
 
 /// Resolve the change author. Precedence:
-///   1. env `GR_AUTHOR`,
+///   1. env `SDT_AUTHOR` (or the older `GR_AUTHOR`),
 ///   2. `user.name`/`user.email` (local, then global) as "Name <email>",
 ///   3. fallback "you <you@localhost>".
 /// Caller frees.
 pub fn author(store: *Store, alloc: std.mem.Allocator) ![]u8 {
-    if (std.c.getenv("GR_AUTHOR")) |env| {
-        const v = std.mem.span(env);
-        if (v.len != 0) return alloc.dupe(u8, v);
+    // The old `GR_` spelling still works, so an existing shell profile does not
+    // have to be edited the day this is installed.
+    for ([_][:0]const u8{ "SDT_AUTHOR", "GR_AUTHOR" }) |name| {
+        if (std.c.getenv(name)) |env| {
+            const v = std.mem.span(env);
+            if (v.len != 0) return alloc.dupe(u8, v);
+        }
     }
     const name = try get(store, alloc, "user.name");
     defer if (name) |n| alloc.free(n);

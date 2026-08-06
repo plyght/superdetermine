@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Blake3 = std.crypto.hash.Blake3;
 
-/// A content address. guardrail uses BLAKE3-256 for every object and chunk.
+/// A content address. superdetermine uses BLAKE3-256 for every object and chunk.
 /// The type is fixed-width here but callers should treat the length as the
 /// single source of truth (`Oid.len`) so a future hash-width bridge stays local.
 pub const Oid = struct {
@@ -72,7 +72,7 @@ pub const Hasher = struct {
 };
 
 test "oid hex roundtrip" {
-    const o = Oid.ofBytes("hello guardrail");
+    const o = Oid.ofBytes("hello superdetermine");
     var buf: [Oid.len * 2]u8 = undefined;
     const hex = o.toHex(&buf);
     const back = try Oid.fromHex(hex);

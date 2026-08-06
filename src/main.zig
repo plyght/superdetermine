@@ -119,28 +119,28 @@ const sections = [_]Section{
     } },
     .{ .title = "git, side by side", .entries = &.{
         .{ .name = "clone", .alias = "cl", .args = "<src> <dir>", .desc = "a git repo, a share URL, or a bundle" },
-        .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into guardrail" },
-        .{ .name = "export", .args = "<repo>", .desc = "write guardrail HEAD out as git commits" },
+        .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
+        .{ .name = "export", .args = "<repo>", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir>", .desc = "mirror HEAD into the colocated .git" },
         .{ .name = "push", .alias = "ps", .desc = "uses your existing git credentials" },
         .{ .name = "pull", .alias = "pl", .desc = "fetch and merge from a git remote" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
     } },
     .{ .title = "housekeeping", .entries = &.{
-        .{ .name = "init", .desc = "create a guardrail repo here" },
+        .{ .name = "init", .desc = "create a superdetermine repo here" },
         .{ .name = "gc", .args = "[--dry-run]", .desc = "reclaim unreachable objects" },
         .{ .name = "config", .alias = "cfg", .args = "<key> [val]", .desc = "identity and defaults" },
         .{ .name = "completions", .alias = "comp", .args = "<shell>", .desc = "fish | zsh | bash" },
-        .{ .name = "update", .desc = "update gr (--nightly for the latest build)" },
+        .{ .name = "update", .desc = "update sdt (--nightly for the latest build)" },
         .{ .name = "version", .desc = "" },
     } },
 };
 
 fn printUsage(w: *std.Io.Writer) !void {
-    try w.print("{s}gr{s} {s}guardrail: a fast independent VCS built for humans and agents{s}\n\n", .{
+    try w.print("{s}sdt{s} {s}superdetermine: a VCS that records what worked, not just what changed{s}\n\n", .{
         ui.on(.bold), ui.off(), ui.on(.dim), ui.off(),
     });
-    try w.print("  {s}usage:{s} gr <command> [args]\n", .{ ui.on(.dim), ui.off() });
+    try w.print("  {s}usage:{s} sdt <command> [args]\n", .{ ui.on(.dim), ui.off() });
 
     for (sections) |section| {
         try w.print("\n  {s}{s}{s}\n", .{ ui.on(.bold), section.title, ui.off() });
@@ -307,7 +307,7 @@ pub fn main(init: std.process.Init) !void {
     const rest = args[2..];
 
     if (eq(cmd, "version")) {
-        try w.print("gr {s}\n", .{version});
+        try w.print("sdt {s}\n", .{version});
     } else if (eq(cmd, "update")) {
         var nightly = false;
         for (rest) |a| {
@@ -423,9 +423,9 @@ pub fn main(init: std.process.Init) !void {
             ui.on(.red), ui.cross, ui.off(), ui.on(.bold), cmd, ui.off(),
         });
         if (nearestCommand(cmd)) |guess| {
-            try w.print("  did you mean {s}gr {s}{s}?\n", .{ ui.on(.cyan), guess, ui.off() });
+            try w.print("  did you mean {s}sdt {s}{s}?\n", .{ ui.on(.cyan), guess, ui.off() });
         }
-        try w.print("{s}run `gr help` for the full list{s}\n", .{ ui.on(.dim), ui.off() });
+        try w.print("{s}run `sdt help` for the full list{s}\n", .{ ui.on(.dim), ui.off() });
     }
 }
 
@@ -462,11 +462,12 @@ fn envOr(name: [:0]const u8, fallback: []const u8) []const u8 {
 }
 
 // Provenance is OFF by default: only recorded when a prompt/agent is explicitly
-// supplied (--prompt/--agent flag or GR_PROMPT/GR_AGENT env), and never when
+// supplied (--prompt/--agent flag or SDT_PROMPT/SDT_AGENT env, or the older
+// GR_ spellings), and never when
 // config `provenance` is a falsy kill-switch.
 fn recordProvenance(io: std.Io, alloc: std.mem.Allocator, s: *Store, change: Oid, rest: []const []const u8) void {
-    const prompt = envOr("GR_PROMPT", flagValue(rest, "--prompt", "--prompt"));
-    const agent = envOr("GR_AGENT", flagValue(rest, "--agent", "--agent"));
+    const prompt = envOr("SDT_PROMPT", envOr("GR_PROMPT", flagValue(rest, "--prompt", "--prompt")));
+    const agent = envOr("SDT_AGENT", envOr("GR_AGENT", flagValue(rest, "--agent", "--agent")));
     if (prompt.len == 0 and agent.len == 0) return;
     if (config.get(s, alloc, "provenance")) |maybe| {
         if (maybe) |v| {
@@ -484,8 +485,8 @@ fn openWork(io: std.Io) !std.Io.Dir {
 
 fn openRepo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?Store {
     return Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
-        try w.print("{s}{s}{s} not a guardrail repo\n", .{ ui.on(.red), ui.cross, ui.off() });
-        try ui.hint(w, "run `gr init` here, or cd into a repo");
+        try w.print("{s}{s}{s} not a superdetermine repo\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "run `sdt init` here, or cd into a repo");
         return null;
     };
 }
@@ -498,7 +499,7 @@ fn shortHex(o: Oid, buf: []u8) []const u8 {
 fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = Store.init(io, alloc, std.Io.Dir.cwd()) catch |e| switch (e) {
         Store.Error.RepoExists => {
-            try w.writeAll("guardrail repo already exists here\n");
+            try w.writeAll("superdetermine repo already exists here\n");
             return;
         },
         else => return e,
@@ -507,8 +508,10 @@ fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     defer alloc.free(db);
     s.setHeadBranch(db) catch {};
     s.deinit();
-    try w.print("{s}{s}{s} initialized empty guardrail repo in {s}.gr{s} on {s}{s}{s}\n", .{
-        ui.on(.green), ui.check, ui.off(), ui.on(.dim), ui.off(), ui.on(.cyan), db, ui.off(),
+    try w.print("{s}{s}{s} initialized empty superdetermine repo in {s}{s}{s} on {s}{s}{s}\n", .{
+        ui.on(.green), ui.check,       ui.off(),
+        ui.on(.dim),   store.dir_name, ui.off(),
+        ui.on(.cyan),  db,             ui.off(),
     });
 }
 
@@ -518,7 +521,7 @@ fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void 
     const records = try provenance.all(&s, alloc);
     defer provenance.freeAll(alloc, records);
     if (records.len == 0) {
-        try w.writeAll("no provenance recorded (set GR_PROMPT/GR_AGENT or use `gr save --prompt`)\n");
+        try w.writeAll("no provenance recorded (set SDT_PROMPT/SDT_AGENT or use `sdt save --prompt`)\n");
         return;
     }
     var buf: [Oid.len * 2]u8 = undefined;
@@ -531,7 +534,7 @@ fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void 
 
 fn cmdBlame(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr blame <file>\n");
+        try w.writeAll("usage: sdt blame <file>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -566,7 +569,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
             try w.writeAll("no merge in progress\n");
             return;
         }
-        try w.writeAll("usage: gr resolve <file>   (or --abort)\nunresolved:\n");
+        try w.writeAll("usage: sdt resolve <file>   (or --abort)\nunresolved:\n");
         for (rem) |p| try w.print("  ! {s}\n", .{p});
         return;
     }
@@ -587,7 +590,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
         alloc.free(rem);
     }
     if (rem.len == 0) {
-        try w.print("resolved {s}. all conflicts cleared, now `gr save`\n", .{rest[0]});
+        try w.print("resolved {s}. all conflicts cleared, now `sdt save`\n", .{rest[0]});
     } else {
         try w.print("resolved {s}. {d} conflict(s) left\n", .{ rest[0], rem.len });
     }
@@ -704,7 +707,7 @@ fn cmdLfs(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
 
 fn cmdCompletions(w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr completions <fish|zsh|bash>\n");
+        try w.writeAll("usage: sdt completions <fish|zsh|bash>\n");
         return;
     }
     completions.run(rest[0], w) catch |e| switch (e) {
@@ -715,7 +718,7 @@ fn cmdCompletions(w: *std.Io.Writer, rest: []const []const u8) !void {
 
 fn cmdWhy(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr why <file>\n");
+        try w.writeAll("usage: sdt why <file>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -750,7 +753,7 @@ fn cmdConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         }
     }
     if (np == 0) {
-        try w.writeAll("usage: gr config [--global] <key> [value]\n");
+        try w.writeAll("usage: sdt config [--global] <key> [value]\n");
         return;
     }
     const key = pos[0];
@@ -832,7 +835,7 @@ fn cmdDescribe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []
     defer s.deinit();
     const message = messageFlag(rest);
     if (message.len == 0) {
-        try w.writeAll("usage: gr desc -m \"message\"\n");
+        try w.writeAll("usage: sdt desc -m \"message\"\n");
         return;
     }
     const branch = try s.headBranch();
@@ -928,7 +931,7 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
             ui.on(.red), ui.warn, conflicts.len, ui.off(),
         });
         for (conflicts) |p| try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.red), ui.warn, ui.off(), p });
-        try ui.hint(w, "fix the markers then `gr resolve <file>`, or `gr resolve --abort`");
+        try ui.hint(w, "fix the markers then `sdt resolve <file>`, or `sdt resolve --abort`");
     }
     if (entries.len == 0) {
         if (conflicts.len == 0 and superposed == 0) {
@@ -1110,14 +1113,14 @@ fn cmdBranch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 
 fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr new <branch-name>\n");
+        try w.writeAll("usage: sdt new <branch-name>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     const name = rest[0];
 
-    // `gr new <name> @<moment>` turns a fork into a branch once you decide it
+    // `sdt new <name> @<moment>` turns a fork into a branch once you decide it
     // was worth keeping.
     if (rest.len >= 2 and revspec.looksLikeRevspec(rest[1])) {
         const set = checks.settings(&s, alloc);
@@ -1130,7 +1133,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         };
         defer resolved.deinit(alloc);
         if (resolved.target == .live) {
-            try w.writeAll("@ is the live tree; `gr new <name>` already branches from here\n");
+            try w.writeAll("@ is the live tree; `sdt new <name>` already branches from here\n");
             return;
         }
         const author = try config.author(&s, alloc);
@@ -1164,7 +1167,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
 
 fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr switch <branch-name>\n");
+        try w.writeAll("usage: sdt switch <branch-name>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1192,7 +1195,7 @@ fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
 
 fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr work <new-dir>\n");
+        try w.writeAll("usage: sdt work <new-dir>\n");
         return;
     }
     const src_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
@@ -1230,7 +1233,7 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         };
         defer resolved.deinit(alloc);
         if (resolved.target == .live) {
-            try w.writeAll("@ is the live tree; `gr work <dir>` already gives you that\n");
+            try w.writeAll("@ is the live tree; `sdt work <dir>` already gives you that\n");
             return;
         }
 
@@ -1257,7 +1260,7 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
 fn cmdRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr restore <file>\n");
+        try w.writeAll("usage: sdt restore <file>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1277,7 +1280,7 @@ fn cmdRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
 
 fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr merge <branch>\n");
+        try w.writeAll("usage: sdt merge <branch>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1308,7 +1311,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         merge.saveState(&s, rest[0], before, result.conflicts) catch {};
         try w.print("merged {s} into {s} with {d} conflict(s):\n", .{ rest[0], into, result.conflicts.len });
         for (result.conflicts) |p| try w.print("  ! {s}\n", .{p});
-        try w.writeAll("fix the markers, then `gr resolve <file>` each, or `gr resolve --abort`\n");
+        try w.writeAll("fix the markers, then `sdt resolve <file>` each, or `sdt resolve --abort`\n");
     }
 }
 
@@ -1335,14 +1338,14 @@ fn cmdServe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer s.deinit();
     var port: u16 = 7777;
     if (rest.len >= 1) port = std.fmt.parseInt(u16, rest[0], 10) catch 7777;
-    try w.print("serving guardrail objects on port {d} (ctrl-c to stop)\n", .{port});
+    try w.print("serving superdetermine objects on port {d} (ctrl-c to stop)\n", .{port});
     try w.flush();
     try net.serve(&s, port);
 }
 
 fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr fetch <src-repo-dir> [path-prefix]\n");
+        try w.writeAll("usage: sdt fetch <src-repo-dir> [path-prefix]\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1381,9 +1384,9 @@ fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         try w.print("and grading, every {d}ms\n", .{mset.interval_ms});
     } else {
         try w.print("every {d}ms; no check configured, so nothing is ever run\n", .{mset.interval_ms});
-        try ui.hint(w, "set one with `gr config checks.full \"zig build test\"`");
+        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
     }
-    try ui.hint(w, "ctrl-c to stop; `gr grade --on` does this with no terminal and no daemon");
+    try ui.hint(w, "ctrl-c to stop; `sdt grade --on` does this with no terminal and no daemon");
     try w.flush();
 
     const ctx = gradeContext(alloc, &s, work, set, rules);
@@ -1452,7 +1455,7 @@ fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     defer moment.freeMoments(alloc, all);
     if (all.len == 0) {
         try w.writeAll("no moments captured yet\n");
-        try ui.hint(w, "run `gr grade --once`, or `gr watch`, to start capturing");
+        try ui.hint(w, "run `sdt grade --once`, or `sdt watch`, to start capturing");
         return;
     }
 
@@ -1520,7 +1523,7 @@ fn rewindTo(
                     ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
                 });
                 if (std.mem.indexOf(u8, spec, "green") != null) {
-                    try ui.hint(w, "no state has been graded green yet; set `checks.full` and run `gr grade`");
+                    try ui.hint(w, "no state has been graded green yet; set `checks.full` and run `sdt grade`");
                 }
             },
             revspec.Error.UnknownSelector => try w.print("not a revspec: {s}\n", .{spec}),
@@ -1568,7 +1571,7 @@ fn rewindTo(
         try w.print(" {s}({s} {s}){s}", .{ ui.on(.dim), v.result.label(), v.tier.label(), ui.off() });
     }
     try w.print(", {d} file{s} changed\n", .{ applied.changed, if (applied.changed == 1) "" else "s" });
-    try ui.hint(w, "`gr undo` puts it back; the state you left is still addressable");
+    try ui.hint(w, "`sdt undo` puts it back; the state you left is still addressable");
 }
 
 fn cmdRewind(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1591,8 +1594,8 @@ fn cmdRewind(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     }
 
     if (spec.len == 0) {
-        try w.writeAll("usage: gr rewind <ref> [--dry-run] [-- <paths>]\n");
-        try ui.hint(w, "try `gr rewind @green`, `gr rewind @2h`, or `gr back`");
+        try w.writeAll("usage: sdt rewind <ref> [--dry-run] [-- <paths>]\n");
+        try ui.hint(w, "try `sdt rewind @green`, `sdt rewind @2h`, or `sdt back`");
         return;
     }
 
@@ -1641,7 +1644,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             if (!sched.selfTest(io, alloc, 8000)) {
                 try w.print("{s}no{s}\n", .{ ui.on(.yellow), ui.off() });
                 try w.writeAll("automatic grading is not available here\n");
-                try ui.hint(w, "run `gr watch` in a terminal instead; it does the same work");
+                try ui.hint(w, "run `sdt watch` in a terminal instead; it does the same work");
                 return;
             }
             try w.print("{s}yes{s}\n", .{ ui.on(.green), ui.off() });
@@ -1650,7 +1653,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
                 try w.print("{s}{s}{s} could not install the agent: {s}\n", .{
                     ui.on(.red), ui.cross, ui.off(), @errorName(e),
                 });
-                try ui.hint(w, "`gr watch` does the same work in the foreground");
+                try ui.hint(w, "`sdt watch` does the same work in the foreground");
                 return;
             };
             try w.print("{s}{s}{s} automatic grading is on for this repo\n", .{
@@ -1661,7 +1664,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         }
         if (eq(a, "--uninstall") or eq(a, "--off")) {
             sched.uninstall(io, alloc, repo_abs) catch {};
-            try w.writeAll("automatic grading off; `gr grade` still works by hand\n");
+            try w.writeAll("automatic grading off; `sdt grade` still works by hand\n");
             return;
         }
     }
@@ -1670,7 +1673,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer set.deinit(alloc);
     if (!set.enabled) {
         try w.writeAll("no check configured, so nothing to grade\n");
-        try ui.hint(w, "set one with `gr config checks.full \"zig build test\"`");
+        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
         return;
     }
 
@@ -1697,7 +1700,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         try w.print("{s}broke between moment {d} and {d}{s}\n", .{
             ui.on(.yellow), b.last_green, b.first_red, ui.off(),
         });
-        try ui.hint(w, "`gr green` rewinds to the last state that worked");
+        try ui.hint(w, "`sdt green` rewinds to the last state that worked");
     }
 }
 
@@ -1707,7 +1710,7 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var work = try openWork(io);
     defer work.close(io);
 
-    try w.print("{s}guardrail doctor{s}\n\n", .{ ui.on(.bold), ui.off() });
+    try w.print("{s}superdetermine doctor{s}\n\n", .{ ui.on(.bold), ui.off() });
 
     const mset = moment.settings(&s, alloc);
     const count = moment.count(&s, alloc) catch 0;
@@ -1752,8 +1755,8 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     const status = sched.agentStatus(io, alloc, work_abs) catch .unsupported;
     try w.print("  background   {s}\n", .{switch (status) {
         .installed => "on, via launchd, with no resident process",
-        .not_installed => "off (`gr grade --install`, or run `gr watch`)",
-        .unsupported => "not available here; use `gr watch` in a terminal",
+        .not_installed => "off (`sdt grade --install`, or run `sdt watch`)",
+        .unsupported => "not available here; use `sdt watch` in a terminal",
     }});
 
     const verdicts = try verdict.readAll(&s, alloc);
@@ -1850,12 +1853,12 @@ fn cmdSuper(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         if (rest.len != 0 and !eq(rest[0], sp.path)) continue;
         try superpose.renderStatus(w, &.{sp}, null);
     }
-    try ui.hint(w, "`gr collapse <path> A` keeps one; the other is never deleted");
+    try ui.hint(w, "`sdt collapse <path> A` keeps one; the other is never deleted");
 }
 
 fn cmdCollapse(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr collapse <path> <A|B|--greenest|--edit>\n");
+        try w.writeAll("usage: sdt collapse <path> <A|B|--greenest|--edit>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1916,12 +1919,12 @@ fn cmdCollapse(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []
     // Accurate rather than flattering: undo puts the file back, but the path
     // does not become superposed again. Nothing is lost either way, because the
     // losing candidate is still a blob in the store.
-    try ui.hint(w, "`gr undo` puts the file back; the losing version stays in the store");
+    try ui.hint(w, "`sdt undo` puts the file back; the losing version stays in the store");
 }
 
 fn cmdNote(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 2) {
-        try w.writeAll("usage: gr note <file>:<line> <text>\n");
+        try w.writeAll("usage: sdt note <file>:<line> <text>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1965,7 +1968,7 @@ fn cmdNotes(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 ///
 /// Every mutating command is a defensive capture point: whatever the command
 /// then does, the state it was asked to leave stays addressable as a moment, so
-/// `gr back` and `@~1` reach it even if the command itself has no undo of its
+/// `sdt back` and `@~1` reach it even if the command itself has no undo of its
 /// own. Failure is deliberately silent — a capture that cannot happen must
 /// never stop the command the user actually asked for.
 fn captureBefore(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
@@ -2009,7 +2012,7 @@ const GitOp = enum { import, export_, sync };
 
 fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8, op: GitOp) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: gr <import|export|sync> <path>\n");
+        try w.writeAll("usage: sdt <import|export|sync> <path>\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -2039,21 +2042,21 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
                 try w.print("{s}{s}{s} {d} path{s} still superposed\n", .{
                     ui.on(.red), ui.cross, ui.off(), n, if (n == 1) "" else "s",
                 });
-                try ui.hint(w, "`gr super` lists them; `gr collapse <path> <A|B>` picks one");
+                try ui.hint(w, "`sdt super` lists them; `sdt collapse <path> <A|B>` picks one");
                 return;
             }
             git.exportAll(&s, target) catch {
                 try w.writeAll("git export failed\n");
                 return;
             };
-            try w.print("exported guardrail (full history, all branches + tags) to git at {s}\n", .{target});
+            try w.print("exported superdetermine (full history, all branches + tags) to git at {s}\n", .{target});
         },
         .sync => {
             git.syncColocated(&s, target) catch {
                 try w.writeAll("sync failed\n");
                 return;
             };
-            try w.print("synced guardrail HEAD into .git at {s}\n", .{target});
+            try w.print("synced superdetermine HEAD into .git at {s}\n", .{target});
         },
     }
 }
@@ -2101,7 +2104,7 @@ fn gitConfigRemoteUrl(io: std.Io, alloc: std.mem.Allocator, name: []const u8) !?
     return null;
 }
 
-// The branch a colocated .git is on (from .git/HEAD), so `gr push` targets the
+// The branch a colocated .git is on (from .git/HEAD), so `sdt push` targets the
 // same branch git uses (e.g. `master`). Caller frees. null if not colocated.
 fn colocatedGitBranch(io: std.Io, alloc: std.mem.Allocator) ?[]u8 {
     const data = std.Io.Dir.cwd().readFileAlloc(io, ".git/HEAD", alloc, .unlimited) catch return null;
@@ -2137,7 +2140,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     }
     const remote_name = if (np >= 1) pos[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
-        try w.print("unknown remote '{s}'. pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });
+        try w.print("unknown remote '{s}'. pass a URL, or set it in git or `sdt config remote.{s}.url`\n", .{ remote_name, remote_name });
         return;
     };
     defer alloc.free(url);
@@ -2150,7 +2153,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const colocated = if (std.Io.Dir.cwd().access(io, ".git", .{})) |_| true else |_| false;
     if (colocated) {
         git.pushColocated(&s, ".", url, branch, force) catch {
-            try w.print("push to {s} failed (diverged? try `gr push --force`; or auth/URL)\n", .{remote_name});
+            try w.print("push to {s} failed (diverged? try `sdt push --force`; or auth/URL)\n", .{remote_name});
             return;
         };
     } else {
@@ -2168,7 +2171,7 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     captureBefore(io, alloc, &s);
     const remote_name = if (rest.len >= 1) rest[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
-        try w.print("unknown remote '{s}'. pass a URL, or set it in git or `gr config remote.{s}.url`\n", .{ remote_name, remote_name });
+        try w.print("unknown remote '{s}'. pass a URL, or set it in git or `sdt config remote.{s}.url`\n", .{ remote_name, remote_name });
         return;
     };
     defer alloc.free(url);
@@ -2181,14 +2184,14 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
 fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 2) {
-        try w.writeAll("usage: gr clone <git-src|share-url|bundle#k=...> <dir>\n");
+        try w.writeAll("usage: sdt clone <git-src|share-url|bundle#k=...> <dir>\n");
         return;
     }
     if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
         return cloneShare(io, alloc, w, rest[0], rest[1]);
     }
     const into = rest[1];
-    // Create the destination as a guardrail repo, then clone git into it.
+    // Create the destination as a superdetermine repo, then clone git into it.
     std.Io.Dir.cwd().createDirPath(io, into) catch {};
     var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
     defer dest.close(io);
@@ -2237,7 +2240,7 @@ fn relayFlag(rest: []const []const u8, host: *[]const u8, port: *u16) void {
 
 fn sendUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: gr send                    hand it to someone on this network
+        \\usage: sdt send                    hand it to someone on this network
         \\       gr send --file <path>      one sealed file, no network at all
         \\       gr send --link <dir>       static files you upload anywhere
         \\       gr send --relay <host:port>  across the internet, via a relay
@@ -2454,7 +2457,7 @@ fn relayUnreachable(w: *std.Io.Writer, host: []const u8, port: u16) !void {
     try w.print("{s}{s}{s} cannot reach a relay at {s}{s}:{d}{s}\n", .{
         ui.on(.red), ui.cross, ui.off(), ui.on(.bold), host, port, ui.off(),
     });
-    try ui.hint(w, "start one with `gr relay`, or use `gr send --file` instead");
+    try ui.hint(w, "start one with `sdt relay`, or use `sdt send --file` instead");
 }
 
 fn looksLikeCode(text: []const u8) bool {
@@ -2464,7 +2467,7 @@ fn looksLikeCode(text: []const u8) bool {
 
 fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1 or eq(rest[0], "-h") or eq(rest[0], "--help")) {
-        try w.writeAll("usage: gr get <code | url | file> [dir]\n");
+        try w.writeAll("usage: sdt get <code | url | file> [dir]\n");
         return;
     }
     const source = rest[0];
@@ -2543,7 +2546,7 @@ fn receiveCode(
             try w.print("{s}{s}{s} nobody is sending {s} on this network\n", .{
                 ui.on(.red), ui.cross, ui.off(), code,
             });
-            try ui.hint(w, "same wifi? otherwise ask them for `gr send --file`, or pass --relay host:port");
+            try ui.hint(w, "same wifi? otherwise ask them for `sdt send --file`, or pass --relay host:port");
             return;
         };
         break :blk wormhole.Conn.adopt(io, alloc, try peer.address.connect(io, .{ .mode = .stream })) catch {
@@ -2591,12 +2594,12 @@ fn reportHandshake(w: *std.Io.Writer, e: anyerror) !void {
             try ui.hint(w, "check the words, or start over: a wrong guess costs the sender a try.");
         },
         wormhole.Error.SlotBurned => {
-            try w.writeAll("that code is used up. generate a fresh one with `gr send`.\n");
+            try w.writeAll("that code is used up. generate a fresh one with `sdt send`.\n");
         },
         wormhole.Error.BadCode => try w.writeAll("that does not look like a gr code\n"),
         error.EndOfStream, error.ReadFailed, error.WriteFailed => {
             try w.writeAll("the peer hung up before the transfer, usually a mistyped code.\n");
-            try ui.hint(w, "nothing was sent. run `gr send` again for a fresh one.");
+            try ui.hint(w, "nothing was sent. run `sdt send` again for a fresh one.");
         },
         else => try w.print("handshake failed: {t}\n", .{e}),
     }
@@ -2665,12 +2668,12 @@ fn cloneShare(
     try w.print("{s}{s}{s} cloned into {s}{s}{s}\n", .{
         ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
     });
-    try w.writeAll("any sealed values are still sealed. `gr unseal` needs a key you were not given.\n");
+    try w.writeAll("any sealed values are still sealed. `sdt unseal` needs a key you were not given.\n");
 }
 
 fn sealUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: gr seal <path>       start sealing a file (creates .grsealed)
+        \\usage: sdt seal <path>       start sealing a file (creates .grsealed)
         \\       gr seal             re-seal every tracked path now
         \\       gr seal status      show sealed paths and who can read them
         \\       gr unseal           write the plaintext files back out
@@ -2681,10 +2684,10 @@ fn sealUsage(w: *std.Io.Writer) !void {
 
 fn keyUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: gr key new                 create your keypair
+        \\usage: sdt key new                 create your keypair
         \\       gr key show                print your public key (share this)
         \\       gr key add <name> <pubkey> grant someone access to the secrets
-        \\       gr key remove <name>       revoke (then `gr rotate`)
+        \\       gr key remove <name>       revoke (then `sdt rotate`)
         \\       gr key list                who can read the sealed values
         \\
     );
@@ -2700,7 +2703,7 @@ fn loadRepoManifest(
         try w.print("cannot read {s}: {t}\n", .{ seal.manifest_name, e });
         return null;
     }) orelse {
-        try w.print("nothing is sealed here yet (run `gr seal <path>`)\n", .{});
+        try w.print("nothing is sealed here yet (run `sdt seal <path>`)\n", .{});
         return null;
     };
 }
@@ -2804,7 +2807,7 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         try keyring.saveManifest(io, alloc, work, &manifest);
         try w.print("removed {s} from {s}\n", .{ rest[1], seal.manifest_name });
         try w.writeAll("they still hold the old key and every commit they already cloned.\n");
-        try w.writeAll("run `gr rotate`, then rotate the underlying secrets themselves\n");
+        try w.writeAll("run `sdt rotate`, then rotate the underlying secrets themselves\n");
         try w.writeAll("(new database password, new API keys). only that actually revokes them.\n");
         return;
     }
@@ -2869,7 +2872,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
                 ui.off(),                                ui.on(.cyan),                       seal.manifest_name,
                 ui.off(),
             });
-            if (!present) try ui.hint(w, "      no local plaintext. run `gr unseal`");
+            if (!present) try ui.hint(w, "      no local plaintext. run `sdt unseal`");
         }
         try w.print("{d} member(s) can read these values\n", .{manifest.members.items.len});
         const key = try keyring.repoKey(io, alloc, &manifest);
@@ -2903,7 +2906,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             try manifest.putMember(io, fresh, name, id.publicId());
             break :blk fresh;
         } else (try keyring.repoKey(io, alloc, &manifest)) orelse {
-            try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
+            try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `sdt key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
             return;
         };
         _ = key;
@@ -2929,11 +2932,11 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     defer plan.deinit();
 
     if (plan.outputs.len == 0) {
-        try w.writeAll("nothing is sealed here yet (run `gr seal <path>`)\n");
+        try w.writeAll("nothing is sealed here yet (run `sdt seal <path>`)\n");
         return;
     }
     if (!plan.have_key) {
-        try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `sdt key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
         return;
     }
     for (plan.sources) |src| {
@@ -2955,12 +2958,12 @@ fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 
     const out = keyring.unsealAll(io, alloc, work) catch |e| switch (e) {
         keyring.Error.NoManifest => {
-            try w.writeAll("nothing is sealed here yet (run `gr seal <path>`)\n");
+            try w.writeAll("nothing is sealed here yet (run `sdt seal <path>`)\n");
             return;
         },
         seal.Error.NotAMember => {
-            try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `gr key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
-            try w.writeAll("(`gr key show` prints the public key they need)\n");
+            try w.print("{s}{s}{s} you cannot read this repo's secrets. ask a member to `sdt key add` you\n", .{ ui.on(.red), ui.cross, ui.off() });
+            try w.writeAll("(`sdt key show` prints the public key they need)\n");
             return;
         },
         seal.Error.BadToken => {

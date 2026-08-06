@@ -2,7 +2,7 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const Oid = oid.Oid;
 
-/// guardrail's object model. Everything is content-addressed: an object's Oid is
+/// superdetermine's object model. Everything is content-addressed: an object's Oid is
 /// the BLAKE3 hash of its canonical encoding (which begins with a type tag, so
 /// hashes are domain-separated across object kinds).
 ///

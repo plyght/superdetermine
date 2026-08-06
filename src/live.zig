@@ -22,7 +22,7 @@ const Oid = oid.Oid;
 /// is exactly one writer at any instant, enforced here rather than agreed by
 /// convention. It is deliberately not a CRDT: a CRDT is a different system with
 /// different failure modes, and it forces a synchronisation service to exist for
-/// convergence to mean anything. guardrail has no such service and does not want
+/// convergence to mean anything. superdetermine has no such service and does not want
 /// one, so authority is transferred explicitly with a `handoff` message instead
 /// of being dissolved into a merge function.
 ///

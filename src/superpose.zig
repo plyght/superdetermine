@@ -892,7 +892,9 @@ test "collapse to a label writes it, logs an op, and keeps the loser readable" {
     // The collapse is on the undo stack.
     const op = (try oplog.lastOp(&store, alloc)).?;
     defer alloc.free(op.branch);
-    try testing.expectEqual(oplog.OpKind.other, op.kind);
+    // A rewind, not a bare marker: the op carries the trees on either side of
+    // the write, which is what lets `undo` actually put the file back.
+    try testing.expectEqual(oplog.OpKind.rewind, op.kind);
     try testing.expectEqualStrings("main", op.branch);
 
     // The losing blob was not deleted, and never will be.

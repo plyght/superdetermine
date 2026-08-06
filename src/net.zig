@@ -288,7 +288,7 @@ fn buildSource(st: *Store) !Fixture {
 
     const src_a = "fn main() void {}\n" ** 64;
     const src_b = "pub const x = 42;\n" ** 64;
-    const docs_a = "# guardrail docs\n" ** 64;
+    const docs_a = "# superdetermine docs\n" ** 64;
 
     const src_a_blob = try st.writeFileContent(src_a);
     const src_b_blob = try st.writeFileContent(src_b);
@@ -334,7 +334,7 @@ fn buildSource(st: *Store) !Fixture {
 }
 
 fn grDirPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
-    return tmp.dir.realPathFileAlloc(std.testing.io, ".gr", alloc);
+    return tmp.dir.realPathFileAlloc(std.testing.io, store.dir_name, alloc);
 }
 
 test "fetchSparse pulls only the prefix subtree" {

@@ -115,6 +115,9 @@ pub fn freeMoments(alloc: std.mem.Allocator, list: []Moment) void {
 /// gets two ids.
 pub fn computeId(branch: []const u8, tree: Oid, ms: i64) MomentId {
     var hasher = oid.Hasher.init();
+    // Deliberately still "gr-moment-v1" after the rename: this digest produces
+    // moment ids that are already written into `moments/log`, and re-spelling
+    // the domain would silently invalidate every id ever recorded.
     hasher.update("gr-moment-v1");
     hasher.update(branch);
     hasher.update(&tree.bytes);

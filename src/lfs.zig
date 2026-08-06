@@ -865,7 +865,7 @@ fn boolConfig(store: *Store, key: []const u8, default: bool) bool {
     return default;
 }
 
-/// Load `.gitattributes` out of a guardrail tree. Trees are flat, so this is a
+/// Load `.gitattributes` out of a superdetermine tree. Trees are flat, so this is a
 /// direct lookup of the root file. Absent means "nothing is LFS-tracked".
 pub fn attributesFromTree(store: *Store, tree: object.Tree) !Attributes {
     for (tree.entries) |e| {

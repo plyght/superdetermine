@@ -12,13 +12,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     linkLibgit2(b, exe_mod, target, optimize);
-    const exe = b.addExecutable(.{ .name = "gr", .root_module = exe_mod });
+    const exe = b.addExecutable(.{ .name = "sdt", .root_module = exe_mod });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run the gr binary");
+    const run_step = b.step("run", "Run the sdt binary");
     run_step.dependOn(&run_cmd.step);
 
     const test_mod = b.createModule(.{

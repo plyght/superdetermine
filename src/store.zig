@@ -4,18 +4,29 @@ const object = @import("object.zig");
 const cdc = @import("cdc.zig");
 const Oid = oid.Oid;
 
-/// The on-disk content-addressed store, rooted at `.gr/`.
+/// The on-disk content-addressed store, rooted at `.sdt/`.
 ///
 /// Layout:
-///   .gr/objects/aa/bbbb...   loose objects & chunks, sharded by first hex byte.
+///   .sdt/objects/aa/bbbb..   loose objects & chunks, sharded by first hex byte.
 ///                            The file name is the full hex Oid; contents are the
 ///                            raw object encoding (chunks are stored verbatim).
-///   .gr/refs/heads/<name>    branch pointers (hex change Oid + '\n').
-///   .gr/HEAD                 current branch: "ref: refs/heads/<name>\n".
+///   .sdt/refs/heads/<name>   branch pointers (hex change Oid + '\n').
+///   .sdt/HEAD                current branch: "ref: refs/heads/<name>\n".
 ///
 /// Objects and chunks share one namespace keyed by BLAKE3(content). Writes are
 /// idempotent: storing content that already exists is a no-op, which is the
 /// whole point of content addressing (dedup across versions/branches/workspaces).
+/// The repository directory name, and the one this project used to use.
+///
+/// A repo created today is `.sdt`. A repo created before the rename is `.gr`,
+/// and is opened in place: discovery prefers the new name and falls back to the
+/// old one, so an existing repository keeps working with no migration step and
+/// no flag. There is deliberately no converter, because renaming a directory
+/// out from under a user's tooling is a worse trade than reading both names
+/// forever.
+pub const dir_name = ".sdt";
+pub const legacy_dir_name = ".gr";
+
 pub const Store = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -29,31 +40,31 @@ pub const Store = struct {
         InvalidRef,
     };
 
-    /// Create `.gr/...` under `dir`. Errors `RepoExists` if already present.
+    /// Create `.sdt/...` under `dir`. Errors `RepoExists` if a repo of either
+    /// name is already present.
     pub fn init(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
-        if (dir.access(io, ".gr", .{})) |_| {
-            return Error.RepoExists;
-        } else |_| {}
-        try dir.createDirPath(io, ".gr/objects");
-        try dir.createDirPath(io, ".gr/refs/heads");
-        try dir.writeFile(io, .{ .sub_path = ".gr/HEAD", .data = "ref: refs/heads/main\n" });
+        if (dir.access(io, dir_name, .{})) |_| return Error.RepoExists else |_| {}
+        if (dir.access(io, legacy_dir_name, .{})) |_| return Error.RepoExists else |_| {}
+        try dir.createDirPath(io, dir_name ++ "/objects");
+        try dir.createDirPath(io, dir_name ++ "/refs/heads");
+        try dir.writeFile(io, .{ .sub_path = dir_name ++ "/HEAD", .data = "ref: refs/heads/main\n" });
         return open(io, alloc, dir);
     }
 
-    /// Open an existing repo. Errors `NotARepo` if `.gr` is missing.
+    /// Open an existing repo, preferring `.sdt` and accepting `.gr`.
     pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
-        const root = dir.openDir(io, ".gr", .{}) catch return Error.NotARepo;
+        const root = dir.openDir(io, dir_name, .{}) catch
+            dir.openDir(io, legacy_dir_name, .{}) catch return Error.NotARepo;
         return .{ .io = io, .alloc = alloc, .root = root };
     }
 
-    /// Walk up from `dir` to find the nearest `.gr` repo (like git's discovery).
+    /// Walk up from `dir` to find the nearest repo (like git's discovery).
     pub fn discover(io: std.Io, alloc: std.mem.Allocator, start: std.Io.Dir) !Store {
         var dir = start;
         var depth: usize = 0;
         while (depth < 64) : (depth += 1) {
-            if (dir.access(io, ".gr", .{})) |_| {
-                return open(io, alloc, dir);
-            } else |_| {}
+            if (dir.access(io, dir_name, .{})) |_| return open(io, alloc, dir) else |_| {}
+            if (dir.access(io, legacy_dir_name, .{})) |_| return open(io, alloc, dir) else |_| {}
             const parent = dir.openDir(io, "..", .{}) catch return Error.NotARepo;
             dir = parent;
         }

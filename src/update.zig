@@ -108,9 +108,9 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     };
 
     const api_url = if (nightly)
-        "https://api.github.com/repos/plyght/guardrail/releases/tags/nightly"
+        "https://api.github.com/repos/plyght/superdetermine/releases/tags/nightly"
     else
-        "https://api.github.com/repos/plyght/guardrail/releases/latest";
+        "https://api.github.com/repos/plyght/superdetermine/releases/latest";
     const body = curlCapture(io, alloc, api_url, true) catch {
         if (nightly) {
             try w.writeAll("no nightly build available yet\n");

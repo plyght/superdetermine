@@ -18,9 +18,9 @@ const Oid = oid.Oid;
 /// Getting work done in the background without running a daemon.
 ///
 /// A resident process of our own is the thing to avoid, and it turns out not to
-/// be necessary. On macOS `launchd` is already running whether guardrail exists
+/// be necessary. On macOS `launchd` is already running whether superdetermine exists
 /// or not, and a LaunchAgent with `WatchPaths` lets it do the watching: it
-/// starts a short-lived `gr grade --once` when the worktree changes, and that
+/// starts a short-lived `sdt grade --once` when the worktree changes, and that
 /// process exits when its slice of work is done. Nothing of ours is resident
 /// between changes, and idle CPU is exactly zero because there is no idle
 /// process to burn any.
@@ -28,7 +28,7 @@ const Oid = oid.Oid;
 /// Two things make that safe to lean on. The recursive behaviour of
 /// `WatchPaths` is undocumented by Apple, so `install` refuses to claim it works
 /// without `selfTest` having proved it on this machine. And an OS scheduler is
-/// not available everywhere, so the foreground path (`gr watch`) does the same
+/// not available everywhere, so the foreground path (`sdt watch`) does the same
 /// work in a terminal you can see, which is what every comparable tool
 /// (`entr`, `watchexec`, `ibazel`) does anyway.
 ///
@@ -64,7 +64,7 @@ pub const Lock = struct {
 
 /// Take the tick lock, or report that somebody else already has it.
 ///
-/// Never blocks. Two `gr` processes noticing the same change must not both
+/// Never blocks. Two `sdt` processes noticing the same change must not both
 /// grade it, and the loser has nothing useful to wait for.
 pub fn tryLock(store: *Store) !?Lock {
     const io = store.io;
@@ -300,12 +300,14 @@ fn previousResult(
 /// the same repo replaces its own agent rather than accumulating.
 pub fn agentLabel(alloc: std.mem.Allocator, repo_abs: []const u8) ![]u8 {
     var hasher = oid.Hasher.init();
+    // Deliberately still "gr-agent-v1": this digest names launchd agents that
+    // are already installed on disk, and changing it would orphan them.
     hasher.update("gr-agent-v1");
     hasher.update(repo_abs);
     const o = hasher.finalOid();
     var hex: [Oid.len * 2]u8 = undefined;
     _ = o.toHex(&hex);
-    return std.fmt.allocPrint(alloc, "dev.guardrail.grade.{s}", .{hex[0..16]});
+    return std.fmt.allocPrint(alloc, "dev.superdetermine.grade.{s}", .{hex[0..16]});
 }
 
 pub fn agentPlistPath(alloc: std.mem.Allocator, label: []const u8) !?[]u8 {
@@ -317,7 +319,7 @@ pub fn agentPlistPath(alloc: std.mem.Allocator, label: []const u8) !?[]u8 {
 }
 
 /// The agent. `WatchPaths` is the whole trick: launchd watches the worktree and
-/// starts this job when it changes, so guardrail has no process between changes.
+/// starts this job when it changes, so superdetermine has no process between changes.
 /// `ThrottleInterval` is the debounce, and the job is not `KeepAlive`, so it
 /// runs once and exits.
 pub fn agentPlist(
@@ -390,7 +392,7 @@ pub fn selfTest(io: std.Io, alloc: std.mem.Allocator, deadline_ms: u32) bool {
 
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = trigger, .data = "0" }) catch return false;
 
-    const label = "dev.guardrail.watchpath-selftest";
+    const label = "dev.superdetermine.watchpath-selftest";
     const plist_path = (agentPlistPath(alloc, label) catch return false) orelse return false;
     defer alloc.free(plist_path);
     defer std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
@@ -508,6 +510,21 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator, repo_abs: []const u8) !vo
     defer alloc.free(spec);
     quietly(alloc, &.{ "launchctl", "bootout", spec });
 
+    // Also evict an agent installed under the pre-rename label, or it would
+    // keep firing forever with nothing left to turn it off.
+    var legacy_hasher = oid.Hasher.init();
+    legacy_hasher.update("gr-agent-v1");
+    legacy_hasher.update(repo_abs);
+    const legacy_oid = legacy_hasher.finalOid();
+    var legacy_hex: [Oid.len * 2]u8 = undefined;
+    _ = legacy_oid.toHex(&legacy_hex);
+    const legacy_spec = try std.fmt.allocPrint(alloc, "gui/{d}/dev.superdetermine.grade.{s}", .{ uid, legacy_hex[0..16] });
+    defer alloc.free(legacy_spec);
+    quietly(alloc, &.{ "launchctl", "bootout", legacy_spec });
+    const legacy_plist = try std.fmt.allocPrint(alloc, "{s}/Library/LaunchAgents/dev.superdetermine.grade.{s}.plist", .{ std.mem.span(std.c.getenv("HOME") orelse ""), legacy_hex[0..16] });
+    defer alloc.free(legacy_plist);
+    std.Io.Dir.cwd().deleteFile(io, legacy_plist) catch {};
+
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
@@ -563,12 +580,12 @@ test "agent labels are stable per repo and differ across repos" {
 
     try testing.expectEqualStrings(a, a2);
     try testing.expect(!std.mem.eql(u8, a, b));
-    try testing.expect(std.mem.startsWith(u8, a, "dev.guardrail.grade."));
+    try testing.expect(std.mem.startsWith(u8, a, "dev.superdetermine.grade."));
 }
 
 test "the plist watches the worktree and does not stay resident" {
     const alloc = testing.allocator;
-    const body = try agentPlist(alloc, "dev.guardrail.grade.abc", "/usr/local/bin/gr", "/Users/x/repo", .{});
+    const body = try agentPlist(alloc, "dev.superdetermine.grade.abc", "/usr/local/bin/gr", "/Users/x/repo", .{});
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "<key>WatchPaths</key>") != null);

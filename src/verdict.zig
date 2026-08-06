@@ -179,6 +179,8 @@ fn parseLine(line: []const u8) !Verdict {
 /// BLAKE3 of a check command string, domain-separated from every other digest.
 pub fn commandHash(command: []const u8) Oid {
     var hasher = oid.Hasher.init();
+    // Deliberately still "gr-check-v1": this digest is a persisted verdict
+    // cache key, and changing it would throw away every recorded verdict.
     hasher.update("gr-check-v1");
     hasher.update(command);
     return hasher.finalOid();
