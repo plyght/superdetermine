@@ -10,6 +10,7 @@ const tracer = @import("tracer.zig");
 const applog = @import("applog.zig");
 const proc = @import("proc.zig");
 const config = @import("config.zig");
+const freshness = @import("freshness.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -126,6 +127,8 @@ pub fn powerOk(alloc: std.mem.Allocator, set: Settings) bool {
 
 pub const TickResult = struct {
     captured: bool = false,
+    /// Whether this tick refreshed its view of the remote's refs.
+    freshened: bool = false,
     graded: usize = 0,
     /// Set when a green-to-red flip was found and searched back to a boundary.
     boundary: ?grade.Break = null,
@@ -159,6 +162,17 @@ pub fn tick(
     writeStamp(store, started);
 
     var out = TickResult{};
+
+    // Freshness rides the tick rather than any interactive command.
+    //
+    // The design calls for a refs-only probe fired concurrently with a
+    // command's real work. Doing that from `gr status` would mean either
+    // blocking on the network or spawning a process behind the user's back,
+    // and the hard rule is that no interactive command gets slower. The tick
+    // is already background, already rate-limited, and already the thing that
+    // runs when the tree moves, so the probe lives here and every command
+    // reads the recorded answer for free.
+    out.freshened = freshen(store, alloc) catch false;
 
     const cap = try moment.capture(store, work_dir, .poll, mset);
     if (cap == .captured) {
@@ -207,6 +221,26 @@ pub fn tick(
     }
 
     return out;
+}
+
+/// Take one refs-only look at the remote, if it has been long enough.
+///
+/// One round trip, a few hundred bytes, no objects, no hooks, no daemon: this
+/// is `git ls-remote` and nothing more. Staleness then becomes a property of
+/// the work rather than an event someone has to notice, because every captured
+/// moment can be compared against the refs it was written on top of.
+fn freshen(store: *Store, alloc: std.mem.Allocator) !bool {
+    const set = freshness.settings(store, alloc);
+    if (!freshness.shouldFreshen(store, alloc, set)) return false;
+
+    const url = (config.get(store, alloc, "remote.origin.url") catch return false) orelse return false;
+    defer alloc.free(url);
+    if (url.len == 0) return false;
+
+    const refs = freshness.fetchRefsOnly(alloc, url) catch return false;
+    defer refs.deinit(alloc);
+    try freshness.record(store, "origin", refs, nowMillis(store.io));
+    return true;
 }
 
 // --- launchd (macOS) ---
