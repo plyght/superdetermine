@@ -1755,7 +1755,7 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     const status = sched.agentStatus(io, alloc, work_abs) catch .unsupported;
     try w.print("  background   {s}\n", .{switch (status) {
         .installed => "on, via launchd, with no resident process",
-        .not_installed => "off (`sdt grade --install`, or run `sdt watch`)",
+        .not_installed => "off (`sdt grade --on`, or run `sdt watch`)",
         .unsupported => "not available here; use `sdt watch` in a terminal",
     }});
 
