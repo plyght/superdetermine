@@ -35,12 +35,19 @@ The working tree is captured continuously as *moments*: content-addressed states
 
 A moment can then be *graded*: superdetermine copy-on-write clones your worktree, reconciles the clone to that state, runs your own check inside it, and throws the clone away. Your tree is never touched and your terminal never blocks. Verdicts are keyed by content, so a state is never graded twice, ever.
 
+Capture is on from `sdt init`. You do not switch it on, and you do not run `save` to be safe:
+
 ```sh
-sdt config checks.full "zig build test"   # nothing runs until you say what to run
-sdt grade --on                            # automatic, from here on
+sdt init                                  # capture starts here
+# ... an agent runs for forty minutes and wrecks something ...
+sdt back                                  # it is still there
 ```
 
-`sdt grade --on` is the whole setup. There is no daemon: on macOS, launchd already runs, so it watches the worktree and starts a short-lived `sdt` only when something changes. Idle CPU is zero because there is no idle process. `sdt watch` does the same thing in a terminal if you prefer to see it.
+Grading is the part that runs your code, so it stays inert until you say what to run:
+
+```sh
+sdt config checks.full "zig build test"
+``` There is no daemon: on macOS, launchd already runs, so it watches the worktree and starts a short-lived `sdt` only when something changes. Idle CPU is zero because there is no idle process. `sdt watch` does the same thing in a terminal if you prefer to see it.
 
 Then the payoff:
 

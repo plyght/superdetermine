@@ -32,6 +32,11 @@ pub const MomentId = [8]u8;
 
 pub const log_path = "moments/log";
 
+/// How many captures pass between age-based retention sweeps. The count cap is
+/// enforced exactly (the length is already known at capture time); this only
+/// bounds how stale the time window may get.
+const trim_interval: usize = 64;
+
 pub const Error = error{
     MomentCorrupt,
     MomentNotFound,
@@ -140,7 +145,11 @@ pub fn parseId(s: []const u8) !MomentId {
 // --- settings ---
 
 pub const Settings = struct {
-    enabled: bool = false,
+    /// On by default. "Nothing is ever unsaved" is the whole claim, and a claim
+    /// that only holds after you find a config key is not a claim. Capture is
+    /// local, writes well under a kilobyte per moment, and runs nothing of the
+    /// user's; `moments.enabled = false` turns it off.
+    enabled: bool = true,
     interval_ms: u32 = 800,
     /// Retention window in seconds.
     retain_s: i64 = 14 * 24 * 60 * 60,
@@ -598,8 +607,13 @@ pub fn capture(
     defer alloc.free(enc);
     const full_tree = Oid.ofBytes(enc);
 
-    const prev = try last(store, alloc);
-    defer if (prev) |p| alloc.free(p.branch);
+    // One read of the log, not three. `last`, `count` and `trim` each used to
+    // re-read it, which made capturing the n-th moment cost O(n) log parsing
+    // and the whole session O(n^2) — exactly the shape this module exists to
+    // avoid, reintroduced one convenience call at a time.
+    const existing = try readAll(store, alloc);
+    defer freeMoments(alloc, existing);
+    const prev: ?Moment = if (existing.len == 0) null else existing[existing.len - 1];
 
     if (prev) |p| {
         if (p.full_tree.eql(full_tree)) return .unchanged;
@@ -608,7 +622,7 @@ pub fn capture(
     const branch = try store.headBranch();
     errdefer alloc.free(branch);
 
-    const total = try count(store, alloc);
+    const total = existing.len;
     const want_keyframe = prev == null or
         set.keyframe_interval <= 1 or
         total % set.keyframe_interval == 0;
@@ -624,7 +638,7 @@ pub fn capture(
             // which also re-anchors every future delta on solid ground.
             Error.MomentCorrupt, Error.MomentNotFound => {
                 repr = try store.writeRaw(enc);
-                return try finish(store, alloc, branch, full_tree, repr, .keyframe, cause, set);
+                return try finish(store, alloc, branch, full_tree, repr, .keyframe, cause, set, total);
             },
             else => return e,
         };
@@ -654,7 +668,7 @@ pub fn capture(
         }
     }
 
-    return try finish(store, alloc, branch, full_tree, repr, kind, cause, set);
+    return try finish(store, alloc, branch, full_tree, repr, kind, cause, set, total);
 }
 
 fn finish(
@@ -666,6 +680,7 @@ fn finish(
     kind: ReprKind,
     cause: Cause,
     set: Settings,
+    total: usize,
 ) !CaptureResult {
     const ms = nowMillis(store.io);
     const m = Moment{
@@ -683,7 +698,14 @@ fn finish(
     defer alloc.free(line);
     try applog.append(store, log_path, line);
 
-    trim(store, alloc, set) catch {};
+    // Retention almost always decides nothing, and deciding it costs a full
+    // log read, so it is not run on every capture. The count is already known
+    // here for free, which makes the count cap exact rather than approximate:
+    // sweep the moment it is exceeded, and otherwise only periodically, which
+    // is all the age-based window needs.
+    const over_cap = set.max != 0 and total + 1 > set.max;
+    const periodic = (total + 1) % trim_interval == 0;
+    if (over_cap or periodic) trim(store, alloc, set) catch {};
 
     return .{ .captured = m };
 }

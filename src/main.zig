@@ -50,7 +50,7 @@ const ipnet = std.Io.net;
 const Oid = oid.Oid;
 const Store = store.Store;
 
-const version = "0.3.0";
+const version = "0.4.0";
 
 const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
 const Section = struct { title: []const u8, entries: []const Entry };
@@ -513,6 +513,45 @@ fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         ui.on(.dim),   store.dir_name, ui.off(),
         ui.on(.cyan),  db,             ui.off(),
     });
+
+    try startCapturing(io, alloc, w);
+}
+
+/// Turn on continuous capture for a new repo.
+///
+/// This is opinionated on purpose. The claim is that nothing is ever unsaved,
+/// and that is only true if capture is running before anything goes wrong — a
+/// safety net you have to switch on is a safety net you switch on after the
+/// fall. Capture is cheap, stays entirely local, and runs none of your code:
+/// grading is what runs your code, and grading stays inert until you configure
+/// a check.
+///
+/// It is still one command to undo, and this says so rather than being quiet
+/// about having registered something.
+fn startCapturing(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var work = openWork(io) catch return;
+    defer work.close(io);
+    const repo_abs = work.realPathFileAlloc(io, ".", alloc) catch return;
+    defer alloc.free(repo_abs);
+
+    const exe = update.selfExePathAlloc(alloc) catch {
+        try ui.hint(w, "run `sdt watch` to capture every state as you work");
+        return;
+    };
+    defer alloc.free(exe);
+
+    sched.install(io, alloc, exe, repo_abs, .{}) catch {
+        // No OS scheduler here, or it refused. The foreground path does the
+        // same work, so say that instead of failing the init.
+        try ui.hint(w, "run `sdt watch` to capture every state as you work");
+        return;
+    };
+
+    try w.print("{s}{s}{s} capturing every state, in the background, with no daemon\n", .{
+        ui.on(.green), ui.check, ui.off(),
+    });
+    try ui.hint(w, "`sdt moments` lists them, `sdt green` needs a check: `sdt config checks.full \"...\"`");
+    try ui.hint(w, "`sdt grade --off` stops it");
 }
 
 fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -783,7 +822,6 @@ fn cmdConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
 fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
-    captureBefore(io, alloc, &s);
     const change = try doSave(io, alloc, &s, messageFlag(rest));
     recordProvenance(io, alloc, &s, change, rest);
     const branch = try s.headBranch();
@@ -1671,12 +1709,11 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
 
     const set = checks.settings(&s, alloc);
     defer set.deinit(alloc);
-    if (!set.enabled) {
-        try w.writeAll("no check configured, so nothing to grade\n");
-        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
-        return;
-    }
 
+    // Deliberately no early return when no check is configured. Capture and
+    // grading are separate promises: capture must keep running so nothing is
+    // ever unsaved, and this is the entry point the background agent calls, so
+    // returning here would mean a repo without a check captures nothing at all.
     const rules = warrant.pathRules(&s, alloc);
     defer rules.deinit(alloc);
 
@@ -1688,6 +1725,13 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         return;
     }
     if (r.captured) try w.writeAll("captured a moment\n");
+    if (!set.enabled) {
+        if (r.captured) {
+            try ui.hint(w, "no check configured, so nothing was graded");
+            try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+        }
+        return;
+    }
     if (r.cut) try w.print("{s}{s}{s} cut a verified change at the green boundary\n", .{
         ui.on(.green), ui.check, ui.off(),
     });
@@ -1965,6 +2009,9 @@ fn cmdNotes(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 }
 
 /// Capture the working tree before a command that will change it.
+///
+/// Not used by `save`: a save already writes an addressable change, so
+/// capturing first would walk and hash the whole tree twice for nothing.
 ///
 /// Every mutating command is a defensive capture point: whatever the command
 /// then does, the state it was asked to leave stays addressable as a moment, so
