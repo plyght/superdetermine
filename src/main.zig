@@ -90,6 +90,13 @@ const sections = [_]Section{
         .{ .name = "moments", .alias = "mo", .args = "[-n N]", .desc = "captured states and their verdicts" },
         .{ .name = "grade", .alias = "gd", .desc = "grade now; --on makes it automatic" },
         .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
+        .{ .name = "recap", .alias = "rc", .args = "[@ref..]", .desc = "green and red spans, and what thrashed" },
+    } },
+    .{ .title = "conflicts that halt nothing", .entries = &.{
+        .{ .name = "super", .alias = "sp", .args = "[path]", .desc = "paths holding more than one version" },
+        .{ .name = "collapse", .alias = "cp", .args = "<path> <A|--greenest>", .desc = "keep one; nothing is deleted" },
+        .{ .name = "note", .args = "<f>:<n> <text>", .desc = "annotate a line for whoever has it next" },
+        .{ .name = "notes", .desc = "every annotation recorded here" },
     } },
     .{ .title = "secrets you can actually commit", .entries = &.{
         .{ .name = "seal", .alias = "sl", .args = "<path>", .desc = "seal a .env-style file" },
@@ -196,6 +203,9 @@ const aliases = [_]Alias{
     .{ .short = "mo", .full = "moments" },
     .{ .short = "gd", .full = "grade" },
     .{ .short = "doc", .full = "doctor" },
+    .{ .short = "rc", .full = "recap" },
+    .{ .short = "sp", .full = "super" },
+    .{ .short = "cp", .full = "collapse" },
     .{ .short = "srv", .full = "serve" },
     .{ .short = "f", .full = "fetch" },
     .{ .short = "cl", .full = "clone" },
@@ -348,6 +358,16 @@ pub fn main(init: std.process.Init) !void {
         try cmdBack(io, alloc, w, rest);
     } else if (eq(cmd, "green")) {
         try cmdGreen(io, alloc, w);
+    } else if (eq(cmd, "recap")) {
+        try cmdRecap(io, alloc, w, rest);
+    } else if (eq(cmd, "super")) {
+        try cmdSuper(io, alloc, w, rest);
+    } else if (eq(cmd, "collapse")) {
+        try cmdCollapse(io, alloc, w, rest);
+    } else if (eq(cmd, "note")) {
+        try cmdNote(io, alloc, w, rest);
+    } else if (eq(cmd, "notes")) {
+        try cmdNotes(io, alloc, w);
     } else if (eq(cmd, "undo")) {
         try cmdUndo(io, alloc, w);
     } else if (eq(cmd, "redo")) {
@@ -874,6 +894,10 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         for (conflicts) |p| alloc.free(p);
         alloc.free(conflicts);
     }
+    // Safety rule: a superposed path is never invisible. A file quietly holding
+    // a second value is a real change to the mental model, so it is surfaced
+    // here every single time rather than only when someone goes looking.
+    const superposed = superpose.count(&s, alloc) catch 0;
 
     if (json) {
         try w.writeAll("{\"changes\":[");
@@ -893,9 +917,11 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
             if (i != 0) try w.writeByte(',');
             try writeJsonString(w, p);
         }
-        try w.writeAll("]}\n");
+        try w.print("],\"superposed\":{d}}}\n", .{superposed});
         return;
     }
+
+    if (superposed != 0) try superpose.statusLine(w, superposed);
 
     if (conflicts.len != 0) {
         try w.print("{s}{s} merge in progress: {d} unresolved conflict(s){s}\n", .{
@@ -905,7 +931,7 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         try ui.hint(w, "fix the markers then `gr resolve <file>`, or `gr resolve --abort`");
     }
     if (entries.len == 0) {
-        if (conflicts.len == 0) {
+        if (conflicts.len == 0 and superposed == 0) {
             try w.print("{s}{s}{s} clean, nothing to save\n", .{ ui.on(.green), ui.check, ui.off() });
         }
         return;
@@ -1090,6 +1116,39 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     const name = rest[0];
+
+    // `gr new <name> @<moment>` turns a fork into a branch once you decide it
+    // was worth keeping.
+    if (rest.len >= 2 and revspec.looksLikeRevspec(rest[1])) {
+        const set = checks.settings(&s, alloc);
+        defer set.deinit(alloc);
+        var ix = try verdict.Index.load(&s, alloc);
+        defer ix.deinit();
+        const resolved = resolveSpec(io, alloc, &s, rest[1], &ix, set) catch {
+            try w.print("could not resolve {s}\n", .{rest[1]});
+            return;
+        };
+        defer resolved.deinit(alloc);
+        if (resolved.target == .live) {
+            try w.writeAll("@ is the live tree; `gr new <name>` already branches from here\n");
+            return;
+        }
+        const author = try config.author(&s, alloc);
+        defer alloc.free(author);
+        _ = fork.newBranchAt(&s, name, resolved.target.at, author, nowSeconds(io)) catch |e| switch (e) {
+            fork.Error.BranchExists => {
+                try w.print("branch {s} already exists\n", .{name});
+                return;
+            },
+            else => return e,
+        };
+        var work2 = try openWork(io);
+        defer work2.close(io);
+        try branches.switchTo(&s, work2, name);
+        try w.print("on new branch {s}, at that moment\n", .{name});
+        return;
+    }
+
     branches.create(&s, name) catch |e| switch (e) {
         branches.Error.BranchExists => {
             try w.print("branch {s} already exists\n", .{name});
@@ -1149,6 +1208,45 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     else
         try std.fs.path.join(alloc, &.{ src_abs, dst });
     defer alloc.free(dst_abs);
+
+    // `--at <ref>` is the whole point of forking mid-run: an agent is forty
+    // minutes in, you want the approach it considered at minute twelve, and no
+    // commit exists there.
+    const at = flagValue(rest, "--at", "--at");
+    if (at.len != 0) {
+        var s = (try openRepo(io, alloc, w)) orelse return;
+        defer s.deinit();
+        var work = try openWork(io);
+        defer work.close(io);
+
+        const set = checks.settings(&s, alloc);
+        defer set.deinit(alloc);
+        var ix = try verdict.Index.load(&s, alloc);
+        defer ix.deinit();
+
+        const resolved = resolveSpec(io, alloc, &s, at, &ix, set) catch {
+            try w.print("could not resolve {s}\n", .{at});
+            return;
+        };
+        defer resolved.deinit(alloc);
+        if (resolved.target == .live) {
+            try w.writeAll("@ is the live tree; `gr work <dir>` already gives you that\n");
+            return;
+        }
+
+        fork.workAt(&s, work, dst_abs, resolved.target.at) catch |e| {
+            try w.print("could not create worktree: {s}\n", .{@errorName(e)});
+            return;
+        };
+        var id_hex: [16]u8 = undefined;
+        _ = resolved.target.at.shortId(&id_hex);
+        try w.print("worktree at {s}, holding {s}@{s}{s}", .{ dst, ui.on(.cyan), id_hex[0..12], ui.off() });
+        if (resolved.verdict) |v| {
+            try w.print(" {s}({s} {s}){s}", .{ ui.on(.dim), v.result.label(), v.tier.label(), ui.off() });
+        }
+        try w.writeAll("\n");
+        return;
+    }
 
     branches.work(io, src_abs, dst_abs) catch |e| {
         try w.print("could not create worktree: {s}\n", .{@errorName(e)});
@@ -1668,6 +1766,193 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         try w.print(", {s}{d} green but hollow{s}", .{ ui.on(.yellow), hollow, ui.off() });
     }
     try w.writeAll("\n");
+}
+
+fn cmdRecap(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    var as_json = false;
+    var spec: []const u8 = "";
+    for (rest) |a| {
+        if (eq(a, "--json")) as_json = true else if (spec.len == 0 and a.len != 0 and a[0] != '-') spec = a;
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const all = try moment.readAll(&s, alloc);
+    defer moment.freeMoments(alloc, all);
+    if (all.len == 0) {
+        try w.writeAll("nothing captured yet, so nothing to recap\n");
+        return;
+    }
+
+    // A range narrows the window; without one the recap covers all of history.
+    var from: usize = 0;
+    if (spec.len != 0) {
+        const range = revspec.resolveRange(.{
+            .store = &s,
+            .alloc = alloc,
+            .verdicts = &ix,
+            .command_fast = verdict.commandHash(set.command(.fast)),
+            .command_full = verdict.commandHash(set.command(.full)),
+            .now_ms = nowMillis(io),
+        }, spec) catch {
+            try w.print("could not resolve {s}\n", .{spec});
+            return;
+        };
+        defer range.deinit(alloc);
+        if (range.from) |f| {
+            if (f.target == .at) {
+                for (all, 0..) |m, i| {
+                    if (std.mem.eql(u8, &m.id, &f.target.at.id)) {
+                        from = i;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    const report = try recap.build(
+        &s,
+        alloc,
+        all[from..],
+        &ix,
+        verdict.commandHash(set.command(.fast)),
+        verdict.commandHash(set.command(.full)),
+    );
+    defer report.deinit(alloc);
+
+    if (as_json) try recap.renderJson(w, report) else try recap.render(w, report);
+}
+
+fn cmdSuper(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const items = try superpose.list(&s, alloc);
+    defer superpose.freeAll(alloc, items);
+
+    if (items.len == 0) {
+        try w.writeAll("nothing is superposed\n");
+        return;
+    }
+
+    for (items) |sp| {
+        if (rest.len != 0 and !eq(rest[0], sp.path)) continue;
+        try w.print("{s}{s}{s}\n", .{ ui.on(.bold), sp.path, ui.off() });
+        try superpose.renderStatus(w, &.{sp}, null);
+    }
+    try ui.hint(w, "`gr collapse <path> A` keeps one; the other is never deleted");
+}
+
+fn cmdCollapse(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: gr collapse <path> <A|B|--greenest|--edit>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const path = rest[0];
+    var choice: superpose.Choice = .{ .label = 'A' };
+    if (rest.len >= 2) {
+        if (eq(rest[1], "--greenest")) {
+            choice = .greenest;
+        } else if (eq(rest[1], "--edit")) {
+            // Neither candidate: whatever is in the worktree right now wins.
+            const data = work.readFileAlloc(io, path, alloc, .unlimited) catch {
+                try w.print("could not read {s} to use as the resolution\n", .{path});
+                return;
+            };
+            defer alloc.free(data);
+            choice = .{ .edit = data };
+        } else if (rest[1].len == 1) {
+            choice = .{ .label = std.ascii.toUpper(rest[1][0]) };
+        }
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+    const ev = superpose.Evidence{
+        .index = &ix,
+        .command_fast = verdict.commandHash(set.command(.fast)),
+        .command_full = verdict.commandHash(set.command(.full)),
+    };
+
+    const outcome = superpose.collapse(&s, work, alloc, path, choice, ev) catch |e| switch (e) {
+        superpose.Error.NotSuperposed => {
+            try w.print("{s} is not superposed\n", .{path});
+            return;
+        },
+        superpose.Error.NoSuchCandidate => {
+            try w.print("no such candidate for {s}\n", .{path});
+            return;
+        },
+        else => return e,
+    };
+
+    switch (outcome) {
+        .chosen => try w.print("{s}{s}{s} collapsed {s}\n", .{ ui.on(.green), ui.check, ui.off(), path }),
+        .edited => try w.print("{s}{s}{s} collapsed {s} to your own edit\n", .{ ui.on(.green), ui.check, ui.off(), path }),
+        .fell_back_to_primary => {
+            try w.print("{s}{s}{s} no verdict to choose by, so kept the primary for {s}\n", .{
+                ui.on(.yellow), ui.warn, ui.off(), path,
+            });
+        },
+    }
+    try ui.hint(w, "`gr undo` reverses it; the losing version is still in the store");
+}
+
+fn cmdNote(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 2) {
+        try w.writeAll("usage: gr note <file>:<line> <text>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const target = live.parseNoteTarget(rest[0]) catch {
+        try w.print("expected <file>:<line>, got {s}\n", .{rest[0]});
+        return;
+    };
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (rest[1..], 0..) |part, i| {
+        if (i != 0) try text.append(alloc, ' ');
+        try text.appendSlice(alloc, part);
+    }
+
+    try live.recordNote(&s, .{
+        .path = target.path,
+        .line = target.line,
+        .text = text.items,
+    }, nowMillis(io));
+    try w.print("{s}{s}{s} noted {s}:{d}\n", .{ ui.on(.green), ui.check, ui.off(), target.path, target.line });
+}
+
+fn cmdNotes(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const list = try live.notes(&s, alloc);
+    defer live.freeNotes(alloc, list);
+    if (list.len == 0) {
+        try w.writeAll("no notes\n");
+        return;
+    }
+    for (list) |n| {
+        try w.print("{s}{s}:{d}{s}  {s}\n", .{ ui.on(.cyan), n.path, n.line, ui.off(), n.text });
+    }
 }
 
 /// Capture the working tree before a command that will change it.
