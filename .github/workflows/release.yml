@@ -204,18 +204,22 @@ jobs:
         include:
           - runner: macos-latest
             asset: sdt-macos-arm64
+            legacy: gr-macos-arm64
             os: macos
             zig: aarch64-macos
           - runner: macos-13
             asset: sdt-macos-x64
+            legacy: gr-macos-x64
             os: macos
             zig: x86_64-macos
           - runner: ubuntu-latest
             asset: sdt-linux-x64
+            legacy: gr-linux-x64
             os: linux
             zig: x86_64-linux
           - runner: ubuntu-24.04-arm
             asset: sdt-linux-arm64
+            legacy: gr-linux-arm64
             os: linux
             zig: aarch64-linux
     runs-on: ${{ matrix.runner }}
@@ -242,6 +246,7 @@ jobs:
       - name: Package binary
         env:
           ASSET: ${{ matrix.asset }}
+          LEGACY_ASSET: ${{ matrix.legacy }}
         run: |
           set -euo pipefail
           cp zig-out/bin/sdt "${ASSET}"
@@ -251,7 +256,7 @@ jobs:
           # Publish the pre-rename asset name alongside, byte-identical. An
           # already-installed `gr` looks for `gr-<platform>` and would otherwise
           # find nothing to update to, stranding it on the old name forever.
-          LEGACY="${ASSET/sdt-/gr-}"
+          LEGACY="${LEGACY_ASSET}"
           cp "${ASSET}" "${LEGACY}"
           cp "${ASSET}.sha256" "${LEGACY}.sha256"
 
@@ -262,7 +267,7 @@ jobs:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
-            ${{ replace(matrix.asset, 'sdt-', 'gr-') }}
-            ${{ replace(matrix.asset, 'sdt-', 'gr-') }}.sha256
+            ${{ matrix.legacy }}
+            ${{ matrix.legacy }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
