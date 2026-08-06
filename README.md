@@ -27,6 +27,39 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Sealed secrets | Commit your `.env` safely. Values are encrypted per-variable into one file; the plaintext is never an object. Team access is a wrapped key, not a service. |
 | Encrypted sharing | `gr send` hands a repo to someone peer to peer, or as a link or file no host can read. |
 
+## History that knows what worked
+
+Every version control system records what changed. This one also records **what worked**.
+
+The working tree is captured continuously as *moments*: content-addressed states with a stable id, a timestamp, and a cause. Moments are not commits, never appear in `gr log`, and cost well under a kilobyte each (a delta against the previous state, with a full keyframe every 200).
+
+A moment can then be *graded*: guardrail copy-on-write clones your worktree, reconciles the clone to that state, runs your own check inside it, and throws the clone away. Your tree is never touched and your terminal never blocks. Verdicts are keyed by content, so a state is never graded twice, ever.
+
+```sh
+gr config checks.full "zig build test"   # nothing runs until you say what to run
+gr grade --on                            # automatic, from here on
+```
+
+`gr grade --on` is the whole setup. There is no daemon: on macOS, launchd already runs, so it watches the worktree and starts a short-lived `gr` only when something changes. Idle CPU is zero because there is no idle process. `gr watch` does the same thing in a terminal if you prefer to see it.
+
+Then the payoff:
+
+```sh
+gr green                 # rewind to the last state that actually passed
+gr back 3                # rewind three moments
+gr rewind @2h            # or @green~2, @yesterday, @a3f91c
+gr moments               # what was captured, and what each one did
+gr doctor                # what is on, what is degraded, and why
+```
+
+Nothing is destroyed by any of it: a rewind captures the state it leaves first, and `gr undo` reverses it.
+
+**A green is never shown on its own.** An agent that writes both the code and the test has proved only that it agrees with itself, so every verdict carries a warrant on three deterministic axes — whether the same actor wrote the code and the check (`independent` / `co-authored`), whether the check actually opened the files that changed (`relevance 5/5`), and whether the check would have failed on the previous code (`discriminating` / `vacuous`). A green that is `co-authored` and `vacuous` is named as such, in milliseconds, with no model involved.
+
+None of it gates. Nothing blocks a push or fails a build, because a signal wired to block becomes a target. And it says nothing about whether your design is good — only whether the green in front of you is worth anything.
+
+`checks.enabled = false` returns to exactly today's behaviour.
+
 ## Git, side by side
 
 guardrail does not replace git or GitHub, and adopting it is reversible. It sits next to your `.git`, and you decide how far to lean in:
