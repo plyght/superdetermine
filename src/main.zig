@@ -21,6 +21,7 @@ const tracer = @import("tracer.zig");
 const grade = @import("grade.zig");
 const sched = @import("sched.zig");
 const rewind = @import("rewind.zig");
+const freshness = @import("freshness.zig");
 const net = @import("net.zig");
 const ignore = @import("ignore.zig");
 const provenance = @import("provenance.zig");
