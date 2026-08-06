@@ -283,14 +283,95 @@ pub fn agentStatus(io: std.Io, alloc: std.mem.Allocator, repo_abs: []const u8) !
 /// Does `WatchPaths` actually fire for a change *inside* a watched directory?
 ///
 /// Apple documents the key but not its recursive behaviour, and the whole
-/// design rests on that behaviour, so it is measured rather than assumed. A
-/// machine where this fails still gets the foreground path.
-pub fn selfTest(io: std.Io, alloc: std.mem.Allocator) bool {
+/// design rests on it, so it is measured rather than assumed: register a
+/// throwaway agent over a temp directory, touch a file inside it, and wait to
+/// see whether launchd starts anything. A machine where this fails is not
+/// broken, it just gets the foreground path instead.
+pub fn selfTest(io: std.Io, alloc: std.mem.Allocator, deadline_ms: u32) bool {
     if (builtin.os.tag != .macos) return false;
-    const out = proc.capture(alloc, &.{ "launchctl", "print-disabled", "gui/501" }, "") catch return false;
-    defer out.deinit(alloc);
-    _ = io;
-    return out.ok();
+
+    const home = std.c.getenv("HOME") orelse return false;
+    const dir = std.fmt.allocPrint(alloc, "{s}/.gr-watchpath-selftest", .{std.mem.span(home)}) catch return false;
+    defer alloc.free(dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return false;
+
+    const trigger = std.fmt.allocPrint(alloc, "{s}/trigger", .{dir}) catch return false;
+    defer alloc.free(trigger);
+    const sentinel = std.fmt.allocPrint(alloc, "{s}/fired", .{dir}) catch return false;
+    defer alloc.free(sentinel);
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = trigger, .data = "0" }) catch return false;
+
+    const label = "dev.guardrail.watchpath-selftest";
+    const plist_path = (agentPlistPath(alloc, label) catch return false) orelse return false;
+    defer alloc.free(plist_path);
+    defer std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
+
+    const body = std.fmt.allocPrint(alloc,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\  <key>Label</key><string>{s}</string>
+        \\  <key>ProgramArguments</key>
+        \\  <array><string>/usr/bin/touch</string><string>{s}</string></array>
+        \\  <key>WatchPaths</key><array><string>{s}</string></array>
+        \\  <key>RunAtLoad</key><false/>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{ label, sentinel, dir }) catch return false;
+    defer alloc.free(body);
+
+    if (std.fs.path.dirname(plist_path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = plist_path, .data = body }) catch return false;
+
+    const uid = std.c.getuid();
+    const target = std.fmt.allocPrint(alloc, "gui/{d}", .{uid}) catch return false;
+    defer alloc.free(target);
+    const spec = std.fmt.allocPrint(alloc, "gui/{d}/{s}", .{ uid, label }) catch return false;
+    defer alloc.free(spec);
+
+    quietly(alloc, &.{ "launchctl", "bootout", spec });
+    defer quietly(alloc, &.{ "launchctl", "bootout", spec });
+
+    const boot = proc.capture(alloc, &.{ "launchctl", "bootstrap", target, plist_path }, "") catch return false;
+    defer boot.deinit(alloc);
+    if (!boot.ok()) return false;
+
+    // Change a file *inside* the watched directory: the recursive case.
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = trigger, .data = "1" }) catch return false;
+
+    var waited: u32 = 0;
+    while (waited < deadline_ms) : (waited += 250) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(250), .awake) catch {};
+        if (std.Io.Dir.cwd().access(io, sentinel, .{})) |_| return true else |_| {}
+    }
+    return false;
+}
+
+/// Run a command purely for its effect, discarding both streams.
+///
+/// `proc.capture` inherits stderr, and the `bootout` that has to precede every
+/// `bootstrap` prints "Boot-out failed: 3: No such process" on a first install.
+/// That is expected and means nothing, so it must not reach the terminal.
+/// Every argument here is a literal or a value this module built, so routing
+/// through a shell to redirect cannot carry anything external.
+fn quietly(alloc: std.mem.Allocator, argv: []const []const u8) void {
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
+    for (argv, 0..) |a, i| {
+        if (i != 0) joined.append(alloc, ' ') catch return;
+        joined.appendSlice(alloc, a) catch return;
+    }
+    joined.appendSlice(alloc, " >/dev/null 2>&1") catch return;
+    const cmd = joined.toOwnedSlice(alloc) catch return;
+    defer alloc.free(cmd);
+    const out = proc.capture(alloc, &.{ "/bin/sh", "-c", cmd }, "") catch return;
+    out.deinit(alloc);
 }
 
 pub fn install(
@@ -322,7 +403,7 @@ pub fn install(
     // Replace rather than stack: bootout first, ignoring "was not loaded".
     const spec = try std.fmt.allocPrint(alloc, "gui/{d}/{s}", .{ uid, label });
     defer alloc.free(spec);
-    if (proc.capture(alloc, &.{ "launchctl", "bootout", spec }, "")) |o| o.deinit(alloc) else |_| {}
+    quietly(alloc, &.{ "launchctl", "bootout", spec });
 
     const out = try proc.capture(alloc, &.{ "launchctl", "bootstrap", target, path }, "");
     defer out.deinit(alloc);
@@ -340,7 +421,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator, repo_abs: []const u8) !vo
     const uid = std.c.getuid();
     const spec = try std.fmt.allocPrint(alloc, "gui/{d}/{s}", .{ uid, label });
     defer alloc.free(spec);
-    if (proc.capture(alloc, &.{ "launchctl", "bootout", spec }, "")) |o| o.deinit(alloc) else |_| {}
+    quietly(alloc, &.{ "launchctl", "bootout", spec });
 
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }

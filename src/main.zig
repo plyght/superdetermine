@@ -82,7 +82,7 @@ const sections = [_]Section{
         .{ .name = "back", .alias = "bk", .args = "[n]", .desc = "rewind n moments, default 1" },
         .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
         .{ .name = "moments", .alias = "mo", .args = "[-n N]", .desc = "captured states and their verdicts" },
-        .{ .name = "grade", .alias = "gd", .desc = "run checks in the background (--install)" },
+        .{ .name = "grade", .alias = "gd", .desc = "grade now; --on makes it automatic" },
         .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
     } },
     .{ .title = "secrets you can actually commit", .entries = &.{
@@ -1500,12 +1500,26 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer alloc.free(repo_abs);
 
     for (rest) |a| {
-        if (eq(a, "--install")) {
+        if (eq(a, "--install") or eq(a, "--on")) {
             const exe = update.selfExePathAlloc(alloc) catch |e| {
                 try w.print("could not locate the gr binary: {s}\n", .{@errorName(e)});
                 return;
             };
             defer alloc.free(exe);
+
+            // Apple documents WatchPaths but not whether it fires for a change
+            // inside a watched directory, and the whole design rests on that.
+            // Measure it here rather than promise it.
+            try w.writeAll("checking that this machine can watch a directory... ");
+            try w.flush();
+            if (!sched.selfTest(io, alloc, 8000)) {
+                try w.print("{s}no{s}\n", .{ ui.on(.yellow), ui.off() });
+                try w.writeAll("automatic grading is not available here\n");
+                try ui.hint(w, "run `gr watch` in a terminal instead; it does the same work");
+                return;
+            }
+            try w.print("{s}yes{s}\n", .{ ui.on(.green), ui.off() });
+
             sched.install(io, alloc, exe, repo_abs, .{}) catch |e| {
                 try w.print("{s}{s}{s} could not install the agent: {s}\n", .{
                     ui.on(.red), ui.cross, ui.off(), @errorName(e),
@@ -1513,15 +1527,15 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
                 try ui.hint(w, "`gr watch` does the same work in the foreground");
                 return;
             };
-            try w.print("{s}{s}{s} grading on change, with no resident process\n", .{
+            try w.print("{s}{s}{s} automatic grading is on for this repo\n", .{
                 ui.on(.green), ui.check, ui.off(),
             });
-            try ui.hint(w, "launchd watches the worktree and starts gr only when it changes");
+            try ui.hint(w, "edits are captured and graded with no gr command and no resident process");
             return;
         }
-        if (eq(a, "--uninstall")) {
+        if (eq(a, "--uninstall") or eq(a, "--off")) {
             sched.uninstall(io, alloc, repo_abs) catch {};
-            try w.writeAll("background grading off\n");
+            try w.writeAll("automatic grading off; `gr grade` still works by hand\n");
             return;
         }
     }
