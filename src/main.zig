@@ -1685,6 +1685,9 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         return;
     }
     if (r.captured) try w.writeAll("captured a moment\n");
+    if (r.cut) try w.print("{s}{s}{s} cut a verified change at the green boundary\n", .{
+        ui.on(.green), ui.check, ui.off(),
+    });
     if (r.graded == 0) {
         try w.writeAll("nothing needed running\n");
     } else {
@@ -2025,6 +2028,17 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             try w.print("imported git repo (full history, all branches + tags); on {s} at {s}\n", .{ branch, shortHex(tip, &buf) });
         },
         .export_ => {
+            // Refuse while anything is superposed. A superposed path holds more
+            // than one real version, and exporting would silently pick one and
+            // present it to git as the answer.
+            const n = superpose.count(&s, alloc) catch 0;
+            if (n != 0) {
+                try w.print("{s}{s}{s} {d} path{s} still superposed\n", .{
+                    ui.on(.red), ui.cross, ui.off(), n, if (n == 1) "" else "s",
+                });
+                try ui.hint(w, "`gr super` lists them; `gr collapse <path> <A|B>` picks one");
+                return;
+            }
             git.exportAll(&s, target) catch {
                 try w.writeAll("git export failed\n");
                 return;

@@ -11,6 +11,7 @@ const applog = @import("applog.zig");
 const proc = @import("proc.zig");
 const config = @import("config.zig");
 const freshness = @import("freshness.zig");
+const flow = @import("flow.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -129,6 +130,8 @@ pub const TickResult = struct {
     captured: bool = false,
     /// Whether this tick refreshed its view of the remote's refs.
     freshened: bool = false,
+    /// Whether a verified change was cut at a red-to-green boundary.
+    cut: bool = false,
     graded: usize = 0,
     /// Set when a green-to-red flip was found and searched back to a boundary.
     boundary: ?grade.Break = null,
@@ -199,6 +202,31 @@ pub fn tick(
     var ix = try verdict.Index.load(store, alloc);
     defer ix.deinit();
 
+    // Commitless flow: a red-to-green transition is a boundary worth keeping,
+    // so cut a change there. Every change cut this way is verified by
+    // construction, which is the property git histories are always claimed to
+    // have and never do. Off unless `flow.cut = green`.
+    {
+        const fset = flow.settings(store, alloc);
+        defer fset.deinit(alloc);
+        if (fset.cut == .green) {
+            const prev_result = previousResult(ctx, store, alloc, all, tier, head.full_tree);
+            if (flow.shouldCut(fset.cut, prev_result, head_v.result)) {
+                const author = config.author(store, alloc) catch null;
+                defer if (author) |a| alloc.free(a);
+                const cut = flow.cutAt(
+                    store,
+                    work_dir,
+                    head,
+                    author orelse "you <you@localhost>",
+                    "verified",
+                    @divTrunc(started, 1000),
+                ) catch null;
+                if (cut != null) out.cut = true;
+            }
+        }
+    }
+
     // Trigger 2, on transition: the head just went red, so find where.
     if (grade.headState(ctx, all, &ix, tier)) |hs| {
         if (hs.isTransition()) {
@@ -241,6 +269,29 @@ fn freshen(store: *Store, alloc: std.mem.Allocator) !bool {
     defer refs.deinit(alloc);
     try freshness.record(store, "origin", refs, nowMillis(store.io));
     return true;
+}
+
+/// The verdict of the newest graded state before `tree`, which is what decides
+/// whether the head is a transition rather than a continuation.
+fn previousResult(
+    ctx: grade.Context,
+    store: *Store,
+    alloc: std.mem.Allocator,
+    all: []const moment.Moment,
+    tier: verdict.Tier,
+    tree: Oid,
+) ?verdict.Result {
+    var ix = verdict.Index.load(store, alloc) catch return null;
+    defer ix.deinit();
+    const cmd = verdict.commandHash(ctx.set.command(tier));
+
+    var i = all.len;
+    while (i > 0) {
+        i -= 1;
+        if (all[i].full_tree.eql(tree)) continue;
+        if (ix.get(.{ .tree = all[i].full_tree, .tier = tier, .command = cmd })) |v| return v.result;
+    }
+    return null;
 }
 
 // --- launchd (macOS) ---
