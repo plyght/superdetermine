@@ -15,9 +15,25 @@ pub fn assetName() ?[]const u8 {
         else => return null,
     };
     if (std.mem.eql(u8, os, "macos")) {
-        return if (std.mem.eql(u8, arch, "arm64")) "gr-macos-arm64" else "gr-macos-x64";
+        return if (std.mem.eql(u8, arch, "arm64")) "sdt-macos-arm64" else "sdt-macos-x64";
     }
-    return if (std.mem.eql(u8, arch, "arm64")) "gr-linux-arm64" else "gr-linux-x64";
+    return if (std.mem.eql(u8, arch, "arm64")) "sdt-linux-arm64" else "sdt-linux-x64";
+}
+
+/// The pre-rename asset name for this platform.
+///
+/// Releases cut before the rename only carry `gr-<platform>`, so an update that
+/// reaches back to one of those still has something to download.
+pub fn legacyAssetName() ?[]const u8 {
+    const name = assetName() orelse return null;
+    return if (std.mem.eql(u8, name, "sdt-macos-arm64"))
+        "gr-macos-arm64"
+    else if (std.mem.eql(u8, name, "sdt-macos-x64"))
+        "gr-macos-x64"
+    else if (std.mem.eql(u8, name, "sdt-linux-arm64"))
+        "gr-linux-arm64"
+    else
+        "gr-linux-x64";
 }
 
 pub fn isUpToDate(current: []const u8, tag: []const u8) bool {
@@ -168,12 +184,23 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
         break :blk published;
     } else tag;
 
-    const bin_url = findAssetUrl(assets, asset) orelse {
-        try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
-        return;
+    // Prefer the current asset name, then the pre-rename one, so this works
+    // against releases cut on either side of the rename.
+    const chosen = findAssetUrl(assets, asset) orelse blk: {
+        const legacy = legacyAssetName() orelse {
+            try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
+            return;
+        };
+        break :blk findAssetUrl(assets, legacy) orelse {
+            try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
+            return;
+        };
     };
+    const bin_url = chosen;
+    const effective = if (findAssetUrl(assets, asset) != null) asset else (legacyAssetName() orelse asset);
+
     var sha_name_buf: [128]u8 = undefined;
-    const sha_name = try std.fmt.bufPrint(&sha_name_buf, "{s}.sha256", .{asset});
+    const sha_name = try std.fmt.bufPrint(&sha_name_buf, "{s}.sha256", .{effective});
     const sha_url = findAssetUrl(assets, sha_name) orelse {
         try w.print("sdt update: no checksum '{s}' in release {s}\n", .{ sha_name, tag });
         return;
@@ -182,7 +209,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     const exe = try selfExePathAlloc(alloc);
     defer alloc.free(exe);
     const dir = std.fs.path.dirname(exe) orelse ".";
-    const tmp = try std.fs.path.join(alloc, &.{ dir, "gr.new" });
+    const tmp = try std.fs.path.join(alloc, &.{ dir, "sdt.new" });
     defer alloc.free(tmp);
 
     curlToFile(io, alloc, bin_url, tmp) catch {
@@ -231,10 +258,31 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
         return;
     }
 
+    // The running binary has been replaced in place. If it was invoked under
+    // the old name, the command the user typed still works but is now the new
+    // binary, so also install it under the new name beside it and say so. That
+    // is what makes `gr update` migrate someone to `sdt` rather than quietly
+    // leaving them on a name that no longer exists anywhere else.
+    const invoked = std.fs.path.basename(exe);
+    const migrated = !std.mem.eql(u8, invoked, "sdt");
+    if (migrated) {
+        const sibling = try std.fs.path.join(alloc, &.{ dir, "sdt" });
+        defer alloc.free(sibling);
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sibling, .data = data })) |_| {
+            const sib_z = try alloc.dupeZ(u8, sibling);
+            defer alloc.free(sib_z);
+            _ = std.c.chmod(sib_z, 0o755);
+        } else |_| {}
+    }
+
     if (nightly) {
-        try w.print("updated gr to nightly ({s})\n", .{label});
+        try w.print("updated sdt to nightly ({s})\n", .{label});
     } else {
-        try w.print("updated gr to {s}\n", .{label});
+        try w.print("updated sdt to {s}\n", .{label});
+    }
+    if (migrated) {
+        try w.print("\nthis tool is now called {s}sdt{s} (superdetermine).\n", .{ "\x1b[1m", "\x1b[0m" });
+        try w.print("installed alongside as {s}/sdt; `{s}` still works and is the same binary.\n", .{ dir, invoked });
     }
 }
 
@@ -283,4 +331,14 @@ test "isUpToDate strips leading v" {
     try std.testing.expect(isUpToDate("0.2.0", "0.2.0"));
     try std.testing.expect(!isUpToDate("0.2.0", "v0.3.0"));
     try std.testing.expect(!isUpToDate("0.0.0", "v0.2.0"));
+}
+
+test "asset names follow the current binary, with a pre-rename fallback" {
+    const name = assetName() orelse return;
+    try std.testing.expect(std.mem.startsWith(u8, name, "sdt-"));
+
+    const legacy = legacyAssetName() orelse return;
+    try std.testing.expect(std.mem.startsWith(u8, legacy, "gr-"));
+    // Same platform suffix on both, or an update would fetch the wrong binary.
+    try std.testing.expectEqualStrings(name["sdt-".len..], legacy["gr-".len..]);
 }

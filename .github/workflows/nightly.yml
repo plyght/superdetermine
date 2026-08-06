@@ -62,16 +62,16 @@ jobs:
       matrix:
         include:
           - runner: macos-latest
-            asset: gr-macos-arm64
+            asset: sdt-macos-arm64
             zig: aarch64-macos
           - runner: macos-13
-            asset: gr-macos-x64
+            asset: sdt-macos-x64
             zig: x86_64-macos
           - runner: ubuntu-latest
-            asset: gr-linux-x64
+            asset: sdt-linux-x64
             zig: x86_64-linux
           - runner: ubuntu-24.04-arm
-            asset: gr-linux-arm64
+            asset: sdt-linux-arm64
             zig: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
@@ -93,9 +93,16 @@ jobs:
           ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
-          cp zig-out/bin/gr "${ASSET}"
+          cp zig-out/bin/sdt "${ASSET}"
           chmod +x "${ASSET}"
           shasum -a 256 "${ASSET}" | awk '{print $1}' > "${ASSET}.sha256"
+
+          # Publish the pre-rename asset name alongside, byte-identical. An
+          # already-installed `gr` looks for `gr-<platform>` and would otherwise
+          # find nothing to update to, stranding it on the old name forever.
+          LEGACY="${ASSET/sdt-/gr-}"
+          cp "${ASSET}" "${LEGACY}"
+          cp "${ASSET}.sha256" "${LEGACY}.sha256"
 
       - name: Upload to nightly release
         uses: softprops/action-gh-release@v2
@@ -104,5 +111,7 @@ jobs:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+            ${{ replace(matrix.asset, 'sdt-', 'gr-') }}
+            ${{ replace(matrix.asset, 'sdt-', 'gr-') }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
