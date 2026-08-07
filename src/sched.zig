@@ -114,7 +114,7 @@ pub fn powerOk(alloc: std.mem.Allocator, set: Settings) bool {
     if (std.mem.indexOf(u8, out.stdout, "AC Power") != null) return true;
     if (std.mem.indexOf(u8, out.stdout, "Battery Power") == null) return true;
 
-    // "... 87%; discharging; ..." — take the first percentage on the line.
+    // "... 87%; discharging; ..." so take the first percentage on the line.
     if (std.mem.indexOfScalar(u8, out.stdout, '%')) |pct| {
         var start = pct;
         while (start > 0 and std.ascii.isDigit(out.stdout[start - 1])) start -= 1;

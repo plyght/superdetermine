@@ -609,7 +609,7 @@ pub fn capture(
 
     // One read of the log, not three. `last`, `count` and `trim` each used to
     // re-read it, which made capturing the n-th moment cost O(n) log parsing
-    // and the whole session O(n^2) — exactly the shape this module exists to
+    // and the whole session O(n^2), which is exactly the shape this module exists to
     // avoid, reintroduced one convenience call at a time.
     const existing = try readAll(store, alloc);
     defer freeMoments(alloc, existing);

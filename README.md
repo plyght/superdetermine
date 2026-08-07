@@ -1,14 +1,14 @@
 # superdetermine (`sdt`)
 
-A version control system that records **what worked**, not just what changed.
+A version control system that remembers which states of your code actually worked.
 
-Your working tree is captured continuously from `sdt init` — no staging, no stash, no `save` needed to be safe, and nothing you write is ever unsaved. Each captured state can then be graded by running the project's own check against it, so `sdt green` means "the last state that actually passed", not "the last time someone remembered to commit".
+Your working tree is captured continuously from `sdt init`. There is no staging area, no stash, and no `save` you have to remember, so nothing you write is ever unsaved. Each captured state can then be graded by running the project's own check against it, which is what makes `sdt green` mean the last state that genuinely passed.
 
 It runs beside git and pushes to GitHub, so you can adopt it gradually without giving anything up.
 
 ## Why
 
-Every version control system ever built records what changed. None records what worked — which is why `git bisect` exists at all: the commit is too coarse a unit, so you binary search inside it after the fact.
+Every version control system ever built records what changed. None of them record what worked. That is why `git bisect` exists: a commit is too coarse a unit to answer the question, so you binary search inside one after the fact.
 
 That gets worse with agents in the loop. A forty-minute run with nobody watching produces hundreds of intermediate states, not one of which is a commit, and the later a failure surfaces the more of them are suspects. Continuous capture makes those states addressable; grading makes them answerable.
 
@@ -72,9 +72,9 @@ sdt doctor                # what is on, what is degraded, and why
 
 Nothing is destroyed by any of it: a rewind captures the state it leaves first, and `sdt undo` reverses it.
 
-**A green is never shown on its own.** An agent that writes both the code and the test has proved only that it agrees with itself, so every verdict carries a warrant on three deterministic axes — whether the same actor wrote the code and the check (`independent` / `co-authored`), whether the check actually opened the files that changed (`relevance 5/5`), and whether the check would have failed on the previous code (`discriminating` / `vacuous`). A green that is `co-authored` and `vacuous` is named as such, in milliseconds, with no model involved.
+**A green is never shown on its own.** An agent that writes both the code and the test has proved only that it agrees with itself, so every verdict carries a warrant on three deterministic axes. Whether the same actor wrote the code and the check (`independent` / `co-authored`), whether the check actually opened the files that changed (`relevance 5/5`), and whether the check would have failed on the previous code (`discriminating` / `vacuous`). A green that is `co-authored` and `vacuous` is named as such, in milliseconds, with no model involved.
 
-None of it gates. Nothing blocks a push or fails a build, because a signal wired to block becomes a target. And it says nothing about whether your design is good — only whether the green in front of you is worth anything.
+None of it gates. Nothing blocks a push or fails a build, because a signal wired to block becomes a target. And it says nothing about whether your design is good. It answers one narrow question well: whether the green in front of you is worth anything.
 
 `moments.enabled = false` stops capture; `checks.enabled = false` stops grading. Either returns to plain-VCS behaviour.
 
