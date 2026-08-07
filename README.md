@@ -1,17 +1,28 @@
 # superdetermine (`sdt`)
 
-A fast, independent version control system. Content-addressed storage with sub-file dedup, whole-repo undo, and instant copy-on-write worktrees. It runs beside git and pushes to GitHub, so you can adopt it gradually without giving anything up.
+A version control system that records **what worked**, not just what changed.
+
+Your working tree is captured continuously from `sdt init` — no staging, no stash, no `save` needed to be safe, and nothing you write is ever unsaved. Each captured state can then be graded by running the project's own check against it, so `sdt green` means "the last state that actually passed", not "the last time someone remembered to commit".
+
+It runs beside git and pushes to GitHub, so you can adopt it gradually without giving anything up.
 
 ## Why
 
-git is excellent, but much of its friction is incidental: a staging area to manage, stashing just to switch branches, resets that feel dangerous, whole-file handling for binaries, and heavyweight worktrees. superdetermine keeps a familiar flow and removes that friction while staying compatible with the git world you already use.
+Every version control system ever built records what changed. None records what worked — which is why `git bisect` exists at all: the commit is too coarse a unit, so you binary search inside it after the fact.
+
+That gets worse with agents in the loop. A forty-minute run with nobody watching produces hundreds of intermediate states, not one of which is a commit, and the later a failure surfaces the more of them are suspects. Continuous capture makes those states addressable; grading makes them answerable.
+
+The rest is incidental friction git never had to keep: a staging area to manage, stashing just to switch branches, resets that feel dangerous, whole-file handling for binaries, and heavyweight worktrees.
 
 ## Features
 
 | Feature | What it gives you |
 | --- | --- |
+| **Continuous capture** | On from `sdt init`. Every state of the tree is kept as a *moment*, under a kilobyte each. Nothing is ever unsaved, and you never type `save` to be safe. |
+| **Verified history** | Run the repo's own check against a captured state in a throwaway clone. `sdt green` rewinds to the last state that genuinely passed. |
+| **Warranted verdicts** | A green is never shown bare: it says whether the same actor wrote the code and the check, whether the check read what changed, and whether it would have failed on the previous code. |
 | Content-addressed store (BLAKE3 + FastCDC) | Large files and binaries are first-class, deduped at the chunk level. No LFS. |
-| Working copy is always a change | No staging, no stash. Edit, then `sdt save`. |
+| Working copy is always a change | No staging, no stash. `sdt save` names a boundary; it is not how work gets kept. |
 | Operation log | `sdt undo` and `sdt redo` across the whole repo. Nothing gets lost. |
 | Instant copy-on-write worktrees | `sdt work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). |
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
@@ -27,9 +38,7 @@ git is excellent, but much of its friction is incidental: a staging area to mana
 | Sealed secrets | Commit your `.env` safely. Values are encrypted per-variable into one file; the plaintext is never an object. Team access is a wrapped key, not a service. |
 | Encrypted sharing | `sdt send` hands a repo to someone peer to peer, or as a link or file no host can read. |
 
-## History that knows what worked
-
-Every version control system records what changed. This one also records **what worked**.
+## How it works
 
 The working tree is captured continuously as *moments*: content-addressed states with a stable id, a timestamp, and a cause. Moments are not commits, never appear in `sdt log`, and cost well under a kilobyte each (a delta against the previous state, with a full keyframe every 200).
 
@@ -47,7 +56,9 @@ Grading is the part that runs your code, so it stays inert until you say what to
 
 ```sh
 sdt config checks.full "zig build test"
-``` There is no daemon: on macOS, launchd already runs, so it watches the worktree and starts a short-lived `sdt` only when something changes. Idle CPU is zero because there is no idle process. `sdt watch` does the same thing in a terminal if you prefer to see it.
+```
+
+There is no daemon behind any of this. On macOS, launchd is already running, so it watches the worktree and starts a short-lived `sdt` only when something changes; idle CPU is zero because there is no idle process. `sdt watch` does the same work in a terminal if you would rather see it.
 
 Then the payoff:
 
@@ -65,7 +76,7 @@ Nothing is destroyed by any of it: a rewind captures the state it leaves first, 
 
 None of it gates. Nothing blocks a push or fails a build, because a signal wired to block becomes a target. And it says nothing about whether your design is good — only whether the green in front of you is worth anything.
 
-`checks.enabled = false` returns to exactly today's behaviour.
+`moments.enabled = false` stops capture; `checks.enabled = false` stops grading. Either returns to plain-VCS behaviour.
 
 ## Git, side by side
 
