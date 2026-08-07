@@ -2,27 +2,31 @@
 
 A version control system that remembers which states of your code actually worked.
 
-Your working tree is captured continuously from `sdt init`. There is no staging area, no stash, and no `save` you have to remember, so nothing you write is ever unsaved. Each captured state can then be graded by running the project's own check against it, which is what makes `sdt green` mean the last state that genuinely passed.
+`sdt` captures your working tree continuously from `sdt init`. There is no staging area and no stash. You never run `save` to keep your work safe.
 
-It runs beside git and pushes to GitHub, so you can adopt it gradually without giving anything up.
+`sdt` also grades each captured state. It runs the project's own check against that state. `sdt green` then returns the last state that passed.
+
+`sdt` runs beside git and pushes to GitHub. You can adopt it one step at a time.
 
 ## Why
 
-Every version control system ever built records what changed. None of them record what worked. That is why `git bisect` exists: a commit is too coarse a unit to answer the question, so you binary search inside one after the fact.
+Every version control system records what changed. No version control system records what worked. This is why `git bisect` exists. A commit is too large a unit to answer the question. You must search inside one commit after the failure.
 
-That gets worse with agents in the loop. A forty-minute run with nobody watching produces hundreds of intermediate states, not one of which is a commit, and the later a failure surfaces the more of them are suspects. Continuous capture makes those states addressable; grading makes them answerable.
+Agents make this worse. A forty-minute agent run makes hundreds of intermediate states. None of these states is a commit. A failure that appears late has more states to blame.
 
-The rest is incidental friction git never had to keep: a staging area to manage, stashing just to switch branches, resets that feel dangerous, whole-file handling for binaries, and heavyweight worktrees.
+Continuous capture gives you an address for each state. Grading gives you an answer for each state.
+
+`sdt` also removes friction that git keeps. There is no staging area to manage. You do not stash to change branch. A reset does not destroy work. Binary files do not need a separate tool.
 
 ## Features
 
 | Feature | What it gives you |
 | --- | --- |
-| **Continuous capture** | On from `sdt init`. Every state of the tree is kept as a *moment*, under a kilobyte each. Nothing is ever unsaved, and you never type `save` to be safe. |
-| **Verified history** | Run the repo's own check against a captured state in a throwaway clone. `sdt green` rewinds to the last state that genuinely passed. |
-| **Warranted verdicts** | A green is never shown bare: it says whether the same actor wrote the code and the check, whether the check read what changed, and whether it would have failed on the previous code. |
+| **Continuous capture** | Starts at `sdt init`. `sdt` keeps every state of the tree as a *moment*. Each moment costs less than one kilobyte. You never type `save` to stay safe. |
+| **Verified history** | `sdt` runs your check against a captured state in a clone it then deletes. `sdt green` rewinds to the last state that passed. |
+| **Warranted verdicts** | Each green result names who wrote the code and the check. It also names which changed files the check read. |
 | Content-addressed store (BLAKE3 + FastCDC) | Large files and binaries are first-class, deduped at the chunk level. No LFS. |
-| Working copy is always a change | No staging, no stash. `sdt save` names a boundary; it is not how work gets kept. |
+| Working copy is always a change | There is no staging area and no stash. `sdt save` names a boundary. It is not how `sdt` keeps your work. |
 | Operation log | `sdt undo` and `sdt redo` across the whole repo. Nothing gets lost. |
 | Instant copy-on-write worktrees | `sdt work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). |
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
@@ -40,11 +44,13 @@ The rest is incidental friction git never had to keep: a staging area to manage,
 
 ## How it works
 
-The working tree is captured continuously as *moments*: content-addressed states with a stable id, a timestamp, and a cause. Moments are not commits, never appear in `sdt log`, and cost well under a kilobyte each (a delta against the previous state, with a full keyframe every 200).
+`sdt` captures the working tree as a *moment*. A moment is a content-addressed state with a stable id, a timestamp, and a cause. A moment is not a commit. Moments never appear in `sdt log`. Each moment costs less than one kilobyte. `sdt` stores a delta against the previous state and a full keyframe every 200 moments.
 
-A moment can then be *graded*: superdetermine copy-on-write clones your worktree, reconciles the clone to that state, runs your own check inside it, and throws the clone away. Your tree is never touched and your terminal never blocks. Verdicts are keyed by content, so a state is never graded twice, ever.
+`sdt` grades a moment in four steps. It makes a copy-on-write clone of your worktree. It changes the clone to the target state. It runs your check inside the clone. It deletes the clone. `sdt` does not change your worktree, and your terminal does not wait.
 
-Capture is on from `sdt init`. You do not switch it on, and you do not run `save` to be safe:
+`sdt` keys each verdict by content. `sdt` therefore grades a given state one time only.
+
+Capture starts at `sdt init`. You do not turn it on, and you do not run `save` to stay safe:
 
 ```sh
 sdt init                                  # capture starts here
@@ -58,7 +64,9 @@ Grading is the part that runs your code, so it stays inert until you say what to
 sdt config checks.full "zig build test"
 ```
 
-There is no daemon behind any of this. On macOS, launchd is already running, so it watches the worktree and starts a short-lived `sdt` only when something changes; idle CPU is zero because there is no idle process. `sdt watch` does the same work in a terminal if you would rather see it.
+`sdt` uses no daemon. On macOS, launchd already runs. Launchd watches the worktree and starts `sdt` only after a file changes. That `sdt` process does its work and stops. Idle CPU use is zero, because no process waits.
+
+`sdt watch` does the same work in a terminal, if you prefer to see it.
 
 Then the payoff:
 
@@ -70,13 +78,21 @@ sdt moments               # what was captured, and what each one did
 sdt doctor                # what is on, what is degraded, and why
 ```
 
-Nothing is destroyed by any of it: a rewind captures the state it leaves first, and `sdt undo` reverses it.
+A rewind destroys nothing. `sdt` captures the state that you leave before it rewinds. `sdt undo` reverses the rewind.
 
-**A green is never shown on its own.** An agent that writes both the code and the test has proved only that it agrees with itself, so every verdict carries a warrant on three deterministic axes. Whether the same actor wrote the code and the check (`independent` / `co-authored`), whether the check actually opened the files that changed (`relevance 5/5`), and whether the check would have failed on the previous code (`discriminating` / `vacuous`). A green that is `co-authored` and `vacuous` is named as such, in milliseconds, with no model involved.
+**`sdt` never shows a green result alone.** An agent can write both the code and the test. A green result then proves only that the agent agrees with itself. Each verdict therefore carries a warrant on three axes:
 
-None of it gates. Nothing blocks a push or fails a build, because a signal wired to block becomes a target. And it says nothing about whether your design is good. It answers one narrow question well: whether the green in front of you is worth anything.
+1. Independence. Did one actor write both the code and the check? The verdict reads `independent` or `co-authored`.
+2. Relevance. Did the check open the files that changed? The verdict reads `relevance 5/5`.
+3. Discrimination. Would the check fail on the previous code? The verdict reads `discriminating` or `vacuous`.
 
-`moments.enabled = false` stops capture; `checks.enabled = false` stops grading. Either returns to plain-VCS behaviour.
+`sdt` computes all three axes in milliseconds. It uses no model.
+
+A warrant labels a verdict. It never blocks. `sdt` does not stop a push and does not fail a build. A signal that blocks becomes a target, and an agent then optimizes against it.
+
+A warrant does not tell you if your design is good. It answers one narrow question. It tells you if the green result in front of you has value.
+
+To stop capture, set `moments.enabled = false`. To stop grading, set `checks.enabled = false`. Either setting returns `sdt` to plain version control.
 
 ## Git, side by side
 
