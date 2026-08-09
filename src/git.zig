@@ -1019,8 +1019,12 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
 /// Clone a git repo (local path or file:// URL) into `into_dir`, then import its
 /// HEAD into `store` so the superdetermine ref is populated.
 pub fn cloneGit(store: *Store, url_or_path: []const u8, into_dir: []const u8) !void {
+    try cloneGitOnly(store.alloc, url_or_path, into_dir);
+    try importAll(store, into_dir);
+}
+
+pub fn cloneGitOnly(alloc: std.mem.Allocator, url_or_path: []const u8, into_dir: []const u8) !void {
     ensureInit();
-    const alloc = store.alloc;
 
     const url_z = try alloc.dupeZ(u8, url_or_path);
     defer alloc.free(url_z);
@@ -1030,8 +1034,6 @@ pub fn cloneGit(store: *Store, url_or_path: []const u8, into_dir: []const u8) !v
     var repo: ?*c.git_repository = null;
     try check(c.git_clone(&repo, url_z.ptr, into_z.ptr, null));
     c.git_repository_free(repo);
-
-    try importAll(store, into_dir);
 }
 
 /// Ensure `.sdt/gitmirror` exists as a real git repo and return its absolute path.

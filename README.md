@@ -121,7 +121,7 @@ sdt gc                     # reclaim unreachable objects
 Working with git:
 
 ```
-sdt clone <git-url> <dir>
+sdt clone <git-url> [dir]
 sdt import <git-repo>   /   sdt export <git-repo>
 sdt push [remote] [branch]     # uses your existing git credentials
 ```

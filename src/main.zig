@@ -118,7 +118,7 @@ const sections = [_]Section{
         .{ .name = "watch", .desc = "experimental: auto-save on every change" },
     } },
     .{ .title = "git, side by side", .entries = &.{
-        .{ .name = "clone", .alias = "cl", .args = "<src> <dir>", .desc = "a git repo, a share URL, or a bundle" },
+        .{ .name = "clone", .alias = "cl", .args = "<src> [dir]", .desc = "a git repo, a share URL, or a bundle" },
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
         .{ .name = "export", .args = "<repo>", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir>", .desc = "mirror HEAD into the colocated .git" },
@@ -2229,17 +2229,36 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     try w.print("pulled from {s} ({s})\n", .{ remote_name, url });
 }
 
+fn defaultCloneDir(src: []const u8) ?[]const u8 {
+    var t = src;
+    if (std.mem.indexOfScalar(u8, t, '#')) |c| t = t[0..c];
+    if (std.mem.indexOfScalar(u8, t, '?')) |c| t = t[0..c];
+    while (t.len > 0 and (t[t.len - 1] == '/' or t[t.len - 1] == '\\')) t = t[0 .. t.len - 1];
+    if (std.mem.endsWith(u8, t, ".git")) t = t[0 .. t.len - ".git".len];
+    if (std.mem.endsWith(u8, t, ".bundle")) t = t[0 .. t.len - ".bundle".len];
+    while (t.len > 0 and (t[t.len - 1] == '/' or t[t.len - 1] == '\\')) t = t[0 .. t.len - 1];
+    if (std.mem.lastIndexOfAny(u8, t, "/\\:")) |c| t = t[c + 1 ..];
+    if (t.len == 0 or eq(t, ".") or eq(t, "..")) return null;
+    return t;
+}
+
 fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    if (rest.len < 2) {
-        try w.writeAll("usage: sdt clone <git-src|share-url|bundle#k=...> <dir>\n");
+    if (rest.len < 1) {
+        try w.writeAll("usage: sdt clone <git-src|share-url|bundle#k=...> [dir]\n");
         return;
     }
+    const into = if (rest.len >= 2) rest[1] else defaultCloneDir(rest[0]) orelse {
+        try w.print("cannot tell what to name the directory for {s}. pass one: sdt clone <src> <dir>\n", .{rest[0]});
+        return;
+    };
     if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
-        return cloneShare(io, alloc, w, rest[0], rest[1]);
+        return cloneShare(io, alloc, w, rest[0], into);
     }
-    const into = rest[1];
     // Create the destination as a superdetermine repo, then clone git into it.
-    std.Io.Dir.cwd().createDirPath(io, into) catch {};
+    git.cloneGitOnly(alloc, rest[0], into) catch {
+        try w.print("clone failed. check the URL, your access, and that {s} is empty\n", .{into});
+        return;
+    };
     var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
     defer dest.close(io);
     var s = Store.init(io, alloc, dest) catch |e| switch (e) {
@@ -2247,8 +2266,8 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         else => return e,
     };
     defer s.deinit();
-    git.cloneGit(&s, rest[0], into) catch {
-        try w.writeAll("clone failed\n");
+    git.importAll(&s, into) catch {
+        try w.writeAll("cloned, but importing the git history failed\n");
         return;
     };
     try w.print("cloned {s} into {s}\n", .{ rest[0], into });
