@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,6 +13,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     linkLibgit2(b, exe_mod, target, optimize);
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zon.version);
+    exe_mod.addOptions("build_options", build_options);
+
     const exe = b.addExecutable(.{ .name = "sdt", .root_module = exe_mod });
     b.installArtifact(exe);
 
@@ -29,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     linkLibgit2(b, test_mod, target, .Debug);
+    test_mod.addOptions("build_options", build_options);
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

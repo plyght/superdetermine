@@ -50,7 +50,7 @@ const ipnet = std.Io.net;
 const Oid = oid.Oid;
 const Store = store.Store;
 
-const version = "0.4.0";
+const version = @import("build_options").version;
 
 const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
 const Section = struct { title: []const u8, entries: []const Entry };

@@ -47,20 +47,12 @@ jobs:
           CURRENT_VERSION="$(grep -E '\.version' build.zig.zon | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
           echo "version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
-          PREV_VERSION=""
-          if git rev-parse HEAD^ >/dev/null 2>&1; then
-            PREV_VERSION="$(git show HEAD^:build.zig.zon 2>/dev/null | grep -E '\.version' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-          fi
-
           echo "Current version: ${CURRENT_VERSION}"
-          echo "Previous version: ${PREV_VERSION}"
 
-          if [ "${CURRENT_VERSION}" = "${PREV_VERSION}" ]; then
-            echo "Version unchanged since previous commit; skipping release."
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
+          # The released tags are the source of truth, not a diff against the
+          # previous commit: a push carrying several commits can bump the version
+          # anywhere but the tip, and comparing HEAD to HEAD^ misses that bump and
+          # strands the release for good.
           if git ls-remote --tags origin "refs/tags/v${CURRENT_VERSION}" | grep -q "refs/tags/v${CURRENT_VERSION}"; then
             echo "Tag v${CURRENT_VERSION} already exists on origin; skipping release."
             echo "should_release=false" >> "$GITHUB_OUTPUT"
