@@ -2194,15 +2194,27 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const branch = try targetBranch(io, alloc, &s, if (np >= 2) pos[1] else null);
     defer alloc.free(branch);
 
-    // If a git repo is colocated here, push IT directly (dual-write commits live
-    // there) so local .git and the remote stay identical. Otherwise synthesize a
-    // history in the mirror and push that.
+    // If a git repo is colocated here, push IT directly so local .git and the
+    // remote stay identical. Mirror the saved states onto the target branch
+    // first: dual-write is opt-in, so without this a push of an unmoved ref
+    // succeeds and reports success while leaving every save behind. Otherwise
+    // synthesize a history in the mirror and push that.
     const colocated = if (std.Io.Dir.cwd().access(io, ".git", .{})) |_| true else |_| false;
     if (colocated) {
+        const before = git.branchTipHex(&s, ".", branch);
+        git.syncColocatedTo(&s, ".", branch) catch {
+            try w.print("cannot mirror the saved states onto {s} in .git, so nothing was pushed\n", .{branch});
+            return;
+        };
+        const after = git.branchTipHex(&s, ".", branch);
         git.pushColocated(&s, ".", url, branch, force) catch {
             try w.print("push to {s} failed (diverged? try `sdt push --force`; or auth/URL)\n", .{remote_name});
             return;
         };
+        const moved = if (before) |b| if (after) |a| !eq(&b, &a) else false else after != null;
+        if (moved) {
+            if (after) |a| try w.print("mirrored {s} into .git at {s}\n", .{ branch, a[0..12] });
+        }
     } else {
         git.pushRemote(&s, url, branch) catch {
             try w.print("push to {s} failed (auth? or check the URL)\n", .{remote_name});

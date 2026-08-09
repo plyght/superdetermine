@@ -1282,12 +1282,38 @@ pub fn pullHead(store: *Store, target: []const u8) !void {
 /// Mirror superdetermine HEAD into a colocated git repo at `work_dir_path`, so `git log`
 /// there reflects superdetermine's current change ("sdt and git coexist live").
 pub fn syncColocated(store: *Store, work_dir_path: []const u8) !void {
-    try exportHead(store, work_dir_path);
+    try syncColocatedTo(store, work_dir_path, null);
+}
+
+/// As `syncColocated`, but onto an explicit git branch. The sdt branch and the
+/// git branch need not share a name: `init.defaultBranch = main` with a git repo
+/// on `master` is the common case, and the sdt history lands on `master` there.
+pub fn syncColocatedTo(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8) !void {
+    try exportHeadTo(store, work_dir_path, git_branch);
     // gr wrote the commit straight to the branch ref, which leaves git's index
     // stale relative to the new HEAD (so `git status`/`git diff` show garbage).
     // Reset the index (MIXED: HEAD + index, working tree untouched) so git stays
     // consistent and `git status` shows exactly what changed since the sdt save.
     resetIndexToHead(store, work_dir_path) catch {};
+}
+
+/// Hex id of `branch`'s tip in the git repo at `work_dir_path`, or null when the
+/// repo or the branch is absent.
+pub fn branchTipHex(store: *Store, work_dir_path: []const u8, branch: []const u8) ?[40]u8 {
+    ensureInit();
+    const alloc = store.alloc;
+    const path_z = alloc.dupeZ(u8, work_dir_path) catch return null;
+    defer alloc.free(path_z);
+
+    var repo: ?*c.git_repository = null;
+    if (c.git_repository_open(&repo, path_z.ptr) != 0) return null;
+    defer c.git_repository_free(repo);
+
+    var ref_buf: [512]u8 = undefined;
+    const ref_name = std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{branch}) catch return null;
+    var tip: c.git_oid = undefined;
+    if (c.git_reference_name_to_id(&tip, repo, ref_name.ptr) != 0) return null;
+    return gitOidHex(&tip);
 }
 
 fn resetIndexToHead(store: *Store, work_dir_path: []const u8) !void {
