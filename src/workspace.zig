@@ -255,19 +255,57 @@ pub fn status(store: *Store, work_dir: std.Io.Dir, alloc: std.mem.Allocator) ![]
 }
 
 pub fn materialize(store: *Store, tree_oid: Oid, dest_dir: std.Io.Dir) !void {
+    return checkout(store, dest_dir, null, tree_oid);
+}
+
+/// Move `dest_dir` from `from_tree` to `to_tree`: drop every path the old tree
+/// tracked and the new one does not, prune the directories that leaves empty,
+/// then write the new tree's files.
+///
+/// Only paths recorded in `from_tree` are ever deleted, so untracked and ignored
+/// files survive a checkout. Passing `null` for `from_tree` deletes nothing,
+/// which is what filling a fresh directory wants.
+pub fn checkout(store: *Store, dest_dir: std.Io.Dir, from_tree: ?Oid, to_tree: Oid) !void {
     const io = store.io;
     const alloc = store.alloc;
 
-    const tree = try store.readTree(tree_oid);
-    defer object.freeTree(alloc, tree);
+    const target = try store.readTree(to_tree);
+    defer object.freeTree(alloc, target);
 
-    for (tree.entries) |e| {
+    var previous: ?object.Tree = null;
+    defer if (previous) |p| object.freeTree(alloc, p);
+    if (from_tree) |f| {
+        if (!f.eql(to_tree)) previous = store.readTree(f) catch null;
+    }
+
+    var want = std.StringHashMap(void).init(alloc);
+    defer want.deinit();
+    for (target.entries) |e| try want.put(e.path, {});
+
+    if (previous) |p| for (p.entries) |e| {
+        if (want.contains(e.path)) continue;
+        dest_dir.deleteFile(io, e.path) catch {};
+    };
+
+    for (target.entries) |e| {
         if (std.fs.path.dirnamePosix(e.path)) |dir| {
             try dest_dir.createDirPath(io, dir);
         }
         const data = try store.readFileContent(e.blob);
         defer alloc.free(data);
         try dest_dir.writeFile(io, .{ .sub_path = e.path, .data = data });
+    }
+
+    if (previous) |p| for (p.entries) |e| {
+        if (want.contains(e.path)) continue;
+        pruneEmptyDirs(io, dest_dir, e.path);
+    };
+}
+
+fn pruneEmptyDirs(io: std.Io, dest_dir: std.Io.Dir, rel_path: []const u8) void {
+    var dir = std.fs.path.dirnamePosix(rel_path);
+    while (dir) |d| : (dir = std.fs.path.dirnamePosix(d)) {
+        dest_dir.deleteDir(io, d) catch return;
     }
 }
 

@@ -478,9 +478,32 @@ fn recordProvenance(io: std.Io, alloc: std.mem.Allocator, s: *Store, change: Oid
     provenance.record(s, change, agent, prompt, nowSeconds(io)) catch {};
 }
 
+/// The worktree root, which is the directory holding the repo dir and not the
+/// directory the command was typed in. Tracked paths are stored repo-root
+/// relative, so resolving them against the cwd would write a second copy of the
+/// tree into whatever subdirectory happened to be current.
 fn openWork(io: std.Io) !std.Io.Dir {
     // cwd() is a special AT_FDCWD handle that cannot be iterated/seeked.
-    return std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+    return openWorkFrom(io, std.Io.Dir.cwd());
+}
+
+fn openWorkFrom(io: std.Io, start: std.Io.Dir) !std.Io.Dir {
+    var dir = try start.openDir(io, ".", .{ .iterate = true });
+    var depth: usize = 0;
+    while (depth < 64) : (depth += 1) {
+        if (isWorkRoot(io, dir)) return dir;
+        const parent = dir.openDir(io, "..", .{ .iterate = true }) catch break;
+        dir.close(io);
+        dir = parent;
+    }
+    dir.close(io);
+    return start.openDir(io, ".", .{ .iterate = true });
+}
+
+fn isWorkRoot(io: std.Io, dir: std.Io.Dir) bool {
+    if (dir.access(io, store.dir_name, .{})) |_| return true else |_| {}
+    if (dir.access(io, store.legacy_dir_name, .{})) |_| return true else |_| {}
+    return false;
 }
 
 fn openRepo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?Store {
@@ -677,17 +700,7 @@ fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
 
     // Clean-checkout the target tree: drop currently-tracked files that the
     // target does not have, then materialize the target's files.
-    const cur_tree = try s.readTree(head_change.tree);
-    defer object.freeTree(alloc, cur_tree);
-    const tgt = try s.readTree(target_tree);
-    defer object.freeTree(alloc, tgt);
-    var keep = std.StringHashMap(void).init(alloc);
-    defer keep.deinit();
-    for (tgt.entries) |e| try keep.put(e.path, {});
-    for (cur_tree.entries) |e| {
-        if (!keep.contains(e.path)) work.deleteFile(io, e.path) catch {};
-    }
-    try workspace.materialize(&s, target_tree, work);
+    try workspace.checkout(&s, work, head_change.tree, target_tree);
 
     const author = try config.author(&s, alloc);
     defer alloc.free(author);
@@ -1165,10 +1178,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         defer set.deinit(alloc);
         var ix = try verdict.Index.load(&s, alloc);
         defer ix.deinit();
-        const resolved = resolveSpec(io, alloc, &s, rest[1], &ix, set) catch {
-            try w.print("could not resolve {s}\n", .{rest[1]});
-            return;
-        };
+        const resolved = resolveSpecOrFail(io, alloc, w, &s, rest[1], &ix, set);
         defer resolved.deinit(alloc);
         if (resolved.target == .live) {
             try w.writeAll("@ is the live tree; `sdt new <name>` already branches from here\n");
@@ -1265,10 +1275,7 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         var ix = try verdict.Index.load(&s, alloc);
         defer ix.deinit();
 
-        const resolved = resolveSpec(io, alloc, &s, at, &ix, set) catch {
-            try w.print("could not resolve {s}\n", .{at});
-            return;
-        };
+        const resolved = resolveSpecOrFail(io, alloc, w, &s, at, &ix, set);
         defer resolved.deinit(alloc);
         if (resolved.target == .live) {
             try w.writeAll("@ is the live tree; `sdt work <dir>` already gives you that\n");
@@ -1330,6 +1337,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer alloc.free(author);
 
     const before = s.readRef(into) catch Oid.zero();
+    const before_tree = branches.headTree(&s);
     const result = merge.merge(&s, alloc, into, rest[0], author, nowSeconds(io)) catch |e| {
         try w.print("merge failed: {s}\n", .{@errorName(e)});
         return;
@@ -1341,7 +1349,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     // Materialize the merged tree into the working directory.
     var work = try openWork(io);
     defer work.close(io);
-    workspace.materialize(&s, result.tree, work) catch {};
+    workspace.checkout(&s, work, before_tree, result.tree) catch {};
 
     if (result.conflicts.len == 0) {
         try w.print("merged {s} into {s}, clean\n", .{ rest[0], into });
@@ -1470,14 +1478,114 @@ fn resolveSpec(
     ix: *const verdict.Index,
     set: checks.Settings,
 ) !revspec.Resolved {
-    return revspec.resolve(.{
+    return revspec.resolve(specContext(io, alloc, s, ix, set), spec);
+}
+
+fn specContext(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    s: *Store,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+) revspec.Context {
+    return .{
         .store = s,
         .alloc = alloc,
         .verdicts = ix,
         .command_fast = verdict.commandHash(set.command(.fast)),
         .command_full = verdict.commandHash(set.command(.full)),
         .now_ms = nowMillis(io),
-    }, spec);
+    };
+}
+
+fn failSpec(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    spec: []const u8,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+    e: anyerror,
+) noreturn {
+    reportSpec(io, alloc, w, s, spec, ix, set, e) catch {};
+    w.flush() catch {};
+    std.process.exit(1);
+}
+
+fn reportSpec(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    spec: []const u8,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+    e: anyerror,
+) !void {
+    switch (e) {
+        revspec.Error.NoSuchMoment => {
+            try w.print("{s}{s}{s} nothing matches {s}{s}{s}\n", .{
+                ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+            });
+            if (std.mem.indexOf(u8, spec, "green") != null) {
+                try ui.hint(w, "no state has been graded green yet; set `checks.full` and run `sdt grade`");
+            }
+        },
+        revspec.Error.AmbiguousMoment => {
+            try w.print("{s}{s}{s} {s}{s}{s} matches more than one state\n", .{
+                ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+            });
+            var found: std.ArrayList(revspec.Match) = .empty;
+            defer found.deinit(alloc);
+            revspec.matches(specContext(io, alloc, s, ix, set), spec, &found) catch {};
+            for (found.items) |m| {
+                const id = m.id();
+                try w.print("  {s}{s}{s}  {s}{s}{s}\n", .{
+                    ui.on(.cyan), id[0..@min(id.len, 12)], ui.off(),
+                    ui.on(.dim),  @tagName(m.kind),        ui.off(),
+                });
+            }
+            try ui.hint(w, "use more characters of the id");
+        },
+        revspec.Error.NotARevspec, revspec.Error.UnknownSelector => {
+            try w.print("{s}{s}{s} not a ref: {s}{s}{s}\n", .{
+                ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+            });
+            try ui.hint(w, "refs are @green, @2h, @yesterday, @save, '@~1', a branch name, or an id from `sdt log`");
+        },
+        else => {
+            try w.print("{s}{s}{s} could not resolve {s}{s}{s}: {s}\n", .{
+                ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(), @errorName(e),
+            });
+        },
+    }
+}
+
+fn resolveSpecOrFail(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    spec: []const u8,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+) revspec.Resolved {
+    return resolveSpec(io, alloc, s, spec, ix, set) catch |e|
+        failSpec(io, alloc, w, s, spec, ix, set, e);
+}
+
+fn resolveRangeOrFail(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    spec: []const u8,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+) revspec.Range {
+    return revspec.resolveRange(specContext(io, alloc, s, ix, set), spec) catch |e|
+        failSpec(io, alloc, w, s, spec, ix, set, e);
 }
 
 fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1554,22 +1662,7 @@ fn rewindTo(
     var ix = try verdict.Index.load(&s, alloc);
     defer ix.deinit();
 
-    const resolved = resolveSpec(io, alloc, &s, spec, &ix, set) catch |e| {
-        switch (e) {
-            revspec.Error.NoSuchMoment => {
-                try w.print("{s}{s}{s} nothing matches {s}{s}{s}\n", .{
-                    ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
-                });
-                if (std.mem.indexOf(u8, spec, "green") != null) {
-                    try ui.hint(w, "no state has been graded green yet; set `checks.full` and run `sdt grade`");
-                }
-            },
-            revspec.Error.UnknownSelector => try w.print("not a revspec: {s}\n", .{spec}),
-            revspec.Error.AmbiguousMoment => try w.print("{s} matches more than one moment\n", .{spec}),
-            else => return e,
-        }
-        return;
-    };
+    const resolved = resolveSpecOrFail(io, alloc, w, &s, spec, &ix, set);
     defer resolved.deinit(alloc);
 
     const target_moment = switch (resolved.target) {
@@ -1843,17 +1936,7 @@ fn cmdRecap(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     // A range narrows the window; without one the recap covers all of history.
     var from: usize = 0;
     if (spec.len != 0) {
-        const range = revspec.resolveRange(.{
-            .store = &s,
-            .alloc = alloc,
-            .verdicts = &ix,
-            .command_fast = verdict.commandHash(set.command(.fast)),
-            .command_full = verdict.commandHash(set.command(.full)),
-            .now_ms = nowMillis(io),
-        }, spec) catch {
-            try w.print("could not resolve {s}\n", .{spec});
-            return;
-        };
+        const range = resolveRangeOrFail(io, alloc, w, &s, spec, &ix, set);
         defer range.deinit(alloc);
         if (range.from) |f| {
             if (f.target == .at) {
@@ -3148,4 +3231,75 @@ test {
     _ = superpose;
     _ = live;
     _ = @import("index.zig");
+}
+
+extern "c" fn chdir(path: [*:0]const u8) c_int;
+
+test "openWorkFrom finds the repo root from a nested subdirectory" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "repo/native/deep");
+    var root = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer root.close(io);
+    var s = try Store.init(io, alloc, root);
+    defer s.deinit();
+    try root.writeFile(io, .{ .sub_path = "top.txt", .data = "root file" });
+
+    var nested = try tmp.dir.openDir(io, "repo/native/deep", .{ .iterate = true });
+    defer nested.close(io);
+
+    var work = try openWorkFrom(io, nested);
+    defer work.close(io);
+
+    const got = try work.readFileAlloc(io, "top.txt", alloc, .unlimited);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("root file", got);
+}
+
+test "a checkout run from a nested subdirectory writes to the repo root" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "repo/native");
+    var root = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer root.close(io);
+    var s = try Store.init(io, alloc, root);
+    defer s.deinit();
+
+    try root.writeFile(io, .{ .sub_path = "native/lib.zig", .data = "v1" });
+    _ = try workspace.snapshot(&s, root, "Nico <n@x>", "main", 1_700_000_000);
+
+    try branches.create(&s, "side");
+    try branches.switchTo(&s, root, "side");
+    try root.writeFile(io, .{ .sub_path = "native/lib.zig", .data = "v2" });
+    _ = try workspace.snapshot(&s, root, "Nico <n@x>", "side", 1_700_000_001);
+
+    const before_path = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(before_path);
+    const before = try alloc.dupeZ(u8, before_path);
+    defer alloc.free(before);
+    const nested_path = try tmp.dir.realPathFileAlloc(io, "repo/native", alloc);
+    defer alloc.free(nested_path);
+    const nested_abs = try alloc.dupeZ(u8, nested_path);
+    defer alloc.free(nested_abs);
+
+    try std.testing.expectEqual(@as(c_int, 0), chdir(nested_abs.ptr));
+    defer _ = chdir(before.ptr);
+
+    var work = try openWork(io);
+    defer work.close(io);
+    try branches.switchTo(&s, work, "main");
+
+    const got = try root.readFileAlloc(io, "native/lib.zig", alloc, .unlimited);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("v1", got);
+    try std.testing.expectError(error.FileNotFound, root.access(io, "native/native", .{}));
+    try std.testing.expectError(error.FileNotFound, root.access(io, "native/repo", .{}));
 }

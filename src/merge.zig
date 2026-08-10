@@ -554,11 +554,19 @@ pub fn abort(store: *Store, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !voi
     const branch = try store.headBranch();
     defer alloc.free(branch);
 
+    var from_tree: ?Oid = null;
+    if (store.readRef(branch)) |tip| {
+        if (store.readChange(tip)) |cur| {
+            defer object.freeChange(alloc, cur);
+            from_tree = cur.tree;
+        } else |_| {}
+    } else |_| {}
+
     try store.updateRef(branch, state.pre_merge);
 
     const change = try store.readChange(state.pre_merge);
     defer object.freeChange(alloc, change);
-    try workspace.materialize(store, change.tree, work_dir);
+    try workspace.checkout(store, work_dir, from_tree, change.tree);
 
     try clearState(store);
 }

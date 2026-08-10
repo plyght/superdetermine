@@ -51,11 +51,24 @@ pub fn create(store: *Store, name: []const u8) !void {
 /// MVP: assumes a clean working tree — we do not yet stash or merge dirty
 /// state; the CLI layer will auto-snapshot before switching.
 pub fn switchTo(store: *Store, work_dir: std.Io.Dir, name: []const u8) !void {
+    const from_tree = headTree(store);
     try store.setHeadBranch(name);
     if (!store.refExists(name)) return; // unborn branch: nothing to materialize
     const change = try store.readChange(try store.readRef(name));
     defer object.freeChange(store.alloc, change);
-    try workspace.materialize(store, change.tree, work_dir);
+    try workspace.checkout(store, work_dir, from_tree, change.tree);
+}
+
+/// The tree the current branch's tip holds, or null when HEAD is unborn or
+/// unreadable. Nothing is deleted from the worktree in that case.
+pub fn headTree(store: *Store) ?Oid {
+    const branch = store.headBranch() catch return null;
+    defer store.alloc.free(branch);
+    if (!store.refExists(branch)) return null;
+    const tip = store.readRef(branch) catch return null;
+    const change = store.readChange(tip) catch return null;
+    defer object.freeChange(store.alloc, change);
+    return change.tree;
 }
 
 /// Instant copy-on-write worktree via macOS clonefile(2). `dst_dir_path` must
@@ -170,6 +183,86 @@ test "branch create and list" {
     }
     try testing.expect(has_main);
     try testing.expect(has_feature);
+}
+
+test "switching away deletes tracked paths the target branch lacks" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "work");
+    var wt = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer wt.close(io);
+
+    var s = try Store.init(io, alloc, wt);
+    defer s.deinit();
+
+    try wt.writeFile(io, .{ .sub_path = "keep.txt", .data = "shared" });
+    _ = try workspace.snapshot(&s, wt, "Nico <n@x>", "main", 1_700_000_000);
+
+    try create(&s, "bench");
+    try switchTo(&s, wt, "bench");
+    try wt.createDirPath(io, "bench/adversarial");
+    try wt.writeFile(io, .{ .sub_path = "bench/adversarial/one.txt", .data = "a" });
+    try wt.writeFile(io, .{ .sub_path = "bench/adversarial/two.txt", .data = "b" });
+    _ = try workspace.snapshot(&s, wt, "Nico <n@x>", "add bench", 1_700_000_001);
+
+    try switchTo(&s, wt, "main");
+
+    try testing.expectError(error.FileNotFound, wt.access(io, "bench/adversarial/one.txt", .{}));
+    try testing.expectError(error.FileNotFound, wt.access(io, "bench/adversarial", .{}));
+    try testing.expectError(error.FileNotFound, wt.access(io, "bench", .{}));
+    try wt.access(io, "keep.txt", .{});
+
+    const st = try workspace.status(&s, wt, alloc);
+    defer {
+        for (st) |e| alloc.free(e.path);
+        alloc.free(st);
+    }
+    try testing.expectEqual(@as(usize, 0), st.len);
+
+    try switchTo(&s, wt, "bench");
+    const back = try wt.readFileAlloc(io, "bench/adversarial/two.txt", alloc, .unlimited);
+    defer alloc.free(back);
+    try testing.expectEqualStrings("b", back);
+}
+
+test "switching never removes an untracked file" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "work");
+    var wt = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer wt.close(io);
+
+    var s = try Store.init(io, alloc, wt);
+    defer s.deinit();
+
+    try wt.writeFile(io, .{ .sub_path = "tracked.txt", .data = "v1" });
+    _ = try workspace.snapshot(&s, wt, "Nico <n@x>", "main", 1_700_000_000);
+
+    try create(&s, "side");
+    try switchTo(&s, wt, "side");
+    try wt.writeFile(io, .{ .sub_path = "side-only.txt", .data = "only on side" });
+    _ = try workspace.snapshot(&s, wt, "Nico <n@x>", "side work", 1_700_000_001);
+
+    try wt.createDirPath(io, "scratch");
+    try wt.writeFile(io, .{ .sub_path = "scratch/notes.txt", .data = "mine" });
+    try wt.writeFile(io, .{ .sub_path = ".grignore", .data = "scratch/\n" });
+    try wt.writeFile(io, .{ .sub_path = "untracked.txt", .data = "never saved" });
+
+    try switchTo(&s, wt, "main");
+
+    try testing.expectError(error.FileNotFound, wt.access(io, "side-only.txt", .{}));
+    const notes = try wt.readFileAlloc(io, "scratch/notes.txt", alloc, .unlimited);
+    defer alloc.free(notes);
+    try testing.expectEqualStrings("mine", notes);
+    const loose = try wt.readFileAlloc(io, "untracked.txt", alloc, .unlimited);
+    defer alloc.free(loose);
+    try testing.expectEqualStrings("never saved", loose);
 }
 
 test "cow worktree" {
