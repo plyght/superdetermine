@@ -122,8 +122,8 @@ const sections = [_]Section{
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
         .{ .name = "export", .args = "<repo>", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir>", .desc = "mirror HEAD into the colocated .git" },
-        .{ .name = "push", .alias = "ps", .desc = "uses your existing git credentials" },
-        .{ .name = "pull", .alias = "pl", .desc = "fetch and merge from a git remote" },
+        .{ .name = "push", .alias = "ps", .args = "[remote] [branch]", .desc = "uses your existing git credentials" },
+        .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
     } },
     .{ .title = "housekeeping", .entries = &.{
@@ -845,6 +845,7 @@ fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         ui.on(.yellow), shortHex(change, &buf), ui.off(),
         ui.on(.cyan),   branch,                 ui.off(),
     });
+    if (sync_blocked) try reportNotFastForward(w, git.at_risk.branch());
 }
 
 // Snapshot the working tree and log the op. Shared by save and auto-save.
@@ -878,8 +879,16 @@ fn maybeSyncGit(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
     defer alloc.free(v);
     const on = eq(v, "true") or eq(v, "1") or eq(v, "yes") or eq(v, "on");
     if (!on) return;
-    git.syncColocated(s, ".") catch {};
+    sync_blocked = false;
+    git.syncColocated(s, ".") catch |e| {
+        if (e == git.Error.NotFastForward) sync_blocked = true;
+    };
 }
+
+// Set when the last save could not mirror into .git because doing so would have
+// dropped git-side commits. The save itself still happened; only the mirror was
+// held back, and the command that ran the save says so.
+var sync_blocked: bool = false;
 
 fn cmdDescribe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1478,7 +1487,20 @@ fn resolveSpec(
     ix: *const verdict.Index,
     set: checks.Settings,
 ) !revspec.Resolved {
-    return revspec.resolve(specContext(io, alloc, s, ix, set), spec);
+    const ctx = specContext(io, alloc, s, ix, set);
+    return revspec.resolve(ctx, spec) catch |e| {
+        switch (e) {
+            revspec.Error.NotARevspec, revspec.Error.UnknownSelector => {
+                // A colocated repo makes git revisions real addresses here, so
+                // `origin/master` resolves to whatever sdt imported it as.
+                switch (git.lookupGitRef(s, ".", spec)) {
+                    .mapped => |o| return revspec.resolveChangeOid(ctx, o),
+                    else => return e,
+                }
+            },
+            else => return e,
+        }
+    };
 }
 
 fn specContext(
@@ -1549,10 +1571,20 @@ fn reportSpec(
             try ui.hint(w, "use more characters of the id");
         },
         revspec.Error.NotARevspec, revspec.Error.UnknownSelector => {
+            switch (git.lookupGitRef(s, ".", spec)) {
+                .unmapped => {
+                    try w.print("{s}{s}{s} git knows {s}{s}{s}, but superdetermine has not imported it\n", .{
+                        ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+                    });
+                    try ui.hint(w, "`sdt pull` brings a remote branch in; `sdt import .` brings the whole colocated repo in");
+                    return;
+                },
+                else => {},
+            }
             try w.print("{s}{s}{s} not a ref: {s}{s}{s}\n", .{
                 ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
             });
-            try ui.hint(w, "refs are @green, @2h, @yesterday, @save, '@~1', a branch name, or an id from `sdt log`");
+            try ui.hint(w, "refs are @green, @2h, @yesterday, @save, '@~1', a branch name, an imported git ref, or an id from `sdt log`");
         },
         else => {
             try w.print("{s}{s}{s} could not resolve {s}{s}{s}: {s}\n", .{
@@ -2175,15 +2207,25 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
                 try ui.hint(w, "`sdt super` lists them; `sdt collapse <path> <A|B>` picks one");
                 return;
             }
-            git.exportAll(&s, target) catch {
+            git.exportAll(&s, target) catch |e| {
+                if (e == git.Error.NotFastForward) {
+                    try reportNotFastForward(w, git.at_risk.branch());
+                    return;
+                }
                 try w.writeAll("git export failed\n");
+                try reportGitError(w);
                 return;
             };
             try w.print("exported superdetermine (full history, all branches + tags) to git at {s}\n", .{target});
         },
         .sync => {
-            git.syncColocated(&s, target) catch {
+            git.syncColocated(&s, target) catch |e| {
+                if (e == git.Error.NotFastForward) {
+                    try reportNotFastForward(w, git.at_risk.branch());
+                    return;
+                }
                 try w.writeAll("sync failed\n");
+                try reportGitError(w);
                 return;
             };
             try w.print("synced superdetermine HEAD into .git at {s}\n", .{target});
@@ -2252,17 +2294,48 @@ fn targetBranch(io: std.Io, alloc: std.mem.Allocator, s: *Store, explicit: ?[]co
     return s.headBranch();
 }
 
+// Print whatever libgit2 (or sdt) said about the last failure. Silence is worse
+// than a raw message: it leaves the user with nothing to act on.
+fn reportGitError(w: *std.Io.Writer) !void {
+    const msg = git.lastError();
+    if (msg.len == 0) return;
+    try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), msg, ui.off() });
+}
+
+// Name the commits that would have been dropped. The branch is left untouched.
+fn reportNotFastForward(w: *std.Io.Writer, branch: []const u8) !void {
+    const r = &git.at_risk;
+    try w.print("{s}{s}{s} refusing to move {s}{s}{s} in .git: {d} commit{s} there {s} not in superdetermine\n", .{
+        ui.on(.red),  ui.cross,                      ui.off(),
+        ui.on(.bold), branch,                        ui.off(),
+        r.total,      if (r.total == 1) "" else "s", if (r.total == 1) "is" else "are",
+    });
+    var i: usize = 0;
+    while (i < r.shown) : (i += 1) {
+        const id = r.id(i);
+        try w.print("  {s}{s}{s}  {s}\n", .{ ui.on(.cyan), id[0..12], ui.off(), r.subject(i) });
+    }
+    if (r.total > r.shown) try w.print("  {s}... and {d} more{s}\n", .{ ui.on(.dim), r.total - r.shown, ui.off() });
+    try ui.hint(w, "`sdt pull` brings them in; `sdt push --force` drops them on purpose");
+}
+
 fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
 
     // Positional args are remote then branch; -f/--force is a flag anywhere.
     var force = false;
+    var verbose = false;
     var pos: [2][]const u8 = undefined;
     var np: usize = 0;
     for (rest) |a| {
         if (eq(a, "-f") or eq(a, "--force")) {
             force = true;
+        } else if (eq(a, "-v") or eq(a, "--verbose")) {
+            verbose = true;
+        } else if (a.len != 0 and a[0] == '-') {
+            try w.print("unknown option '{s}'\n", .{a});
+            return;
         } else if (np < 2) {
             pos[np] = a;
             np += 1;
@@ -2285,13 +2358,19 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const colocated = if (std.Io.Dir.cwd().access(io, ".git", .{})) |_| true else |_| false;
     if (colocated) {
         const before = git.branchTipHex(&s, ".", branch);
-        git.syncColocatedTo(&s, ".", branch) catch {
-            try w.print("cannot mirror the saved states onto {s} in .git, so nothing was pushed\n", .{branch});
+        git.syncColocatedForced(&s, ".", branch, force) catch |e| {
+            if (e == git.Error.NotFastForward) {
+                try reportNotFastForward(w, branch);
+            } else {
+                try w.print("cannot mirror the saved states onto {s} in .git, so nothing was pushed\n", .{branch});
+                try reportGitError(w);
+            }
             return;
         };
         const after = git.branchTipHex(&s, ".", branch);
         git.pushColocated(&s, ".", url, branch, force) catch {
             try w.print("push to {s} failed (diverged? try `sdt push --force`; or auth/URL)\n", .{remote_name});
+            try reportGitError(w);
             return;
         };
         const moved = if (before) |b| if (after) |a| !eq(&b, &a) else false else after != null;
@@ -2299,29 +2378,133 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             if (after) |a| try w.print("mirrored {s} into .git at {s}\n", .{ branch, a[0..12] });
         }
     } else {
-        git.pushRemote(&s, url, branch) catch {
-            try w.print("push to {s} failed (auth? or check the URL)\n", .{remote_name});
+        git.pushRemote(&s, url, branch) catch |e| {
+            if (e == git.Error.NotFastForward) {
+                try reportNotFastForward(w, branch);
+            } else {
+                try w.print("push to {s} failed (auth? or check the URL)\n", .{remote_name});
+                try reportGitError(w);
+            }
             return;
         };
     }
     try w.print("pushed {s} → {s} ({s})\n", .{ branch, remote_name, url });
 }
 
+// The sdt ref the fetched remote history lands on, so a pull never overwrites
+// the local branch before the two have been reconciled.
+const pull_ref = "sdt-remote";
+
 fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     captureBefore(io, alloc, &s);
-    const remote_name = if (rest.len >= 1) rest[0] else "origin";
+
+    var pos: [2][]const u8 = undefined;
+    var np: usize = 0;
+    for (rest) |a| {
+        if (eq(a, "-v") or eq(a, "--verbose")) {
+            continue;
+        } else if (a.len != 0 and a[0] == '-') {
+            try w.print("unknown option '{s}'\n", .{a});
+            return;
+        } else if (np < 2) {
+            pos[np] = a;
+            np += 1;
+        }
+    }
+
+    const remote_name = if (np >= 1) pos[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
         try w.print("unknown remote '{s}'. pass a URL, or set it in git or `sdt config remote.{s}.url`\n", .{ remote_name, remote_name });
         return;
     };
     defer alloc.free(url);
-    git.pullRemote(&s, url) catch {
-        try w.print("pull from {s} failed\n", .{remote_name});
+
+    const owned_branch: ?[]u8 = if (np >= 2) null else colocatedGitBranch(io, alloc);
+    defer if (owned_branch) |b| alloc.free(b);
+    const want_branch: ?[]const u8 = if (np >= 2) pos[1] else owned_branch;
+
+    const local = try s.headBranch();
+    defer alloc.free(local);
+    const had_local = s.refExists(local);
+    const before = if (had_local) try s.readRef(local) else Oid.zero();
+
+    var fetched = git.fetchRemote(&s, url, want_branch, pull_ref) catch |e| {
+        try w.print("pull from {s} failed: {s}\n", .{ remote_name, @errorName(e) });
+        try reportGitError(w);
         return;
     };
-    try w.print("pulled from {s} ({s})\n", .{ remote_name, url });
+    defer fetched.deinit(alloc);
+
+    if (!had_local) {
+        try s.updateRef(local, fetched.tip);
+        try checkoutTree(io, alloc, &s, before, fetched.tip);
+        try w.print("pulled {s} from {s} ({s})\n", .{ fetched.branch, remote_name, url });
+        return;
+    }
+    if (before.eql(fetched.tip)) {
+        try w.print("already up to date with {s}/{s}\n", .{ remote_name, fetched.branch });
+        return;
+    }
+
+    const base = merge.commonAncestor(&s, alloc, before, fetched.tip) catch null;
+    if (base) |b| {
+        if (b.eql(fetched.tip)) {
+            try w.print("already up to date with {s}/{s}\n", .{ remote_name, fetched.branch });
+            return;
+        }
+    }
+    const fast_forward = if (base) |b| b.eql(before) else false;
+    if (fast_forward) {
+        try s.updateRef(local, fetched.tip);
+        oplog.record(&s, .{ .kind = .import, .branch = local, .prev = before, .new = fetched.tip, .timestamp = nowSeconds(io) }) catch {};
+        try checkoutTree(io, alloc, &s, before, fetched.tip);
+        try w.print("fast-forwarded {s} to {s}/{s}\n", .{ local, remote_name, fetched.branch });
+        return;
+    }
+
+    const author = try config.author(&s, alloc);
+    defer alloc.free(author);
+    const before_tree = branches.headTree(&s);
+    const result = merge.merge(&s, alloc, local, pull_ref, author, nowSeconds(io)) catch |e| {
+        try w.print("pull from {s} failed to merge: {s}\n", .{ remote_name, @errorName(e) });
+        return;
+    };
+    defer merge.freeMergeResult(alloc, result);
+    const after = s.readRef(local) catch before;
+    oplog.record(&s, .{ .kind = .other, .branch = local, .prev = before, .new = after, .timestamp = nowSeconds(io) }) catch {};
+
+    {
+        var work = try openWork(io);
+        defer work.close(io);
+        workspace.checkout(&s, work, before_tree, result.tree) catch {};
+    }
+
+    if (result.conflicts.len == 0) {
+        try w.print("merged {s}/{s} into {s}, clean\n", .{ remote_name, fetched.branch, local });
+        return;
+    }
+    merge.saveState(&s, pull_ref, before, result.conflicts) catch {};
+    try w.print("merged {s}/{s} into {s} with {d} conflict(s):\n", .{ remote_name, fetched.branch, local, result.conflicts.len });
+    for (result.conflicts) |p| try w.print("  ! {s}\n", .{p});
+    try w.writeAll("fix the markers, then `sdt resolve <file>` each, or `sdt resolve --abort`\n");
+}
+
+fn checkoutTree(io: std.Io, alloc: std.mem.Allocator, s: *Store, from: Oid, to: Oid) !void {
+    _ = alloc;
+    const to_change = s.readChange(to) catch return;
+    defer object.freeChange(s.alloc, to_change);
+    var from_tree: ?Oid = null;
+    if (!from.eql(Oid.zero())) {
+        if (s.readChange(from)) |fc| {
+            defer object.freeChange(s.alloc, fc);
+            from_tree = fc.tree;
+        } else |_| {}
+    }
+    var work = try openWork(io);
+    defer work.close(io);
+    workspace.checkout(s, work, from_tree, to_change.tree) catch {};
 }
 
 fn defaultCloneDir(src: []const u8) ?[]const u8 {

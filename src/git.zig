@@ -10,7 +10,7 @@ const c = @cImport({
     @cInclude("git2.h");
 });
 
-pub const Error = error{GitError};
+pub const Error = error{ GitError, NotFastForward };
 
 /// Set by the last import/push so the CLI can report LFS work without having to
 /// re-open a session: pointers that stayed pointers, and objects uploaded.
@@ -30,8 +30,113 @@ pub fn shutdown() void {
     _ = c.git_libgit2_shutdown();
 }
 
+var last_err_buf: [1024]u8 = undefined;
+var last_err_len: usize = 0;
+
+/// The text of the last libgit2 failure (or a message sdt recorded itself), so
+/// the CLI can say what actually went wrong instead of "it failed".
+pub fn lastError() []const u8 {
+    return last_err_buf[0..last_err_len];
+}
+
+pub fn recordError(msg: []const u8) void {
+    const n = @min(msg.len, last_err_buf.len);
+    @memcpy(last_err_buf[0..n], msg[0..n]);
+    last_err_len = n;
+}
+
+fn recordLibgitError() void {
+    last_err_len = 0;
+    const e = c.git_error_last();
+    if (e == null) return;
+    const m = e.*.message;
+    if (m == null) return;
+    recordError(std.mem.span(m));
+}
+
 fn check(rc: c_int) Error!void {
-    if (rc != 0) return Error.GitError;
+    if (rc != 0) {
+        recordLibgitError();
+        return Error.GitError;
+    }
+}
+
+/// Git-side commits an export would drop, captured when a branch update is not
+/// a fast-forward. Reported instead of being overwritten: history that git has
+/// and sdt does not is still history, and losing it silently is not an option.
+pub const AtRisk = struct {
+    branch_buf: [256]u8 = undefined,
+    branch_len: usize = 0,
+    ids: [8][40]u8 = undefined,
+    subject_bufs: [8][80]u8 = undefined,
+    subject_lens: [8]usize = [_]usize{0} ** 8,
+    shown: usize = 0,
+    total: usize = 0,
+
+    pub fn branch(self: *const AtRisk) []const u8 {
+        return self.branch_buf[0..self.branch_len];
+    }
+
+    pub fn id(self: *const AtRisk, i: usize) []const u8 {
+        return self.ids[i][0..];
+    }
+
+    pub fn subject(self: *const AtRisk, i: usize) []const u8 {
+        return self.subject_bufs[i][0..self.subject_lens[i]];
+    }
+};
+
+pub var at_risk: AtRisk = .{};
+
+fn recordAtRisk(repo: ?*c.git_repository, old: *const c.git_oid, new_tip: *const c.git_oid, branch: []const u8) void {
+    at_risk = .{};
+    const bn = @min(branch.len, at_risk.branch_buf.len);
+    @memcpy(at_risk.branch_buf[0..bn], branch[0..bn]);
+    at_risk.branch_len = bn;
+
+    var walk: ?*c.git_revwalk = null;
+    if (c.git_revwalk_new(&walk, repo) != 0) return;
+    defer c.git_revwalk_free(walk);
+    _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL);
+    if (c.git_revwalk_push(walk, old) != 0) return;
+    _ = c.git_revwalk_hide(walk, new_tip);
+
+    var woid: c.git_oid = undefined;
+    while (c.git_revwalk_next(&woid, walk) == 0) {
+        at_risk.total += 1;
+        const i = at_risk.shown;
+        if (i >= at_risk.ids.len) continue;
+        at_risk.ids[i] = gitOidHex(&woid);
+        var commit: ?*c.git_commit = null;
+        if (c.git_commit_lookup(&commit, repo, &woid) == 0) {
+            defer c.git_commit_free(commit);
+            const sm = c.git_commit_summary(commit);
+            if (sm != null) {
+                const text = std.mem.span(sm);
+                const n = @min(text.len, at_risk.subject_bufs[i].len);
+                @memcpy(at_risk.subject_bufs[i][0..n], text[0..n]);
+                at_risk.subject_lens[i] = n;
+            }
+        }
+        at_risk.shown += 1;
+    }
+}
+
+/// Refuse to move `ref_name` to `new_tip` when that would orphan commits: the
+/// update is allowed only when the current tip is an ancestor of the new one.
+fn guardFastForward(
+    repo: ?*c.git_repository,
+    ref_name: [*:0]const u8,
+    new_tip: *const c.git_oid,
+    branch: []const u8,
+) Error!void {
+    var old: c.git_oid = undefined;
+    if (c.git_reference_name_to_id(&old, repo, ref_name) != 0) return;
+    if (c.git_oid_equal(&old, new_tip) != 0) return;
+    if (c.git_graph_descendant_of(repo, new_tip, &old) == 1) return;
+    recordAtRisk(repo, &old, new_tip, branch);
+    recordError("the git branch has commits that superdetermine does not have");
+    return Error.NotFastForward;
 }
 
 const CredState = struct {
@@ -372,6 +477,13 @@ fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *con
 /// imported before it, reproducing the full ancestry as superdetermine changes.
 /// Returns the tip change Oid and updates the store's current branch ref.
 pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
+    return importRefTo(store, git_repo_path, null, null);
+}
+
+/// Import one git branch's full history into `store`. `git_ref` is a git branch
+/// shorthand (null means the repo's HEAD) and `dest_branch` is the sdt branch to
+/// point at the imported tip (null means the sdt HEAD branch).
+pub fn importRefTo(store: *Store, git_repo_path: []const u8, git_ref: ?[]const u8, dest_branch: ?[]const u8) !Oid {
     ensureInit();
     const alloc = store.alloc;
 
@@ -382,15 +494,27 @@ pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
     try check(c.git_repository_open(&repo, path_z.ptr));
     defer c.git_repository_free(repo);
 
-    var head_ref: ?*c.git_reference = null;
-    try check(c.git_repository_head(&head_ref, repo));
-    defer c.git_reference_free(head_ref);
-
-    var commit_obj: ?*c.git_object = null;
-    try check(c.git_reference_peel(&commit_obj, head_ref, c.GIT_OBJECT_COMMIT));
-    defer c.git_object_free(commit_obj);
     var head_oid: c.git_oid = undefined;
-    _ = c.git_oid_cpy(&head_oid, c.git_object_id(commit_obj));
+    if (git_ref) |r| {
+        var ref_buf: [512]u8 = undefined;
+        const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{r});
+        var obj: ?*c.git_object = null;
+        try check(c.git_revparse_single(&obj, repo, ref_name.ptr));
+        defer c.git_object_free(obj);
+        var peeled: ?*c.git_object = null;
+        try check(c.git_object_peel(&peeled, obj, c.GIT_OBJECT_COMMIT));
+        defer c.git_object_free(peeled);
+        _ = c.git_oid_cpy(&head_oid, c.git_object_id(peeled));
+    } else {
+        var head_ref: ?*c.git_reference = null;
+        try check(c.git_repository_head(&head_ref, repo));
+        defer c.git_reference_free(head_ref);
+
+        var commit_obj: ?*c.git_object = null;
+        try check(c.git_reference_peel(&commit_obj, head_ref, c.GIT_OBJECT_COMMIT));
+        defer c.git_object_free(commit_obj);
+        _ = c.git_oid_cpy(&head_oid, c.git_object_id(commit_obj));
+    }
 
     var map = try Gitmap.load(store);
     defer map.deinit();
@@ -416,8 +540,9 @@ pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
 
     try map.save(store);
 
-    const branch = try store.headBranch();
-    defer alloc.free(branch);
+    const head_branch = try store.headBranch();
+    defer alloc.free(head_branch);
+    const branch = if (dest_branch) |b| b else head_branch;
     try store.updateRef(branch, tip);
 
     return tip;
@@ -796,6 +921,12 @@ pub fn exportHead(store: *Store, dest_git_repo_path: []const u8) !void {
 /// If the target branch already exists, the gr root(s) are grafted onto its tip
 /// so the update fast-forwards rather than replacing existing history.
 pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8) !void {
+    try exportHeadToForced(store, dest_git_repo_path, git_branch, false);
+}
+
+/// As `exportHeadTo`, but `force` opts out of the fast-forward guard, which is
+/// how the caller says "yes, drop the git-side commits I was just shown".
+pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
     ensureInit();
     const alloc = store.alloc;
 
@@ -842,6 +973,8 @@ pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?
     defer if (session) |*s| s.deinit();
 
     const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null, if (session) |*s| s else null);
+
+    if (!force) try guardFastForward(repo, ref_name.ptr, &tip_git, target);
 
     var newref: ?*c.git_reference = null;
     try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
@@ -892,6 +1025,7 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
             const have_graft = c.git_reference_name_to_id(&graft_oid, repo, ref_name.ptr) == 0;
 
             const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null, if (session) |*s| s else null);
+            try guardFastForward(repo, ref_name.ptr, &tip_git, bname);
             var newref: ?*c.git_reference = null;
             try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
             c.git_reference_free(newref);
@@ -1008,10 +1142,16 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
     var commit_oid: c.git_oid = undefined;
     if (parent_commit) |pc| {
         var parents = [_]?*const c.git_commit{pc};
-        try check(c.git_commit_create(&commit_oid, repo, ref_name.ptr, sig, sig, null, msg_z.ptr, git_tree, 1, &parents));
+        try check(c.git_commit_create(&commit_oid, repo, null, sig, sig, null, msg_z.ptr, git_tree, 1, &parents));
     } else {
-        try check(c.git_commit_create(&commit_oid, repo, ref_name.ptr, sig, sig, null, msg_z.ptr, git_tree, 0, null));
+        try check(c.git_commit_create(&commit_oid, repo, null, sig, sig, null, msg_z.ptr, git_tree, 0, null));
     }
+
+    try guardFastForward(repo, ref_name.ptr, &commit_oid, target);
+
+    var newref: ?*c.git_reference = null;
+    try check(c.git_reference_create(&newref, repo, ref_name.ptr, &commit_oid, 1, null));
+    c.git_reference_free(newref);
 
     try check(c.git_repository_set_head(repo, ref_name.ptr));
 }
@@ -1225,14 +1365,41 @@ pub fn pushColocated(store: *Store, work_dir_path: []const u8, remote_url: []con
 /// heads into the managed `.sdt/gitmirror` repo, points its HEAD at the current
 /// branch, then imports that HEAD so the superdetermine ref updates.
 pub fn pullRemote(store: *Store, remote_url: []const u8) !void {
+    var f = try fetchRemote(store, remote_url, null, null);
+    f.deinit(store.alloc);
+}
+
+/// What a fetch brought back: the imported tip and the remote branch it came
+/// from. `branch` is heap-allocated.
+pub const Fetched = struct {
+    tip: Oid,
+    branch: []u8,
+
+    pub fn deinit(self: *Fetched, alloc: std.mem.Allocator) void {
+        alloc.free(self.branch);
+    }
+};
+
+/// Fetch every branch of `remote_url` into the managed `.sdt/gitmirror`, then
+/// import one of them into `store`. `branch_opt` names the wanted remote branch;
+/// with none, the sdt HEAD branch is preferred, then `main`/`master`, then the
+/// only branch there is. `dest_branch` is the sdt ref that ends up at the
+/// imported tip (null means the sdt HEAD branch), so a caller can land the
+/// remote history beside its own instead of on top of it.
+pub fn fetchRemote(
+    store: *Store,
+    remote_url: []const u8,
+    branch_opt: ?[]const u8,
+    dest_branch: ?[]const u8,
+) !Fetched {
     ensureInit();
     const alloc = store.alloc;
 
     const mirror_abs = try mirrorRepoPath(store);
     defer alloc.free(mirror_abs);
 
-    const branch = try store.headBranch();
-    defer alloc.free(branch);
+    const head_branch = try store.headBranch();
+    defer alloc.free(head_branch);
 
     var repo: ?*c.git_repository = null;
     try check(c.git_repository_open(&repo, mirror_abs.ptr));
@@ -1257,11 +1424,82 @@ pub fn pullRemote(store: *Store, remote_url: []const u8) !void {
 
     try check(c.git_remote_fetch(remote, &strarr, &opts, null));
 
-    var ref_buf: [512]u8 = undefined;
-    const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{branch});
-    try check(c.git_repository_set_head(repo, ref_name.ptr));
+    const chosen = (try pickFetchedBranch(store, repo, branch_opt, head_branch)) orelse {
+        return Error.GitError;
+    };
+    errdefer alloc.free(chosen);
 
-    _ = try importHead(store, mirror_abs);
+    const tip = try importRefTo(store, mirror_abs, chosen, dest_branch);
+    return .{ .tip = tip, .branch = chosen };
+}
+
+/// Which branch in the mirror the pull should land. Records a message naming
+/// what the remote actually has when nothing matches, so the caller can say so.
+fn pickFetchedBranch(
+    store: *Store,
+    repo: ?*c.git_repository,
+    branch_opt: ?[]const u8,
+    head_branch: []const u8,
+) !?[]u8 {
+    const alloc = store.alloc;
+
+    var names: c.git_strarray = undefined;
+    var have_names = false;
+    if (c.git_reference_list(&names, repo) == 0) have_names = true;
+    defer if (have_names) c.git_strarray_dispose(&names);
+
+    var local: std.ArrayList([]const u8) = .empty;
+    defer local.deinit(alloc);
+    if (have_names) {
+        var i: usize = 0;
+        while (i < names.count) : (i += 1) {
+            const n = std.mem.span(names.strings[i]);
+            if (!std.mem.startsWith(u8, n, "refs/heads/")) continue;
+            try local.append(alloc, n["refs/heads/".len..]);
+        }
+    }
+
+    const explicit = branch_opt != null;
+    var wanted: [3][]const u8 = undefined;
+    var nw: usize = 0;
+    if (branch_opt) |b| {
+        wanted[nw] = b;
+        nw += 1;
+    } else {
+        wanted[nw] = head_branch;
+        nw += 1;
+        wanted[nw] = "main";
+        nw += 1;
+        wanted[nw] = "master";
+        nw += 1;
+    }
+    for (wanted[0..nw]) |cand| {
+        for (local.items) |have| {
+            if (std.mem.eql(u8, have, cand)) return try alloc.dupe(u8, cand);
+        }
+    }
+    if (!explicit and local.items.len == 1) return try alloc.dupe(u8, local.items[0]);
+
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(alloc);
+    if (explicit) {
+        try msg.appendSlice(alloc, "the remote has no branch '");
+        try msg.appendSlice(alloc, branch_opt.?);
+        try msg.appendSlice(alloc, "'");
+    } else {
+        try msg.appendSlice(alloc, "cannot tell which remote branch to pull");
+    }
+    if (local.items.len == 0) {
+        try msg.appendSlice(alloc, "; it has no branches at all");
+    } else {
+        try msg.appendSlice(alloc, "; it has: ");
+        for (local.items, 0..) |b, i| {
+            if (i != 0) try msg.appendSlice(alloc, ", ");
+            try msg.appendSlice(alloc, b);
+        }
+    }
+    recordError(msg.items);
+    return null;
 }
 
 /// Push superdetermine HEAD. If `target` looks like a URL/remote (contains "://",
@@ -1289,12 +1527,56 @@ pub fn syncColocated(store: *Store, work_dir_path: []const u8) !void {
 /// git branch need not share a name: `init.defaultBranch = main` with a git repo
 /// on `master` is the common case, and the sdt history lands on `master` there.
 pub fn syncColocatedTo(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8) !void {
-    try exportHeadTo(store, work_dir_path, git_branch);
+    try syncColocatedForced(store, work_dir_path, git_branch, false);
+}
+
+pub fn syncColocatedForced(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
+    try exportHeadToForced(store, work_dir_path, git_branch, force);
     // gr wrote the commit straight to the branch ref, which leaves git's index
     // stale relative to the new HEAD (so `git status`/`git diff` show garbage).
     // Reset the index (MIXED: HEAD + index, working tree untouched) so git stays
     // consistent and `git status` shows exactly what changed since the sdt save.
     resetIndexToHead(store, work_dir_path) catch {};
+}
+
+/// What a git revision string meant to superdetermine. `missing` covers both
+/// "no colocated git repo" and "git does not know that revision"; `unmapped`
+/// means git resolved it but sdt has never imported that commit.
+pub const RefLookup = union(enum) {
+    missing,
+    unmapped: [40]u8,
+    mapped: Oid,
+};
+
+/// Resolve a git revision (`origin/master`, `HEAD~3`, a git sha) in the repo at
+/// `work_dir_path` and translate it into the sdt change it was imported as.
+pub fn lookupGitRef(store: *Store, work_dir_path: []const u8, spec: []const u8) RefLookup {
+    ensureInit();
+    const alloc = store.alloc;
+
+    const path_z = alloc.dupeZ(u8, work_dir_path) catch return .missing;
+    defer alloc.free(path_z);
+    const spec_z = alloc.dupeZ(u8, spec) catch return .missing;
+    defer alloc.free(spec_z);
+
+    var repo: ?*c.git_repository = null;
+    if (c.git_repository_open(&repo, path_z.ptr) != 0) return .missing;
+    defer c.git_repository_free(repo);
+
+    var obj: ?*c.git_object = null;
+    if (c.git_revparse_single(&obj, repo, spec_z.ptr) != 0) return .missing;
+    defer c.git_object_free(obj);
+
+    var commit: ?*c.git_object = null;
+    if (c.git_object_peel(&commit, obj, c.GIT_OBJECT_COMMIT) != 0) return .missing;
+    defer c.git_object_free(commit);
+
+    const hex = gitOidHex(c.git_object_id(commit));
+
+    var map = Gitmap.load(store) catch return .{ .unmapped = hex };
+    defer map.deinit();
+    if (map.lookupGr(hex[0..])) |gr| return .{ .mapped = gr };
+    return .{ .unmapped = hex };
 }
 
 /// Hex id of `branch`'s tip in the git repo at `work_dir_path`, or null when the
@@ -2253,5 +2535,280 @@ test "import leaves a pointer alone when the object cannot be resolved" {
         const content = try store.readFileContent(e.blob);
         defer alloc.free(content);
         try testing.expect(lfs.parsePointer(content) != null);
+    }
+}
+
+test "syncColocatedTo refuses to drop git-side commits" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "gitrepo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitrepo", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try exportHeadTo(&store, abs, "master");
+
+    var mirrored: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&mirrored, repo, "refs/heads/master"));
+
+    // Git moves on by itself, exactly as a `git merge origin/master` would.
+    const git_side = try commitOnto(repo, "refs/heads/master", "merged.txt", "from git\n", "merge from the remote\n", &mirrored, 1_700_000_100);
+
+    try testing.expectError(Error.NotFastForward, syncColocatedTo(&store, abs, "master"));
+
+    var after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&after, repo, "refs/heads/master"));
+    try testing.expect(c.git_oid_cmp(&after, &git_side) == 0);
+
+    try testing.expectEqual(@as(usize, 1), at_risk.total);
+    try testing.expectEqual(@as(usize, 1), at_risk.shown);
+    try testing.expectEqualStrings("master", at_risk.branch());
+    try testing.expectEqualStrings(&gitOidHex(&git_side), at_risk.id(0));
+    try testing.expectEqualStrings("merge from the remote", at_risk.subject(0));
+    try testing.expect(lastError().len != 0);
+}
+
+test "syncColocatedForced drops git-side commits only when asked" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "gitrepo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitrepo", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try exportHeadTo(&store, abs, "master");
+    var mirrored: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&mirrored, repo, "refs/heads/master"));
+    const git_side = try commitOnto(repo, "refs/heads/master", "merged.txt", "from git\n", "merge from the remote\n", &mirrored, 1_700_000_100);
+
+    try syncColocatedForced(&store, abs, "master", true);
+
+    var after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&after, repo, "refs/heads/master"));
+    try testing.expect(c.git_oid_cmp(&after, &git_side) != 0);
+    try testing.expect(c.git_oid_cmp(&after, &mirrored) == 0);
+}
+
+test "pushRemote refuses when the mirror would drop fetched remote commits" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "bare");
+    const bare_abs = try tmp.dir.realPathFileAlloc(io, "bare", alloc);
+    defer alloc.free(bare_abs);
+    const bare_z = try alloc.dupeZ(u8, bare_abs);
+    defer alloc.free(bare_z);
+    var bare_repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&bare_repo, bare_z.ptr, 1));
+    defer c.git_repository_free(bare_repo);
+
+    const url = try std.fmt.allocPrint(alloc, "file://{s}", .{bare_abs});
+    defer alloc.free(url);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try pushRemote(&store, url, "master");
+
+    var pushed: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&pushed, bare_repo, "refs/heads/master"));
+
+    // Someone else lands a commit on the remote between the two pushes.
+    const theirs = try commitOnto(bare_repo, "refs/heads/master", "theirs.txt", "theirs\n", "their work\n", &pushed, 1_700_000_200);
+
+    try pushRemote(&store, url, "master");
+
+    var after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&after, bare_repo, "refs/heads/master"));
+    var commit: ?*c.git_commit = null;
+    try check(c.git_commit_lookup(&commit, bare_repo, &after));
+    defer c.git_commit_free(commit);
+    try testing.expectEqual(@as(c_uint, 1), c.git_commit_parentcount(commit));
+    try testing.expect(c.git_oid_cmp(c.git_commit_parent_id(commit, 0), &theirs) == 0);
+}
+
+test "fetchRemote picks a differently named remote branch" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "bare");
+    const bare_abs = try tmp.dir.realPathFileAlloc(io, "bare", alloc);
+    defer alloc.free(bare_abs);
+    const bare_z = try alloc.dupeZ(u8, bare_abs);
+    defer alloc.free(bare_z);
+    var bare_repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&bare_repo, bare_z.ptr, 1));
+    defer c.git_repository_free(bare_repo);
+    _ = try commitInitialMaster(bare_repo, "seed.txt", "seed\n");
+
+    const url = try std.fmt.allocPrint(alloc, "file://{s}", .{bare_abs});
+    defer alloc.free(url);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    try testing.expectEqualStrings("main", branch);
+
+    var fetched = try fetchRemote(&store, url, null, "sdt-remote");
+    defer fetched.deinit(alloc);
+    try testing.expectEqualStrings("master", fetched.branch);
+    try testing.expect(store.refExists("sdt-remote"));
+    try testing.expect(!store.refExists("main"));
+}
+
+test "fetchRemote names the branches the remote actually has" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "bare");
+    const bare_abs = try tmp.dir.realPathFileAlloc(io, "bare", alloc);
+    defer alloc.free(bare_abs);
+    const bare_z = try alloc.dupeZ(u8, bare_abs);
+    defer alloc.free(bare_z);
+    var bare_repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&bare_repo, bare_z.ptr, 1));
+    defer c.git_repository_free(bare_repo);
+    _ = try commitInitialMaster(bare_repo, "seed.txt", "seed\n");
+
+    const url = try std.fmt.allocPrint(alloc, "file://{s}", .{bare_abs});
+    defer alloc.free(url);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    recordError("");
+    try testing.expectError(Error.GitError, fetchRemote(&store, url, "nope", null));
+    const msg = lastError();
+    try testing.expect(std.mem.indexOf(u8, msg, "nope") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "master") != null);
+}
+
+test "fetchRemote surfaces the real error for an unreachable remote" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const missing = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(missing);
+    const url = try std.fmt.allocPrint(alloc, "file://{s}/no-such-repo", .{missing});
+    defer alloc.free(url);
+
+    recordError("");
+    try testing.expectError(Error.GitError, fetchRemote(&store, url, null, null));
+    try testing.expect(lastError().len != 0);
+}
+
+test "lookupGitRef translates a git revision into an sdt change" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "gitrepo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitrepo", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try exportHeadTo(&store, abs, "master");
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const tip = try store.readRef(branch);
+
+    switch (lookupGitRef(&store, abs, "master")) {
+        .mapped => |o| try testing.expect(o.eql(tip)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A commit git has but sdt never imported is reported as such, not as a
+    // missing ref.
+    var master_tip: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&master_tip, repo, "refs/heads/master"));
+    _ = try commitOnto(repo, "refs/heads/other", "extra.txt", "extra\n", "git only\n", &master_tip, 1_700_000_300);
+    switch (lookupGitRef(&store, abs, "other")) {
+        .unmapped => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (lookupGitRef(&store, abs, "no-such-ref")) {
+        .missing => {},
+        else => return error.TestUnexpectedResult,
     }
 }

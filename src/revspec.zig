@@ -283,6 +283,12 @@ pub fn matches(ctx: Context, spec: []const u8, out: *std.ArrayList(Match)) !void
     }
 }
 
+/// Resolve a change that some other addressing scheme already identified (a git
+/// ref translated through the gitmap, say). The caller owns the result.
+pub fn resolveChangeOid(ctx: Context, o: Oid) !Resolved {
+    return resolveChange(ctx, o, 0);
+}
+
 /// Resolve a revspec against captured history. The caller owns the result and
 /// must call `Resolved.deinit`.
 pub fn resolve(ctx: Context, spec: []const u8) !Resolved {
