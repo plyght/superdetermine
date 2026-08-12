@@ -169,7 +169,7 @@ fn oidEqOpt(a: ?Oid, b: ?Oid) bool {
 
 /// Resolve one path across base/ours/theirs. Returns the chosen blob Oid, or
 /// null when the path should be absent (deleted) in the merged tree.
-fn resolvePath(
+pub fn resolvePath(
     store: *Store,
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -574,6 +574,10 @@ pub fn abort(store: *Store, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !voi
 // --- tests ---
 
 const testing = std.testing;
+
+test {
+    _ = @import("replay.zig");
+}
 
 fn commitTree(store: *Store, tree: Oid, parents: []const Oid, msg: []const u8) !Oid {
     const change = object.Change{

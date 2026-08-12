@@ -120,8 +120,8 @@ const sections = [_]Section{
     .{ .title = "git, side by side", .entries = &.{
         .{ .name = "clone", .alias = "cl", .args = "<src> [dir]", .desc = "a git repo, a share URL, or a bundle" },
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
-        .{ .name = "export", .args = "<repo>", .desc = "write superdetermine HEAD out as git commits" },
-        .{ .name = "sync", .args = "<dir>", .desc = "mirror HEAD into the colocated .git" },
+        .{ .name = "export", .args = "<repo> [--force]", .desc = "write superdetermine HEAD out as git commits" },
+        .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
         .{ .name = "push", .alias = "ps", .args = "[remote] [branch]", .desc = "uses your existing git credentials" },
         .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
@@ -2291,13 +2291,28 @@ fn cmdRedo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 const GitOp = enum { import, export_, sync };
 
 fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8, op: GitOp) !void {
-    if (rest.len < 1) {
-        try w.writeAll("usage: sdt <import|export|sync> <path>\n");
+    var force = false;
+    var target_opt: ?[]const u8 = null;
+    for (rest) |a| {
+        if (eq(a, "-f") or eq(a, "--force")) {
+            force = true;
+        } else if (a.len != 0 and a[0] == '-') {
+            try w.print("unknown option '{s}'\n", .{a});
+            return;
+        } else if (target_opt == null) {
+            target_opt = a;
+        }
+    }
+    const target = target_opt orelse {
+        try w.writeAll("usage: sdt <import|export|sync> <path> [--force]\n");
+        return;
+    };
+    if (force and op == .import) {
+        try w.writeAll("--force applies to export and sync, not import\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
-    const target = rest[0];
 
     switch (op) {
         .import => {
@@ -2325,7 +2340,7 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
                 try ui.hint(w, "`sdt super` lists them; `sdt collapse <path> <A|B>` picks one");
                 return;
             }
-            git.exportAll(&s, target) catch |e| {
+            git.exportAllForced(&s, target, force) catch |e| {
                 if (e == git.Error.NotFastForward) {
                     try reportNotFastForward(w, git.at_risk.branch());
                     return;
@@ -2334,10 +2349,14 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
                 try reportGitError(w);
                 return;
             };
-            try w.print("exported superdetermine (full history, all branches + tags) to git at {s}\n", .{target});
+            if (force) {
+                try w.print("exported superdetermine (full history, all branches + tags) to git at {s}, replacing what was there\n", .{target});
+            } else {
+                try w.print("exported superdetermine (full history, all branches + tags) to git at {s}\n", .{target});
+            }
         },
         .sync => {
-            git.syncColocated(&s, target) catch |e| {
+            git.syncColocatedForced(&s, target, null, force) catch |e| {
                 if (e == git.Error.NotFastForward) {
                     try reportNotFastForward(w, git.at_risk.branch());
                     return;
@@ -2346,7 +2365,11 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
                 try reportGitError(w);
                 return;
             };
-            try w.print("synced superdetermine HEAD into .git at {s}\n", .{target});
+            if (force) {
+                try w.print("synced superdetermine HEAD into .git at {s}, replacing what was there\n", .{target});
+            } else {
+                try w.print("synced superdetermine HEAD into .git at {s}\n", .{target});
+            }
         },
     }
 }

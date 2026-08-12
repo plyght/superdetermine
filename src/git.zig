@@ -983,7 +983,7 @@ pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_bra
     var session = lfsSessionFor(store, repo, null);
     defer if (session) |*s| s.deinit();
 
-    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null, if (session) |*s| s else null);
+    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null);
 
     if (!force) try guardFastForward(repo, ref_name.ptr, &tip_git, target);
 
@@ -998,6 +998,10 @@ pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_bra
 /// Export ALL gr branches and tags (each with full history) into `dest`. Into a
 /// fresh/empty git repo this reproduces the whole project graph.
 pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
+    try exportAllForced(store, dest_git_repo_path, false);
+}
+
+pub fn exportAllForced(store: *Store, dest_git_repo_path: []const u8, force: bool) !void {
     ensureInit();
     const alloc = store.alloc;
 
@@ -1035,8 +1039,8 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
             var graft_oid: c.git_oid = undefined;
             const have_graft = c.git_reference_name_to_id(&graft_oid, repo, ref_name.ptr) == 0;
 
-            const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft) &graft_oid else null, if (session) |*s| s else null);
-            try guardFastForward(repo, ref_name.ptr, &tip_git, bname);
+            const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null);
+            if (!force) try guardFastForward(repo, ref_name.ptr, &tip_git, bname);
             var newref: ?*c.git_reference = null;
             try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
             c.git_reference_free(newref);
@@ -2630,6 +2634,76 @@ test "syncColocatedForced drops git-side commits only when asked" {
     try check(c.git_reference_name_to_id(&after, repo, "refs/heads/master"));
     try testing.expect(c.git_oid_cmp(&after, &git_side) != 0);
     try testing.expect(c.git_oid_cmp(&after, &mirrored) == 0);
+}
+
+fn countCommitsFrom(repo: ?*c.git_repository, ref_name: [*:0]const u8) !usize {
+    var tip: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&tip, repo, ref_name));
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, repo));
+    defer c.git_revwalk_free(walk);
+    try check(c.git_revwalk_push(walk, &tip));
+    var n: usize = 0;
+    var cur: c.git_oid = undefined;
+    while (c.git_revwalk_next(&cur, walk) == 0) n += 1;
+    return n;
+}
+
+test "forced sync replaces a rewritten chain instead of grafting it" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "gitrepo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitrepo", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try exportHeadTo(&store, abs, "master");
+    try testing.expectEqual(@as(usize, 1), try countCommitsFrom(repo, "refs/heads/master"));
+
+    const blob = try store.writeFileContent("rewritten\n");
+    const entries = [_]object.TreeEntry{.{ .mode = .regular, .path = "root.txt", .blob = blob }};
+    var sorted = entries;
+    std.mem.sort(object.TreeEntry, &sorted, {}, object.Tree.lessThan);
+    const tree_oid = try store.writeTree(.{ .entries = &sorted });
+    const rewritten = object.Change{
+        .tree = tree_oid,
+        .parents = &[_]Oid{},
+        .change_id = [_]u8{9} ** 16,
+        .timestamp = 1_700_000_500,
+        .tz_offset_min = 0,
+        .author = "Remote <remote@example.com>",
+        .message = "rewritten root\n",
+    };
+    const rewritten_oid = try store.writeChange(rewritten);
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    try store.updateRef(branch, rewritten_oid);
+
+    try syncColocatedForced(&store, abs, "master", true);
+    try testing.expectEqual(@as(usize, 1), try countCommitsFrom(repo, "refs/heads/master"));
+
+    var after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&after, repo, "refs/heads/master"));
+    var commit: ?*c.git_commit = null;
+    try check(c.git_commit_lookup(&commit, repo, &after));
+    defer c.git_commit_free(commit);
+    try testing.expectEqual(@as(c_uint, 0), c.git_commit_parentcount(commit));
 }
 
 test "pushRemote refuses when the mirror would drop fetched remote commits" {
