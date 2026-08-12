@@ -284,7 +284,7 @@ const Gitmap = struct {
             const gr = Oid.fromHex(rhex) catch continue;
             var goid: c.git_oid = undefined;
             if (c.git_oid_fromstrn(&goid, ghex.ptr, 40) != 0) continue;
-            try self.insert(ghex, goid, gr);
+            try self.insertLatest(ghex, goid, gr);
         }
         return self;
     }
@@ -304,6 +304,21 @@ const Gitmap = struct {
         }
     }
 
+    fn insertLatest(self: *Gitmap, git_hex: []const u8, git_oid: c.git_oid, gr: Oid) !void {
+        try self.insert(git_hex, git_oid, gr);
+        var rbuf: [64]u8 = undefined;
+        const rhex = gr.toHex(&rbuf);
+        if (self.gr_to_git.getPtr(rhex)) |slot| slot.* = git_oid;
+    }
+
+    fn isCanonical(self: *Gitmap, git_hex: []const u8, gr: Oid) bool {
+        var rbuf: [64]u8 = undefined;
+        const rhex = gr.toHex(&rbuf);
+        const mapped = self.gr_to_git.get(rhex) orelse return false;
+        const mhex = gitOidHex(&mapped);
+        return std.mem.eql(u8, &mhex, git_hex);
+    }
+
     fn lookupGr(self: *Gitmap, git_hex: []const u8) ?Oid {
         return self.git_to_gr.get(git_hex);
     }
@@ -317,14 +332,18 @@ const Gitmap = struct {
     fn save(self: *Gitmap, store: *Store) !void {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.alloc);
-        var it = self.git_to_gr.iterator();
-        while (it.next()) |kv| {
-            var rb: [64]u8 = undefined;
-            const rhex = kv.value_ptr.toHex(&rb);
-            try buf.appendSlice(self.alloc, kv.key_ptr.*);
-            try buf.append(self.alloc, ' ');
-            try buf.appendSlice(self.alloc, rhex);
-            try buf.append(self.alloc, '\n');
+        var pass: usize = 0;
+        while (pass < 2) : (pass += 1) {
+            var it = self.git_to_gr.iterator();
+            while (it.next()) |kv| {
+                if (self.isCanonical(kv.key_ptr.*, kv.value_ptr.*) != (pass == 1)) continue;
+                var rb: [64]u8 = undefined;
+                const rhex = kv.value_ptr.toHex(&rb);
+                try buf.appendSlice(self.alloc, kv.key_ptr.*);
+                try buf.append(self.alloc, ' ');
+                try buf.appendSlice(self.alloc, rhex);
+                try buf.append(self.alloc, '\n');
+            }
         }
         try store.root.writeFile(store.io, .{ .sub_path = "gitmap", .data = buf.items });
     }
@@ -837,12 +856,14 @@ fn collectChain(store: *Store, o: Oid, out: *std.ArrayList(Oid), seen: *std.Stri
 /// Reuses the mapped git commit if it still exists in `repo`. Root changes (no
 /// gr parents) chain onto `graft` if provided (used to fast-forward onto an
 /// existing branch tip). Returns the git commit id and records it in the map.
-fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session) !c.git_oid {
-    if (map.lookupGit(gr)) |existing| {
-        var commit: ?*c.git_commit = null;
-        if (c.git_commit_lookup(&commit, repo, &existing) == 0) {
-            c.git_commit_free(commit);
-            return existing;
+fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session, fresh: bool) !c.git_oid {
+    if (!fresh) {
+        if (map.lookupGit(gr)) |existing| {
+            var commit: ?*c.git_commit = null;
+            if (c.git_commit_lookup(&commit, repo, &existing) == 0) {
+                c.git_commit_free(commit);
+                return existing;
+            }
         }
     }
 
@@ -894,13 +915,13 @@ fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, 
         try check(c.git_commit_create(&commit_oid, repo, null, sig, sig, null, msg_z.ptr, git_tree, @intCast(pn), parent_commits.items.ptr));
     }
     const ghex = gitOidHex(&commit_oid);
-    try map.insert(&ghex, commit_oid, gr);
+    if (fresh) try map.insertLatest(&ghex, commit_oid, gr) else try map.insert(&ghex, commit_oid, gr);
     return commit_oid;
 }
 
 /// Export the full history reachable from `tip` into `repo`, oldest-first.
 /// Returns the git commit id of the tip.
-fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session) !c.git_oid {
+fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session, fresh: bool) !c.git_oid {
     const alloc = store.alloc;
     var out: std.ArrayList(Oid) = .empty;
     defer out.deinit(alloc);
@@ -912,7 +933,7 @@ fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, 
     }
     try collectChain(store, tip, &out, &seen, alloc);
     var last: c.git_oid = undefined;
-    for (out.items) |o| last = try exportChange(store, repo, map, o, graft, sess);
+    for (out.items) |o| last = try exportChange(store, repo, map, o, graft, sess, fresh);
     return last;
 }
 
@@ -930,13 +951,17 @@ pub fn exportHead(store: *Store, dest_git_repo_path: []const u8) !void {
 ///     is used (e.g. "master") so a colocated repo updates its own branch;
 ///   - else it falls back to the superdetermine branch name.
 /// If the target branch already exists, the gr root(s) are grafted onto its tip
-/// so the update fast-forwards rather than replacing existing history.
+/// so the update fast-forwards rather than replacing existing history (unforced
+/// exports only; see `exportHeadToForced`).
 pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8) !void {
     try exportHeadToForced(store, dest_git_repo_path, git_branch, false);
 }
 
-/// As `exportHeadTo`, but `force` opts out of the fast-forward guard, which is
-/// how the caller says "yes, drop the git-side commits I was just shown".
+/// As `exportHeadTo`, but `force` opts out of the fast-forward guard and of the
+/// graft, and rebuilds the chain's commits from sdt truth instead of reusing the
+/// gitmap's existing ones, so a chain that was previously exported grafted is
+/// repaired rather than replayed. It is how the caller says "yes, drop the
+/// git-side commits I was just shown".
 pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
     ensureInit();
     const alloc = store.alloc;
@@ -983,7 +1008,7 @@ pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_bra
     var session = lfsSessionFor(store, repo, null);
     defer if (session) |*s| s.deinit();
 
-    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null);
+    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null, force);
 
     if (!force) try guardFastForward(repo, ref_name.ptr, &tip_git, target);
 
@@ -1039,7 +1064,7 @@ pub fn exportAllForced(store: *Store, dest_git_repo_path: []const u8, force: boo
             var graft_oid: c.git_oid = undefined;
             const have_graft = c.git_reference_name_to_id(&graft_oid, repo, ref_name.ptr) == 0;
 
-            const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null);
+            const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null, force);
             if (!force) try guardFastForward(repo, ref_name.ptr, &tip_git, bname);
             var newref: ?*c.git_reference = null;
             try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
@@ -2704,6 +2729,103 @@ test "forced sync replaces a rewritten chain instead of grafting it" {
     try check(c.git_commit_lookup(&commit, repo, &after));
     defer c.git_commit_free(commit);
     try testing.expectEqual(@as(c_uint, 0), c.git_commit_parentcount(commit));
+}
+
+fn writeChangeWith(
+    store: *Store,
+    parents: []const Oid,
+    path: []const u8,
+    content: []const u8,
+    msg: []const u8,
+    id: u8,
+    ts: i64,
+) !Oid {
+    const blob = try store.writeFileContent(content);
+    const entries = [_]object.TreeEntry{.{ .mode = .regular, .path = path, .blob = blob }};
+    var sorted = entries;
+    std.mem.sort(object.TreeEntry, &sorted, {}, object.Tree.lessThan);
+    const tree_oid = try store.writeTree(.{ .entries = &sorted });
+    return store.writeChange(.{
+        .tree = tree_oid,
+        .parents = parents,
+        .change_id = [_]u8{id} ** 16,
+        .timestamp = ts,
+        .tz_offset_min = 0,
+        .author = "Remote <remote@example.com>",
+        .message = msg,
+    });
+}
+
+test "forced export repairs a chain that was already exported grafted" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "gitrepo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitrepo", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+
+    const c1 = try store.readRef(branch);
+    const c2 = try writeChangeWith(&store, &[_]Oid{c1}, "second.txt", "second\n", "second\n", 8, 1_700_000_100);
+    try store.updateRef(branch, c2);
+
+    try exportHeadTo(&store, abs, "master");
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/master"));
+    const old_tip = branchTipHex(&store, abs, "master").?;
+
+    const r1 = try writeChangeWith(&store, &[_]Oid{}, "root.txt", "rewritten\n", "rewritten root\n", 9, 1_700_000_500);
+    const r2 = try writeChangeWith(&store, &[_]Oid{r1}, "second.txt", "rewritten second\n", "rewritten second\n", 10, 1_700_000_600);
+    try store.updateRef(branch, r2);
+
+    try exportHeadTo(&store, abs, "master");
+    try testing.expectEqual(@as(usize, 4), try countCommitsFrom(repo, "refs/heads/master"));
+
+    try exportHeadToForced(&store, abs, "master", true);
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/master"));
+
+    var tip_oid: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&tip_oid, repo, "refs/heads/master"));
+    var tip_commit: ?*c.git_commit = null;
+    try check(c.git_commit_lookup(&tip_commit, repo, &tip_oid));
+    defer c.git_commit_free(tip_commit);
+    try testing.expectEqual(@as(c_uint, 1), c.git_commit_parentcount(tip_commit));
+    var root_commit: ?*c.git_commit = null;
+    try check(c.git_commit_parent(&root_commit, tip_commit, 0));
+    defer c.git_commit_free(root_commit);
+    try testing.expectEqual(@as(c_uint, 0), c.git_commit_parentcount(root_commit));
+
+    switch (lookupGitRef(&store, abs, "master")) {
+        .mapped => |o| try testing.expect(o.eql(r2)),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (lookupGitRef(&store, abs, old_tip[0..])) {
+        .mapped => |o| try testing.expect(o.eql(c2)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try exportHeadTo(&store, abs, "master");
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/master"));
+    var again: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&again, repo, "refs/heads/master"));
+    try testing.expect(c.git_oid_cmp(&again, &tip_oid) == 0);
 }
 
 test "pushRemote refuses when the mirror would drop fetched remote commits" {

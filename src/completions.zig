@@ -45,6 +45,15 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a work -d 'instant copy-on-write worktree'
     \\complete -c sdt -n __fish_use_subcommand -a restore -d 'discard local edits to one file'
     \\complete -c sdt -n __fish_use_subcommand -a merge -d 'merge another branch into this one'
+    \\complete -c sdt -n __fish_use_subcommand -a absorb -d 'fold edits into the changes they belong to'
+    \\complete -c sdt -n __fish_use_subcommand -a point -d "move this branch's tip to any ref"
+    \\complete -c sdt -n __fish_use_subcommand -a rebase -d 'replay this branch onto a new base'
+    \\complete -c sdt -n __fish_use_subcommand -a squash -d 'collapse adjacent changes into one'
+    \\complete -c sdt -n __fish_use_subcommand -a split -d 'split one change in two, by path'
+    \\complete -c sdt -n __fish_use_subcommand -a reorder -d 'reorder the last changes, 1 = oldest'
+    \\complete -c sdt -n '__fish_seen_subcommand_from squash sq' -s m -d 'message for the collapsed change' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from squash sq' -l at -d 'end the span at this ref' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from split spl' -s m -d 'message for the extracted change' -r
     \\complete -c sdt -n __fish_use_subcommand -a provenance -d 'show which agent/prompt produced each change'
     \\complete -c sdt -n __fish_use_subcommand -a why -d 'who last authored a file'
     \\complete -c sdt -n __fish_use_subcommand -a undo -d 'revert the last change-making operation'
@@ -117,6 +126,12 @@ const zsh_script =
     \\    'work:instant copy-on-write worktree'
     \\    'restore:discard local edits to one file'
     \\    'merge:merge another branch into this one'
+    \\    'absorb:fold edits into the changes they belong to'
+    \\    'point:move this branch tip to any ref'
+    \\    'rebase:replay this branch onto a new base'
+    \\    'squash:collapse adjacent changes into one'
+    \\    'split:split one change in two, by path'
+    \\    'reorder:reorder the last changes, 1 = oldest'
     \\    'provenance:show which agent/prompt produced each change'
     \\    'why:who last authored a file'
     \\    'undo:revert the last change-making operation'
@@ -165,6 +180,10 @@ const zsh_script =
     \\    compadd fish zsh bash
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (grade|gd) ]]; then
     \\    compadd -- --repo --fast --full --json
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (squash|sq) ]]; then
+    \\    compadd -- -m --at
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (split|spl) ]]; then
+    \\    compadd -- -m --
     \\  fi
     \\}
     \\_gr "$@"
@@ -178,7 +197,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor export f fetch g gc gd grade get gn green help import init k key l lfs log merge mg mo moments n new note notes pl prov provenance ps pull push r rc recap receive recv redo relay res resolve restore rev rewind rot rotate rs rv rw save seal send serve sh share sl snap snapshot snd sp srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor export f fetch g gc gd grade get gn green help import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve sh share sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
@@ -189,6 +208,14 @@ const bash_script =
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "grade" || "${COMP_WORDS[1]}" == "gd" ]]; then
     \\    COMPREPLY=( $(compgen -W "--repo --fast --full --json" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "squash" || "${COMP_WORDS[1]}" == "sq" ]]; then
+    \\    COMPREPLY=( $(compgen -W "-m --at" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "split" || "${COMP_WORDS[1]}" == "spl" ]]; then
+    \\    COMPREPLY=( $(compgen -W "-m --" -- "$cur") )
     \\    return 0
     \\  fi
     \\}

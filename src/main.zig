@@ -10,6 +10,8 @@ const diff = @import("diff.zig");
 const branches = @import("branches.zig");
 const config = @import("config.zig");
 const merge = @import("merge.zig");
+const replay = @import("replay.zig");
+const history = @import("history.zig");
 const watch = @import("watch.zig");
 const moment = @import("moment.zig");
 const verdict = @import("verdict.zig");
@@ -73,6 +75,13 @@ const sections = [_]Section{
         .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
         .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
         .{ .name = "absorb", .alias = "ab", .desc = "fold edits into the changes they belong to" },
+    } },
+    .{ .title = "reshaping history", .entries = &.{
+        .{ .name = "point", .alias = "pt", .args = "<ref>", .desc = "move this branch's tip to any ref" },
+        .{ .name = "rebase", .alias = "rb", .args = "<ref>", .desc = "replay this branch onto a new base" },
+        .{ .name = "squash", .alias = "sq", .args = "[n] [-m msg]", .desc = "collapse adjacent changes into one" },
+        .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths>", .desc = "split one change in two, by path" },
+        .{ .name = "reorder", .alias = "ro", .args = "<order...>", .desc = "reorder the last changes, 1 = oldest" },
     } },
     .{ .title = "who wrote this", .entries = &.{
         .{ .name = "blame", .alias = "bl", .args = "<file>", .desc = "per-line authorship, incl. agent/prompt" },
@@ -193,6 +202,11 @@ const aliases = [_]Alias{
     .{ .short = "res", .full = "resolve" },
     .{ .short = "rev", .full = "revert" },
     .{ .short = "ab", .full = "absorb" },
+    .{ .short = "pt", .full = "point" },
+    .{ .short = "rb", .full = "rebase" },
+    .{ .short = "sq", .full = "squash" },
+    .{ .short = "spl", .full = "split" },
+    .{ .short = "ro", .full = "reorder" },
     .{ .short = "bl", .full = "blame" },
     .{ .short = "prov", .full = "provenance" },
     .{ .short = "u", .full = "undo" },
@@ -398,6 +412,16 @@ pub fn main(init: std.process.Init) !void {
         try cmdRevert(io, alloc, w, rest);
     } else if (eq(cmd, "absorb")) {
         try cmdAbsorb(io, alloc, w);
+    } else if (eq(cmd, "point")) {
+        try cmdPoint(io, alloc, w, rest);
+    } else if (eq(cmd, "rebase")) {
+        try cmdRebase(io, alloc, w, rest);
+    } else if (eq(cmd, "squash")) {
+        try cmdSquash(io, alloc, w, rest);
+    } else if (eq(cmd, "split")) {
+        try cmdSplit(io, alloc, w, rest);
+    } else if (eq(cmd, "reorder")) {
+        try cmdReorder(io, alloc, w, rest);
     } else if (eq(cmd, "gc")) {
         try cmdGc(io, alloc, w, rest);
     } else if (eq(cmd, "lfs")) {
@@ -723,6 +747,289 @@ fn cmdAbsorb(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var work = try openWork(io);
     defer work.close(io);
     try absorb.run(&s, alloc, work, w);
+}
+
+/// Auto-save before a command that will overwrite the working tree, matching
+/// what `switch` has always done. Merge and pull did not, and silently ate
+/// uncommitted edits.
+fn autoSaveIfDirty(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s: *Store, verb: []const u8) !void {
+    var work = openWork(io) catch return;
+    defer work.close(io);
+    const dirty = workspace.status(s, work, alloc) catch return;
+    const had_changes = dirty.len > 0;
+    for (dirty) |e| alloc.free(e.path);
+    alloc.free(dirty);
+    if (!had_changes) return;
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "wip (auto-saved before {s})", .{verb}) catch "wip (auto-saved)";
+    _ = try doSave(io, alloc, s, msg);
+    try w.writeAll("auto-saved your work first\n");
+}
+
+/// Resolve any address to the change a branch could point at. Captured moments
+/// that no change corresponds to are not such an address, and say so rather
+/// than being rounded to something nearby.
+fn resolveChangeOrFail(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    spec: []const u8,
+) !?Oid {
+    const set = checks.settings(s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(s, alloc);
+    defer ix.deinit();
+
+    const resolved = resolveSpecOrFail(io, alloc, w, s, spec, &ix, set);
+    defer resolved.deinit(alloc);
+
+    const m = switch (resolved.target) {
+        .live => {
+            try w.writeAll("@ is the live tree, not a change. save it first\n");
+            return null;
+        },
+        .at => |at| at,
+    };
+
+    return history.changeOfMoment(s, alloc, &m.id, m.full_tree) catch {
+        try w.print("{s}{s}{s} {s}{s}{s} is a captured moment, not a change\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+        });
+        try ui.hint(w, "a branch can only point at a change; `sdt rewind` moves the working tree to a moment");
+        return null;
+    };
+}
+
+fn reportRewrite(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    before_tree: ?Oid,
+    r: history.Result,
+    what: []const u8,
+) !void {
+    const tip = s.readChange(r.new) catch {
+        try w.print("{s} done\n", .{what});
+        return;
+    };
+    defer object.freeChange(alloc, tip);
+
+    {
+        var work = try openWork(io);
+        defer work.close(io);
+        workspace.checkout(s, work, before_tree, tip.tree) catch {};
+    }
+
+    var buf: [Oid.len * 2]u8 = undefined;
+    if (r.rewritten == 0) {
+        try w.print("{s}{s}{s} {s}, now at {s}{s}{s}\n", .{
+            ui.on(.green), ui.check, ui.off(), what, ui.on(.cyan), shortHex(r.new, &buf), ui.off(),
+        });
+    } else {
+        try w.print("{s}{s}{s} {s}: {d} change(s) rewritten, now at {s}{s}{s}\n", .{
+            ui.on(.green), ui.check,     ui.off(),              what,
+            r.rewritten,   ui.on(.cyan), shortHex(r.new, &buf), ui.off(),
+        });
+    }
+    if (!r.clean()) {
+        try w.print("{d} path(s) came out conflicted, with both sides marked:\n", .{r.conflicts.len});
+        for (r.conflicts) |p| try w.print("  ! {s}\n", .{p});
+        try ui.hint(w, "fix the markers and `sdt save`, or `sdt undo` to put history back");
+        return;
+    }
+    try ui.hint(w, "`sdt undo` puts the old history back");
+}
+
+fn reportHistoryError(w: *std.Io.Writer, e: anyerror, what: []const u8) !bool {
+    switch (e) {
+        replay.Error.MergeChangeNotReplayable => {
+            try w.print("{s}{s}{s} that span contains a merge, so it cannot be replayed\n", .{
+                ui.on(.red), ui.cross, ui.off(),
+            });
+            try ui.hint(w, "rewrite the changes on one side of the merge instead");
+        },
+        history.Error.UnbornBranch => try w.writeAll("nothing saved on this branch yet\n"),
+        history.Error.NothingToDo => try w.print("nothing to {s}\n", .{what}),
+        history.Error.OutOfRange => try w.writeAll("that is more history than this branch has\n"),
+        history.Error.NotAChange => try w.writeAll("that ref is not a change on this branch\n"),
+        history.Error.NotAPermutation => try w.writeAll("the order must list each position exactly once, starting at 1\n"),
+        else => return false,
+    }
+    return true;
+}
+
+fn cmdPoint(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: sdt point <ref>\n");
+        try ui.hint(w, "moves this branch's tip anywhere: `sdt point @~2`, `sdt point other-branch`");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "point");
+
+    const target = (try resolveChangeOrFail(io, alloc, w, &s, rest[0])) orelse return;
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const before_tree = branches.headTree(&s);
+
+    const r = history.point(&s, alloc, branch, target, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "point at")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "moved the tip");
+}
+
+fn cmdRebase(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: sdt rebase <ref>\n");
+        try ui.hint(w, "replays this branch's own changes onto <ref>, keeping their identities");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "rebase");
+
+    const onto = (try resolveChangeOrFail(io, alloc, w, &s, rest[0])) orelse return;
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const before_tree = branches.headTree(&s);
+
+    const r = history.rebase(&s, alloc, branch, onto, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "rebase")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "rebased");
+}
+
+fn cmdSquash(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "squash");
+
+    const message = messageFlag(rest);
+    const at = flagValue(rest, "--at", "--at");
+    var count: usize = 2;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "-m") or eq(a, "--message") or eq(a, "--at")) {
+            i += 1;
+        } else if (a.len != 0 and a[0] != '-') {
+            count = std.fmt.parseInt(usize, a, 10) catch count;
+        }
+    }
+
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const end = if (at.len != 0)
+        (try resolveChangeOrFail(io, alloc, w, &s, at)) orelse return
+    else
+        history.tipOf(&s, branch) catch {
+            try w.writeAll("nothing saved on this branch yet\n");
+            return;
+        };
+    const before_tree = branches.headTree(&s);
+
+    const r = history.squash(&s, alloc, branch, end, count, message, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "squash")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "squashed");
+}
+
+fn cmdSplit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var spec: []const u8 = "";
+    var message: []const u8 = "";
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(alloc);
+
+    var after_sep = false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--")) {
+            after_sep = true;
+        } else if (after_sep) {
+            try paths.append(alloc, a);
+        } else if (eq(a, "-m") or eq(a, "--message")) {
+            i += 1;
+            if (i < rest.len) message = rest[i];
+        } else if (spec.len == 0 and a.len != 0 and a[0] != '-') {
+            spec = a;
+        }
+    }
+
+    if (paths.items.len == 0) {
+        try w.writeAll("usage: sdt split [ref] [-m msg] -- <paths>\n");
+        try ui.hint(w, "the listed paths become the first change; everything else stays in the second");
+        return;
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "split");
+
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const target = if (spec.len != 0)
+        (try resolveChangeOrFail(io, alloc, w, &s, spec)) orelse return
+    else
+        history.tipOf(&s, branch) catch {
+            try w.writeAll("nothing saved on this branch yet\n");
+            return;
+        };
+    const before_tree = branches.headTree(&s);
+
+    const r = history.split(&s, alloc, branch, target, paths.items, message, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "split")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "split");
+}
+
+fn cmdReorder(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var order: std.ArrayList(usize) = .empty;
+    defer order.deinit(alloc);
+    for (rest) |a| {
+        if (a.len == 0 or a[0] == '-') continue;
+        const n = std.fmt.parseInt(usize, a, 10) catch {
+            try w.print("not a position: {s}\n", .{a});
+            return;
+        };
+        try order.append(alloc, n);
+    }
+    if (order.items.len < 2) {
+        try w.writeAll("usage: sdt reorder <order...>\n");
+        try ui.hint(w, "`sdt reorder 2 1` swaps the last two changes; 1 is the oldest of the span");
+        return;
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "reorder");
+
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const before_tree = branches.headTree(&s);
+
+    const r = history.reorder(&s, alloc, branch, order.items, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "reorder")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "reordered");
 }
 
 fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1232,17 +1539,10 @@ fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     captureBefore(io, alloc, &s);
 
     // Never lose work: auto-save the current tree before moving.
+    try autoSaveIfDirty(io, alloc, w, &s, "switch");
+
     var work = try openWork(io);
     defer work.close(io);
-    const dirty = try workspace.status(&s, work, alloc);
-    const had_changes = dirty.len > 0;
-    for (dirty) |e| alloc.free(e.path);
-    alloc.free(dirty);
-    if (had_changes) {
-        _ = try doSave(io, alloc, &s, "wip (auto-saved before switch)");
-        try w.writeAll("auto-saved your work first\n");
-    }
-
     branches.switchTo(&s, work, rest[0]) catch |e| {
         try w.print("could not switch to {s}: {s}\n", .{ rest[0], @errorName(e) });
         return;
@@ -1340,6 +1640,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "merge");
     const into = try s.headBranch();
     defer alloc.free(into);
     const author = try config.author(&s, alloc);
@@ -2540,6 +2841,7 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "pull");
 
     var pos: [2][]const u8 = undefined;
     var np: usize = 0;

@@ -67,7 +67,7 @@ pub fn freeMergeResult(alloc: std.mem.Allocator, r: MergeResult) void {
     alloc.free(r.conflicts);
 }
 
-const PathMap = std.StringHashMap(Oid);
+const PathMap = std.StringHashMap(object.TreeEntry);
 
 /// Load a stored tree into a path->blob map. Keys are duped into `alloc`.
 fn loadPathMap(store: *Store, alloc: std.mem.Allocator, tree: ?Oid, map: *PathMap) !void {
@@ -76,7 +76,8 @@ fn loadPathMap(store: *Store, alloc: std.mem.Allocator, tree: ?Oid, map: *PathMa
     defer object.freeTree(alloc, loaded);
     for (loaded.entries) |e| {
         const key = try alloc.dupe(u8, e.path);
-        try map.put(key, e.blob);
+        errdefer alloc.free(key);
+        try map.put(key, .{ .mode = e.mode, .path = key, .blob = e.blob });
     }
 }
 
@@ -140,12 +141,12 @@ pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid
         const o = ours_map.get(path);
         const t = theirs_map.get(path);
 
-        const result: ?Oid = try resolvePath(store, alloc, path, b, o, t, &conflicts, sset, &superposed);
-        if (result) |blob| {
+        const result: ?object.TreeEntry = try resolveEntry(store, alloc, path, b, o, t, &conflicts, sset, &superposed);
+        if (result) |e| {
             try entries.append(alloc, .{
-                .mode = .regular,
+                .mode = e.mode,
                 .path = try alloc.dupe(u8, path),
-                .blob = blob,
+                .blob = e.blob,
             });
         }
     }
@@ -165,6 +166,67 @@ fn oidEqOpt(a: ?Oid, b: ?Oid) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return a.?.eql(b.?);
+}
+
+fn blobOf(e: ?object.TreeEntry) ?Oid {
+    return if (e) |x| x.blob else null;
+}
+
+fn modeOf(e: ?object.TreeEntry) ?object.Mode {
+    return if (e) |x| x.mode else null;
+}
+
+fn isSymlink(e: ?object.TreeEntry) bool {
+    return if (e) |x| x.mode == .symlink else false;
+}
+
+pub const ModeResolution = struct { mode: object.Mode, conflict: bool };
+
+pub fn resolveMode(base: ?object.Mode, ours: ?object.Mode, theirs: ?object.Mode) ModeResolution {
+    const o = ours orelse return .{ .mode = theirs orelse .regular, .conflict = false };
+    const t = theirs orelse return .{ .mode = o, .conflict = false };
+    if (o == t) return .{ .mode = o, .conflict = false };
+    if (base) |f| {
+        if (f == o) return .{ .mode = t, .conflict = false };
+        if (f == t) return .{ .mode = o, .conflict = false };
+    }
+    return .{ .mode = t, .conflict = true };
+}
+
+pub fn resolveEntry(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    base: ?object.TreeEntry,
+    ours: ?object.TreeEntry,
+    theirs: ?object.TreeEntry,
+    conflicts: *std.ArrayList([]u8),
+    sset: superpose.Settings,
+    superposed: *usize,
+) !?object.TreeEntry {
+    const fb = blobOf(base);
+    const ob = blobOf(ours);
+    const tb = blobOf(theirs);
+
+    const before = conflicts.items.len;
+    var blob: ?Oid = null;
+
+    const both_diverged = ob != null and tb != null and
+        !oidEqOpt(ob, tb) and !oidEqOpt(ob, fb) and !oidEqOpt(tb, fb);
+
+    if (both_diverged and (isSymlink(base) or isSymlink(ours) or isSymlink(theirs))) {
+        try conflicts.append(alloc, try alloc.dupe(u8, path));
+        blob = tb;
+    } else {
+        blob = try resolvePath(store, alloc, path, fb, ob, tb, conflicts, sset, superposed);
+    }
+
+    const b = blob orelse return null;
+    const m = resolveMode(modeOf(base), modeOf(ours), modeOf(theirs));
+    if (m.conflict and conflicts.items.len == before) {
+        try conflicts.append(alloc, try alloc.dupe(u8, path));
+    }
+    return .{ .mode = m.mode, .path = path, .blob = b };
 }
 
 /// Resolve one path across base/ours/theirs. Returns the chosen blob Oid, or
@@ -784,4 +846,279 @@ test "abort restores working tree and branch to pre-merge" {
     try testing.expect((try store.readRef(branch)).eql(pre));
     try testing.expect((try loadState(&store, alloc)) == null);
     try testing.expectError(error.NoMergeInProgress, abort(&store, alloc, work));
+}
+
+fn treeOf(store: *Store, entries: []object.TreeEntry) !Oid {
+    std.sort.pdq(object.TreeEntry, entries, {}, object.Tree.lessThan);
+    return store.writeTree(.{ .entries = entries });
+}
+
+fn entryAt(store: *Store, alloc: std.mem.Allocator, tree: Oid, path: []const u8) !object.TreeEntry {
+    const loaded = try store.readTree(tree);
+    defer object.freeTree(alloc, loaded);
+    for (loaded.entries) |e| {
+        if (std.mem.eql(u8, e.path, path)) return .{ .mode = e.mode, .path = "", .blob = e.blob };
+    }
+    return error.MissingPath;
+}
+
+test "merge preserves the exec bit on an untouched file" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const script = try store.writeFileContent("#!/bin/sh\necho hi\n");
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .executable, .path = "run.sh", .blob = script },
+        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("a\nb\nc\n") },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .executable, .path = "run.sh", .blob = script },
+        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("A\nb\nc\n") },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .executable, .path = "run.sh", .blob = script },
+        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("a\nb\nC\n") },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
+    const run = try entryAt(&store, alloc, result.tree, "run.sh");
+    try testing.expectEqual(object.Mode.executable, run.mode);
+    try testing.expect(run.blob.eql(script));
+
+    const merged = try entryAt(&store, alloc, result.tree, "f");
+    try testing.expectEqual(object.Mode.regular, merged.mode);
+    const merged_data = try store.readFileContent(merged.blob);
+    defer alloc.free(merged_data);
+    try testing.expectEqualStrings("A\nb\nC\n", merged_data);
+}
+
+test "merge takes an exec bit set on one side only" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const script = try store.writeFileContent("#!/bin/sh\n");
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "run.sh", .blob = script },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .executable, .path = "run.sh", .blob = script },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "run.sh", .blob = script },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
+    const run = try entryAt(&store, alloc, result.tree, "run.sh");
+    try testing.expectEqual(object.Mode.executable, run.mode);
+}
+
+test "merge reports an exec-vs-regular divergence as a conflict" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const script = try store.writeFileContent("#!/bin/sh\n");
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
+        .{ .mode = .executable, .path = "run.sh", .blob = script },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
+        .{ .mode = .regular, .path = "run.sh", .blob = script },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 1), result.conflicts.len);
+    try testing.expectEqualStrings("run.sh", result.conflicts[0]);
+    const run = try entryAt(&store, alloc, result.tree, "run.sh");
+    try testing.expect(run.blob.eql(script));
+}
+
+test "merge preserves an untouched symlink" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const target = try store.writeFileContent("a/target");
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = target },
+        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("a\nb\nc\n") },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = target },
+        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("A\nb\nc\n") },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = target },
+        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("a\nb\nC\n") },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
+    const link = try entryAt(&store, alloc, result.tree, "link");
+    try testing.expectEqual(object.Mode.symlink, link.mode);
+    const link_data = try store.readFileContent(link.blob);
+    defer alloc.free(link_data);
+    try testing.expectEqualStrings("a/target", link_data);
+}
+
+test "merge takes a symlink retargeted on one side only" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const old_target = try store.writeFileContent("old/target");
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = old_target },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("new/target") },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = old_target },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
+    const link = try entryAt(&store, alloc, result.tree, "link");
+    try testing.expectEqual(object.Mode.symlink, link.mode);
+    const link_data = try store.readFileContent(link.blob);
+    defer alloc.free(link_data);
+    try testing.expectEqualStrings("new/target", link_data);
+}
+
+test "merge conflicts a divergent symlink without writing markers" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("base/target") },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("ours/target") },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("theirs/target") },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 1), result.conflicts.len);
+    try testing.expectEqualStrings("link", result.conflicts[0]);
+    const link = try entryAt(&store, alloc, result.tree, "link");
+    try testing.expectEqual(object.Mode.symlink, link.mode);
+    const link_data = try store.readFileContent(link.blob);
+    defer alloc.free(link_data);
+    try testing.expectEqualStrings("theirs/target", link_data);
+    try testing.expect(!hasConflictMarkers(link_data));
+}
+
+test "merge conflicts a symlink against a regular file" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    var base_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
+    };
+    const base_tree = try treeOf(&store, &base_entries);
+
+    var ours_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
+        .{ .mode = .regular, .path = "p", .blob = try store.writeFileContent("plain\n") },
+    };
+    const ours_tree = try treeOf(&store, &ours_entries);
+
+    var theirs_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
+        .{ .mode = .symlink, .path = "p", .blob = try store.writeFileContent("some/target") },
+    };
+    const theirs_tree = try treeOf(&store, &theirs_entries);
+
+    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, result);
+
+    try testing.expectEqual(@as(usize, 1), result.conflicts.len);
+    try testing.expectEqualStrings("p", result.conflicts[0]);
+    const p = try entryAt(&store, alloc, result.tree, "p");
+    try testing.expectEqual(object.Mode.symlink, p.mode);
+    const p_data = try store.readFileContent(p.blob);
+    defer alloc.free(p_data);
+    try testing.expectEqualStrings("some/target", p_data);
+    try testing.expect(!hasConflictMarkers(p_data));
 }
