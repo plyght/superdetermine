@@ -161,6 +161,80 @@ pub fn gradeState(
     return v;
 }
 
+pub fn gradeChange(
+    ctx: Context,
+    change_oid: Oid,
+    tier: verdict.Tier,
+) !verdict.Verdict {
+    const alloc = ctx.alloc;
+    if (!ctx.set.has(tier)) return checks.Error.NoCheckConfigured;
+
+    const change = try ctx.store.readChange(change_oid);
+    defer object.freeChange(alloc, change);
+
+    const key = keyFor(ctx, change.tree, tier);
+    if (try verdict.lookup(ctx.store, alloc, key)) |cached| return cached;
+
+    const tree = try ctx.store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+
+    var parent_tree: ?object.Tree = null;
+    defer if (parent_tree) |p| object.freeTree(alloc, p);
+    if (change.parents.len == 1) {
+        if (ctx.store.readChange(change.parents[0])) |p| {
+            defer object.freeChange(alloc, p);
+            parent_tree = ctx.store.readTree(p.tree) catch null;
+        } else |_| {}
+    }
+
+    var span = try warrant.spanBetween(
+        ctx.store,
+        alloc,
+        if (parent_tree) |p| p.entries else null,
+        tree.entries,
+        ctx.rules,
+    );
+    defer span.deinit(alloc);
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = change_oid.toHex(&hex);
+    const graded = try checks.gradeEntries(
+        ctx.store,
+        ctx.work_dir,
+        tree.entries,
+        hex[0..12],
+        ctx.set,
+        .{ .tier = tier, .scratch_parent = ctx.scratch_parent },
+    );
+    defer graded.deinit(alloc);
+    const outcome = graded.outcome;
+
+    const rs_oid = if (graded.read_set) |rs|
+        readset.store_(ctx.store, rs) catch Oid.zero()
+    else
+        Oid.zero();
+
+    const rel = warrant.relevance(graded.read_set, span);
+
+    const v = verdict.Verdict{
+        .tree = change.tree,
+        .tier = tier,
+        .command = key.command,
+        .result = outcome.result(),
+        .exit_code = outcome.exit_code,
+        .duration_ms = outcome.duration_ms,
+        .ms = change.timestamp * 1000,
+        .readset = rs_oid,
+        .independence = warrant.independence(ctx.store, alloc, span),
+        .relevance_hit = rel.hit,
+        .relevance_total = rel.total,
+        .discrimination = .unknown,
+    };
+
+    try verdict.record(ctx.store, v);
+    return v;
+}
+
 const Graded = struct {
     m: Moment,
     entries: []object.TreeEntry,
@@ -672,4 +746,92 @@ test "a state between two greens stays ungraded, never interpolated" {
 
     // Surrounded by green on both sides, and still not green.
     try testing.expect(ix.get(keyFor(ctx, all[1].full_tree, .full)) == null);
+}
+
+fn changeOf(f: *Fixture, body: []const u8, parents: []const Oid) !Oid {
+    const blob = try f.store.writeFileContent(body);
+    const entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a.txt", .blob = blob },
+    };
+    const tree = try f.store.writeTree(.{ .entries = &entries });
+    return f.store.writeChange(.{
+        .tree = tree,
+        .parents = parents,
+        .change_id = [_]u8{7} ** 16,
+        .timestamp = 1_700_000_000,
+        .tz_offset_min = 0,
+        .author = "Someone <someone@example.com>",
+        .message = "imported from git\n",
+    });
+}
+
+test "a change is graded from its tree, with no moment involved" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{ .enabled = true, .full = "grep -q good a.txt" };
+    const ctx = f.ctx(alloc, set);
+
+    const good = try changeOf(&f, "good", &.{});
+    const bad = try changeOf(&f, "bad", &.{good});
+
+    try testing.expectEqual(verdict.Result.green, (try gradeChange(ctx, good, .full)).result);
+    try testing.expectEqual(verdict.Result.red, (try gradeChange(ctx, bad, .full)).result);
+
+    const all = try moment.readAll(&f.store, alloc);
+    defer moment.freeMoments(alloc, all);
+    try testing.expectEqual(@as(usize, 0), all.len);
+}
+
+test "a change and a moment holding the same tree share one verdict" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{
+        .enabled = true,
+        .full = "echo x >> ../runs.log; exit 0",
+    };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+    const first = try gradeState(ctx, m, .full);
+    try testing.expectEqual(verdict.Result.green, first.result);
+
+    const entries = try moment.entriesOf(&f.store, m);
+    defer workspace.freeTreeEntries(alloc, entries);
+    const tree = try f.store.writeTree(.{ .entries = entries });
+    try testing.expect(tree.eql(m.full_tree));
+
+    const change_oid = try f.store.writeChange(.{
+        .tree = tree,
+        .parents = &.{},
+        .change_id = [_]u8{9} ** 16,
+        .timestamp = 1_700_000_000,
+        .tz_offset_min = 0,
+        .author = "Someone <someone@example.com>",
+        .message = "same tree\n",
+    });
+
+    const second = try gradeChange(ctx, change_oid, .full);
+    try testing.expectEqual(verdict.Result.green, second.result);
+    try testing.expectEqual(first.duration_ms, second.duration_ms);
+}
+
+test "the warrant on a change with no attribution is unknown, not fabricated" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{ .enabled = true, .full = "true" };
+    const ctx = f.ctx(alloc, set);
+
+    const only = try changeOf(&f, "whatever", &.{});
+    const v = try gradeChange(ctx, only, .full);
+
+    try testing.expectEqual(verdict.Result.green, v.result);
+    try testing.expectEqual(verdict.Independence.unknown, v.independence);
+    try testing.expectEqual(verdict.Discrimination.unknown, v.discrimination);
 }

@@ -2,9 +2,9 @@
 
 A version control system that remembers which states of your code actually worked.
 
-`sdt` captures your working tree continuously from `sdt init`. There is no staging area and no stash. You never run `save` to keep your work safe.
+`sdt` grades your code. It runs the project's own check against a state, in a throwaway clone, and records the result. `sdt green` then returns the last state that passed.
 
-`sdt` also grades each captured state. It runs the project's own check against that state. `sdt green` then returns the last state that passed.
+For that to be useful, the states have to exist. So `sdt` captures your working tree continuously from `sdt init`. There is no staging area and no stash. You never run `save` to keep your work safe.
 
 `sdt` runs beside git and pushes to GitHub. You can adopt it one step at a time.
 
@@ -22,9 +22,9 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 
 | Feature | What it gives you |
 | --- | --- |
-| **Continuous capture** | Starts at `sdt init`. `sdt` keeps every state of the tree as a *moment*. Each moment costs less than one kilobyte. You never type `save` to stay safe. |
 | **Verified history** | `sdt` runs your check against a captured state in a clone it then deletes. `sdt green` rewinds to the last state that passed. |
 | **Warranted verdicts** | Each green result names who wrote the code and the check. It also names which changed files the check read. |
+| **Continuous capture** | Starts at `sdt init`. `sdt` keeps every state of the tree as a *moment*. Each moment costs less than one kilobyte. You never type `save` to stay safe. |
 | Content-addressed store (BLAKE3 + FastCDC) | Large files and binaries are first-class, deduped at the chunk level. No LFS. |
 | Working copy is always a change | There is no staging area and no stash. `sdt save` names a boundary. It is not how `sdt` keeps your work. |
 | Operation log | `sdt undo` and `sdt redo` across the whole repo. Nothing gets lost. |
@@ -44,7 +44,7 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 
 ## How it works
 
-`sdt` captures the working tree as a *moment*. A moment is a content-addressed state with a stable id, a timestamp, and a cause. A moment is not a commit. Moments never appear in `sdt log`. Each moment costs less than one kilobyte. `sdt` stores a delta against the previous state and a full keyframe every 200 moments.
+`sdt` captures the working tree as a *moment*. A moment is a content-addressed state with a stable id, a timestamp, and a cause. A moment is not a commit. Moments never appear in `sdt log`. Each moment costs less than one kilobyte. `sdt` stores only what changed from the previous state, and a full keyframe every 200 moments.
 
 `sdt` grades a moment in four steps. It makes a copy-on-write clone of your worktree. It changes the clone to the target state. It runs your check inside the clone. It deletes the clone. `sdt` does not change your worktree, and your terminal does not wait.
 
@@ -103,6 +103,16 @@ superdetermine does not replace git or GitHub, and adopting it is reversible. It
 - Run `sdt export <dir>` to materialize a plain git repo at any time.
 
 If superdetermine turns out not to be for you, your git history is right there, untouched.
+
+## How this differs from DeltaDB
+
+Zed's DeltaDB also records the work between your commits, so the comparison is fair to make.
+
+DeltaDB records what happened. It captures every operation, links it to the conversation that produced it, and replicates that to everyone in a thread. It does not run your check. Zed says so directly: git and CI stay for "running checks", and nothing in DeltaDB knows whether a given state built or passed. Review there means reading the diff.
+
+`sdt` records what worked. The check runs, the verdict is stored against the content, and the warrant tells you whether that green result is worth anything. That is the whole difference.
+
+The other difference is where your code lives. Delta stores your repository contents, your git history, and your uncommitted edits on Zed's servers, and needs an account. `sdt` has no account and no server. Sharing is peer to peer, and the optional relay is one you can run yourself and cannot read what passes through it.
 
 ## Quick start
 

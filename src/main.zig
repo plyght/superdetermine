@@ -88,7 +88,7 @@ const sections = [_]Section{
         .{ .name = "back", .alias = "bk", .args = "[n]", .desc = "rewind n moments, default 1" },
         .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
         .{ .name = "moments", .alias = "mo", .args = "[-n N]", .desc = "captured states and their verdicts" },
-        .{ .name = "grade", .alias = "gd", .desc = "grade now; --on makes it automatic" },
+        .{ .name = "grade", .alias = "gd", .args = "[git-ref]", .desc = "grade now, or any git ref; --on automates" },
         .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
         .{ .name = "recap", .alias = "rc", .args = "[@ref..]", .desc = "green and red spans, and what thrashed" },
     } },
@@ -1791,6 +1791,40 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     const repo_abs = try work.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(repo_abs);
 
+    var git_ref: []const u8 = "";
+    var git_repo: []const u8 = "";
+    var ref_tier: verdict.Tier = .full;
+    var ref_json = false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--json")) {
+            ref_json = true;
+        } else if (eq(a, "--fast")) {
+            ref_tier = .fast;
+        } else if (eq(a, "--full")) {
+            ref_tier = .full;
+        } else if (eq(a, "--repo")) {
+            i += 1;
+            if (i < rest.len) git_repo = rest[i];
+        } else if (a.len != 0 and a[0] != '-' and git_ref.len == 0) {
+            git_ref = a;
+        }
+    }
+    if (git_ref.len != 0 or git_repo.len != 0) {
+        try cmdGradeRef(
+            alloc,
+            w,
+            &s,
+            work,
+            git_ref,
+            if (git_repo.len != 0) git_repo else repo_abs,
+            ref_tier,
+            ref_json,
+        );
+        return;
+    }
+
     for (rest) |a| {
         if (eq(a, "--install") or eq(a, "--on")) {
             const exe = update.selfExePathAlloc(alloc) catch |e| {
@@ -1870,6 +1904,90 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             ui.on(.yellow), b.last_green, b.first_red, ui.off(),
         });
         try ui.hint(w, "`sdt green` rewinds to the last state that worked");
+    }
+}
+
+fn cmdGradeRef(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    work: std.Io.Dir,
+    git_ref: []const u8,
+    git_repo: []const u8,
+    tier: verdict.Tier,
+    as_json: bool,
+) !void {
+    const shown = if (git_ref.len != 0) git_ref else "HEAD";
+
+    const set = checks.settings(s, alloc);
+    defer set.deinit(alloc);
+    if (!set.has(tier)) {
+        try w.print("{s}{s}{s} no {s} check configured, so there is nothing to grade with\n", .{
+            ui.on(.red), ui.cross, ui.off(), tier.label(),
+        });
+        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+        return;
+    }
+
+    const change_oid = git.importRefChange(
+        s,
+        git_repo,
+        if (git_ref.len != 0) git_ref else null,
+    ) catch |e| {
+        try w.print("{s}{s}{s} could not resolve {s}{s}{s} in {s}: {s}\n", .{
+            ui.on(.red),  ui.cross,      ui.off(),
+            ui.on(.bold), shown,         ui.off(),
+            git_repo,     @errorName(e),
+        });
+        try ui.hint(w, "pass `--repo <path>` for a git repo other than this one");
+        return;
+    };
+
+    const rules = warrant.pathRules(s, alloc);
+    defer rules.deinit(alloc);
+    const ctx = gradeContext(alloc, s, work, set, rules);
+    const v = try grade.gradeChange(ctx, change_oid, tier);
+
+    var change_buf: [Oid.len * 2]u8 = undefined;
+    var tree_buf: [Oid.len * 2]u8 = undefined;
+    const change_hex = shortHex(change_oid, &change_buf);
+    const tree_hex = shortHex(v.tree, &tree_buf);
+
+    if (as_json) {
+        try w.writeAll("{\"ref\":");
+        try writeJsonString(w, shown);
+        try w.writeAll(",\"repo\":");
+        try writeJsonString(w, git_repo);
+        try w.writeAll(",\"change\":");
+        try writeJsonString(w, change_hex);
+        try w.writeAll(",\"tree\":");
+        try writeJsonString(w, tree_hex);
+        try w.print(",\"tier\":\"{s}\",\"result\":\"{s}\",\"exit_code\":{d},\"duration_ms\":{d}", .{
+            v.tier.label(), v.result.label(), v.exit_code, v.duration_ms,
+        });
+        try w.print(",\"independence\":\"{s}\",\"relevance_hit\":{d},\"relevance_total\":{d}", .{
+            v.independence.label(), v.relevance_hit, v.relevance_total,
+        });
+        try w.print(",\"discrimination\":\"{s}\",\"hollow\":{s}}}\n", .{
+            v.discrimination.label(), if (v.isHollow()) "true" else "false",
+        });
+        return;
+    }
+
+    const colour: ui.Color = if (v.result == .green) .green else .red;
+    try w.print("{s}{s}{s} {s}{s}{s} in {s}\n", .{
+        ui.on(colour), if (v.result == .green) ui.check else ui.cross, ui.off(),
+        ui.on(.bold),  shown,                                          ui.off(),
+        git_repo,
+    });
+    try warrant.render(w, change_hex, v);
+    if (v.result == .red) {
+        try w.print("  exit {d} after {d}ms\n", .{ v.exit_code, v.duration_ms });
+    }
+    if (v.isHollow()) {
+        try ui.hint(w, "green, but the warrant says this green proves little");
+    } else if (v.independence == .unknown and v.discrimination == .unknown) {
+        try ui.hint(w, "no attribution for these commits, so the warrant is unknown rather than clean");
     }
 }
 

@@ -20,6 +20,8 @@ pub const EditEvent = struct {
     path: []const u8, // ABSOLUTE file path edited (repo dir itself for repo-wide identity events)
     new_hash: ?Oid, // BLAKE3 of post-edit content when recoverable, else null
     timestamp_ms: i64,
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
 };
 
 const prompt_cap = 500;
@@ -87,6 +89,8 @@ fn freeEvent(alloc: std.mem.Allocator, e: EditEvent) void {
     alloc.free(e.session);
     alloc.free(e.prompt);
     alloc.free(e.path);
+    alloc.free(e.agent_id);
+    alloc.free(e.prompt_id);
 }
 
 fn freeList(alloc: std.mem.Allocator, events: *std.ArrayList(EditEvent)) void {
@@ -106,6 +110,10 @@ const Ctx = struct {
     /// Append an event iff its path is the repo dir or a file under it and it is
     /// recent enough. Dupes every string so parsed JSON can be freed immediately.
     fn push(self: *Ctx, agent: []const u8, session: []const u8, prompt: []const u8, abs_path: []const u8, new_hash: ?Oid, ts_ms: i64) !void {
+        return self.pushDetail(agent, session, prompt, abs_path, new_hash, ts_ms, .{});
+    }
+
+    fn pushDetail(self: *Ctx, agent: []const u8, session: []const u8, prompt: []const u8, abs_path: []const u8, new_hash: ?Oid, ts_ms: i64, detail: Detail) !void {
         if (ts_ms < self.since_ms - mtime_slack_ms) return;
         if (!pathInRepo(self.repo_abs, abs_path)) return;
 
@@ -117,6 +125,10 @@ const Ctx = struct {
         errdefer self.alloc.free(p);
         const path = try self.alloc.dupe(u8, abs_path);
         errdefer self.alloc.free(path);
+        const aid = try self.alloc.dupe(u8, detail.agent_id);
+        errdefer self.alloc.free(aid);
+        const pid = try self.alloc.dupe(u8, detail.prompt_id);
+        errdefer self.alloc.free(pid);
 
         try self.events.append(self.alloc, .{
             .agent = a,
@@ -125,8 +137,15 @@ const Ctx = struct {
             .path = path,
             .new_hash = new_hash,
             .timestamp_ms = ts_ms,
+            .agent_id = aid,
+            .prompt_id = pid,
         });
     }
+};
+
+const Detail = struct {
+    agent_id: []const u8 = "",
+    prompt_id: []const u8 = "",
 };
 
 /// True if `path` equals `repo` (a repo-wide identity event) or is a file under it.
@@ -295,10 +314,126 @@ fn scanClaude(ctx: *Ctx) anyerror!void {
     walkFiles(ctx, base, &.{".jsonl"}, claudeFile);
 }
 
+const ClaudePending = struct {
+    id: []const u8,
+    session: []const u8,
+    prompt: []const u8,
+    prompt_id: []const u8,
+    agent_id: []const u8,
+    path: []const u8,
+    hash: ?Oid,
+    ts: i64,
+};
+
+fn dupeClaudePending(alloc: std.mem.Allocator, p: ClaudePending) !ClaudePending {
+    var out = p;
+    out.id = try alloc.dupe(u8, p.id);
+    errdefer alloc.free(out.id);
+    out.session = try alloc.dupe(u8, p.session);
+    errdefer alloc.free(out.session);
+    out.prompt = try alloc.dupe(u8, p.prompt);
+    errdefer alloc.free(out.prompt);
+    out.prompt_id = try alloc.dupe(u8, p.prompt_id);
+    errdefer alloc.free(out.prompt_id);
+    out.agent_id = try alloc.dupe(u8, p.agent_id);
+    errdefer alloc.free(out.agent_id);
+    out.path = try alloc.dupe(u8, p.path);
+    return out;
+}
+
+fn freeClaudePending(alloc: std.mem.Allocator, p: ClaudePending) void {
+    alloc.free(p.id);
+    alloc.free(p.session);
+    alloc.free(p.prompt);
+    alloc.free(p.prompt_id);
+    alloc.free(p.agent_id);
+    alloc.free(p.path);
+}
+
+fn pushClaudePending(ctx: *Ctx, p: ClaudePending, hash: ?Oid) void {
+    ctx.pushDetail("claude-code", p.session, p.prompt, p.path, hash, p.ts, .{
+        .agent_id = p.agent_id,
+        .prompt_id = p.prompt_id,
+    }) catch {};
+}
+
+fn isClaudeHumanPrompt(root: Value) bool {
+    const source = asStr(objGet(root, "promptSource")) orelse return false;
+    if (!std.mem.eql(u8, source, "typed")) return false;
+    const origin = objGet(root, "origin") orelse return false;
+    const kind = asStr(objGet(origin, "kind")) orelse return false;
+    return std.mem.eql(u8, kind, "human");
+}
+
+fn boolOr(v: ?Value, default: bool) bool {
+    const val = v orelse return default;
+    return switch (val) {
+        .bool => |b| b,
+        else => default,
+    };
+}
+
+fn rebuildEdit(alloc: std.mem.Allocator, original: []const u8, old: []const u8, new: []const u8, all: bool) ?[]u8 {
+    if (old.len == 0) return null;
+    if (std.mem.indexOf(u8, original, old) == null) return null;
+    return rebuildEditAlloc(alloc, original, old, new, all) catch null;
+}
+
+fn rebuildEditAlloc(alloc: std.mem.Allocator, original: []const u8, old: []const u8, new: []const u8, all: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var rest = original;
+    while (std.mem.indexOf(u8, rest, old)) |i| {
+        try out.appendSlice(alloc, rest[0..i]);
+        try out.appendSlice(alloc, new);
+        rest = rest[i + old.len ..];
+        if (!all) break;
+    }
+    try out.appendSlice(alloc, rest);
+    return out.toOwnedSlice(alloc);
+}
+
+fn claudeResultHash(alloc: std.mem.Allocator, res: Value) ?Oid {
+    if (boolOr(objGet(res, "userModified"), false)) return null;
+    if (asStr(objGet(res, "content"))) |c| return Oid.ofBytes(c);
+    const original = asStr(objGet(res, "originalFile")) orelse return null;
+    const old = asStr(objGet(res, "oldString")) orelse return null;
+    const new = asStr(objGet(res, "newString")) orelse return null;
+    const rebuilt = rebuildEdit(alloc, original, old, new, boolOr(objGet(res, "replaceAll"), false)) orelse return null;
+    defer alloc.free(rebuilt);
+    return Oid.ofBytes(rebuilt);
+}
+
+fn claudeToolResultId(msg: Value) ?[]const u8 {
+    const content = objGet(msg, "content") orelse return null;
+    const arr = switch (content) {
+        .array => |a| a,
+        else => return null,
+    };
+    for (arr.items) |blk| {
+        if (asStr(objGet(blk, "type"))) |t| {
+            if (!std.mem.eql(u8, t, "tool_result")) continue;
+        }
+        if (asStr(objGet(blk, "tool_use_id"))) |id| return id;
+    }
+    return null;
+}
+
 fn claudeFile(ctx: *Ctx, _: []const u8, data: []const u8, _: i64) void {
     const alloc = ctx.alloc;
     var last_prompt: []u8 = alloc.dupe(u8, "") catch return;
     defer alloc.free(last_prompt);
+    var last_prompt_id: []u8 = alloc.dupe(u8, "") catch return;
+    defer alloc.free(last_prompt_id);
+
+    var pending: std.ArrayList(ClaudePending) = .empty;
+    defer {
+        for (pending.items) |p| {
+            pushClaudePending(ctx, p, p.hash);
+            freeClaudePending(alloc, p);
+        }
+        pending.deinit(alloc);
+    }
 
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
@@ -310,17 +445,31 @@ fn claudeFile(ctx: *Ctx, _: []const u8, data: []const u8, _: i64) void {
         const msg = objGet(root, "message") orelse continue;
 
         if (std.mem.eql(u8, rtype, "user")) {
-            const text = contentText(objGet(msg, "content") orelse Value{ .null = {} });
-            if (text.len != 0) {
-                const dup = alloc.dupe(u8, text) catch continue;
-                alloc.free(last_prompt);
-                last_prompt = dup;
+            if (isClaudeHumanPrompt(root)) {
+                const text = contentText(objGet(msg, "content") orelse Value{ .null = {} });
+                if (text.len != 0) {
+                    const dup = alloc.dupe(u8, text) catch continue;
+                    alloc.free(last_prompt);
+                    last_prompt = dup;
+                    replaceDup(alloc, &last_prompt_id, asStr(objGet(root, "promptId")) orelse "");
+                }
+                continue;
+            }
+            const res = objGet(root, "toolUseResult") orelse continue;
+            const id = claudeToolResultId(msg) orelse continue;
+            for (pending.items, 0..) |p, i| {
+                if (!std.mem.eql(u8, p.id, id)) continue;
+                pushClaudePending(ctx, p, claudeResultHash(alloc, res) orelse p.hash);
+                freeClaudePending(alloc, p);
+                _ = pending.orderedRemove(i);
+                break;
             }
             continue;
         }
         if (!std.mem.eql(u8, rtype, "assistant")) continue;
 
         const session = asStr(objGet(root, "sessionId")) orelse "";
+        const agent_id = asStr(objGet(root, "agentId")) orelse "";
         const ts = if (asStr(objGet(root, "timestamp"))) |t| (isoToMs(t) orelse 0) else 0;
 
         const content = objGet(msg, "content") orelse continue;
@@ -339,8 +488,24 @@ fn claudeFile(ctx: *Ctx, _: []const u8, data: []const u8, _: i64) void {
             if (std.mem.eql(u8, name, "Write")) {
                 if (asStr(objGet(input, "content"))) |c| hash = Oid.ofBytes(c);
             }
-            // Edit / MultiEdit carry only fragments → no recoverable full content.
-            ctx.push("claude-code", session, last_prompt, fpath, hash, ts) catch {};
+            // Edit / MultiEdit inputs carry only fragments, but the matching
+            // tool result does carry the full post-edit content → defer the push.
+            const borrowed = ClaudePending{
+                .id = asStr(objGet(blk, "id")) orelse "",
+                .session = session,
+                .prompt = last_prompt,
+                .prompt_id = last_prompt_id,
+                .agent_id = agent_id,
+                .path = fpath,
+                .hash = hash,
+                .ts = ts,
+            };
+            if (borrowed.id.len == 0) {
+                pushClaudePending(ctx, borrowed, hash);
+                continue;
+            }
+            const owned = dupeClaudePending(alloc, borrowed) catch continue;
+            pending.append(alloc, owned) catch freeClaudePending(alloc, owned);
         }
     }
 }
@@ -786,7 +951,7 @@ test "claude-code JSONL parses into an EditEvent with content hash" {
     var ctx = testCtx(alloc, "/repo", &events);
 
     const fixture =
-        \\{"type":"user","message":{"role":"user","content":"make a.txt"},"timestamp":"2026-01-01T00:00:00.000Z","sessionId":"S1","cwd":"/repo"}
+        \\{"type":"user","promptSource":"typed","origin":{"kind":"human"},"promptId":"P1","message":{"role":"user","content":"make a.txt"},"timestamp":"2026-01-01T00:00:00.000Z","sessionId":"S1","cwd":"/repo"}
         \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/a.txt","content":"hello"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S1","cwd":"/repo"}
     ;
     claudeFile(&ctx, "f.jsonl", fixture, 0);
@@ -796,9 +961,139 @@ test "claude-code JSONL parses into an EditEvent with content hash" {
     try testing.expectEqualStrings("claude-code", e.agent);
     try testing.expectEqualStrings("S1", e.session);
     try testing.expectEqualStrings("make a.txt", e.prompt);
+    try testing.expectEqualStrings("P1", e.prompt_id);
     try testing.expectEqualStrings("/repo/a.txt", e.path);
     try testing.expect(e.new_hash != null);
     try testing.expect(e.new_hash.?.eql(Oid.ofBytes("hello")));
+}
+
+test "claude-code only genuine human turns become the prompt" {
+    const alloc = testing.allocator;
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+
+    // A real prompt, then three impostors that also arrive as type:"user":
+    // a bare tool result, a task-notification injection, and a queued peer turn.
+    const fixture =
+        \\{"type":"user","promptSource":"typed","origin":{"kind":"human"},"promptId":"P7","message":{"role":"user","content":"add the flag"},"timestamp":"2026-01-01T00:00:00.000Z","sessionId":"S1"}
+        \\{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_x","content":"ok"}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S1"}
+        \\{"type":"user","promptSource":"system","origin":{"kind":"task-notification"},"message":{"role":"user","content":"agent finished"},"timestamp":"2026-01-01T00:00:02.000Z","sessionId":"S1"}
+        \\{"type":"user","promptSource":"queued","origin":{"kind":"peer"},"message":{"role":"user","content":"peer says hi"},"timestamp":"2026-01-01T00:00:03.000Z","sessionId":"S1"}
+        \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/a.txt","content":"hello"}}]},"timestamp":"2026-01-01T00:00:04.000Z","sessionId":"S1"}
+    ;
+    claudeFile(&ctx, "f.jsonl", fixture, 0);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqualStrings("add the flag", events.items[0].prompt);
+    try testing.expectEqualStrings("P7", events.items[0].prompt_id);
+}
+
+test "claude-code Edit recovers full post-edit content from toolUseResult" {
+    const alloc = testing.allocator;
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+
+    const fixture =
+        \\{"type":"user","promptSource":"typed","origin":{"kind":"human"},"promptId":"P2","message":{"role":"user","content":"rename it"},"timestamp":"2026-01-01T00:00:00.000Z","sessionId":"S2"}
+        \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"/repo/a.zig","old_string":"old","new_string":"new"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S2"}
+        \\{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"done"}]},"toolUseResult":{"filePath":"/repo/a.zig","oldString":"old","newString":"new","originalFile":"a old b","replaceAll":false,"userModified":false,"structuredPatch":[]},"timestamp":"2026-01-01T00:00:02.000Z","sessionId":"S2"}
+    ;
+    claudeFile(&ctx, "f.jsonl", fixture, 0);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    const e = events.items[0];
+    try testing.expectEqualStrings("/repo/a.zig", e.path);
+    try testing.expectEqualStrings("rename it", e.prompt);
+    try testing.expect(e.new_hash != null);
+    try testing.expect(e.new_hash.?.eql(Oid.ofBytes("a new b")));
+}
+
+test "claude-code userModified suppresses the content hash" {
+    const alloc = testing.allocator;
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+
+    const fixture =
+        \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_2","name":"Edit","input":{"file_path":"/repo/a.zig","old_string":"old","new_string":"new"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S3"}
+        \\{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_2","content":"done"}]},"toolUseResult":{"filePath":"/repo/a.zig","oldString":"old","newString":"new","originalFile":"a old b","replaceAll":false,"userModified":true,"structuredPatch":[]},"timestamp":"2026-01-01T00:00:02.000Z","sessionId":"S3"}
+    ;
+    claudeFile(&ctx, "f.jsonl", fixture, 0);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expect(events.items[0].new_hash == null);
+}
+
+test "claude-code unanswered tool_use is still emitted once" {
+    const alloc = testing.allocator;
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+
+    const fixture =
+        \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_3","name":"Write","input":{"file_path":"/repo/a.txt","content":"hello"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S4"}
+    ;
+    claudeFile(&ctx, "f.jsonl", fixture, 0);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expect(events.items[0].new_hash.?.eql(Oid.ofBytes("hello")));
+}
+
+test "claude-code subagent transcript carries the agent id" {
+    const alloc = testing.allocator;
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+
+    const fixture =
+        \\{"type":"assistant","agentId":"aacedf99bce2ac913","isSidechain":true,"message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/sub.txt","content":"sub"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S5"}
+    ;
+    claudeFile(&ctx, "f.jsonl", fixture, 0);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqualStrings("S5", events.items[0].session);
+    try testing.expectEqualStrings("aacedf99bce2ac913", events.items[0].agent_id);
+}
+
+test "rebuildEdit replaces first occurrence or all" {
+    const alloc = testing.allocator;
+    const once = rebuildEdit(alloc, "a x b x c", "x", "y", false).?;
+    defer alloc.free(once);
+    try testing.expectEqualStrings("a y b x c", once);
+
+    const all = rebuildEdit(alloc, "a x b x c", "x", "y", true).?;
+    defer alloc.free(all);
+    try testing.expectEqualStrings("a y b y c", all);
+
+    try testing.expect(rebuildEdit(alloc, "abc", "zzz", "y", false) == null);
+    try testing.expect(rebuildEdit(alloc, "abc", "", "y", false) == null);
+}
+
+test "walkFiles descends into nested subagents directories" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var nested = try tmp.dir.createDirPathOpen(io, "-Users-x-repo/sess-1/subagents", .{});
+    defer nested.close(io);
+    try nested.writeFile(io, .{
+        .sub_path = "agent-abc123.jsonl",
+        .data =
+        \\{"type":"assistant","agentId":"abc123","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/repo/deep.txt","content":"deep"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S6"}
+        ,
+    });
+
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+    walkFiles(&ctx, tmp.dir, &.{".jsonl"}, claudeFile);
+
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqualStrings("/repo/deep.txt", events.items[0].path);
+    try testing.expectEqualStrings("abc123", events.items[0].agent_id);
 }
 
 test "codex apply_patch exec_command parses the edited path" {

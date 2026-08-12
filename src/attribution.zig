@@ -271,24 +271,35 @@ pub fn autoAttribute(store: *Store, work_dir: std.Io.Dir, change: Oid, changed: 
         defer alloc.free(content);
         const hash = Oid.ofBytes(content);
 
-        const rec: FileEntry = if (bestMatch(events, repo_trim, abs, hash)) |m| .{
-            .kind = .agent,
-            .confidence = m.conf,
-            .agent = events[m.idx].agent,
-            .session = events[m.idx].session,
-            .prompt = events[m.idx].prompt,
-            .path = entry.path,
-            .timestamp_ms = events[m.idx].timestamp_ms,
-        } else .{
-            .kind = .human,
-            .confidence = .none,
-            .agent = "",
-            .session = "",
-            .prompt = "",
-            .path = entry.path,
-            .timestamp_ms = now_ms,
-        };
-        record(store, change, rec) catch {};
+        if (bestMatch(events, repo_trim, abs, hash)) |m| {
+            const ev = events[m.idx];
+            // A subagent shares its parent's session id, so qualify it with the
+            // agent id to keep subagent edits distinguishable.
+            const session = if (ev.agent_id.len == 0)
+                alloc.dupe(u8, ev.session) catch continue
+            else
+                std.fmt.allocPrint(alloc, "{s}/{s}", .{ ev.session, ev.agent_id }) catch continue;
+            defer alloc.free(session);
+            record(store, change, .{
+                .kind = .agent,
+                .confidence = m.conf,
+                .agent = ev.agent,
+                .session = session,
+                .prompt = ev.prompt,
+                .path = entry.path,
+                .timestamp_ms = ev.timestamp_ms,
+            }) catch {};
+        } else {
+            record(store, change, .{
+                .kind = .human,
+                .confidence = .none,
+                .agent = "",
+                .session = "",
+                .prompt = "",
+                .path = entry.path,
+                .timestamp_ms = now_ms,
+            }) catch {};
+        }
     }
 }
 

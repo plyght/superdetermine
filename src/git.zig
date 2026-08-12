@@ -484,6 +484,18 @@ pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
 /// shorthand (null means the repo's HEAD) and `dest_branch` is the sdt branch to
 /// point at the imported tip (null means the sdt HEAD branch).
 pub fn importRefTo(store: *Store, git_repo_path: []const u8, git_ref: ?[]const u8, dest_branch: ?[]const u8) !Oid {
+    const alloc = store.alloc;
+    const tip = try importRefChange(store, git_repo_path, git_ref);
+
+    const head_branch = try store.headBranch();
+    defer alloc.free(head_branch);
+    const branch = if (dest_branch) |b| b else head_branch;
+    try store.updateRef(branch, tip);
+
+    return tip;
+}
+
+pub fn importRefChange(store: *Store, git_repo_path: []const u8, git_ref: ?[]const u8) !Oid {
     ensureInit();
     const alloc = store.alloc;
 
@@ -496,10 +508,14 @@ pub fn importRefTo(store: *Store, git_repo_path: []const u8, git_ref: ?[]const u
 
     var head_oid: c.git_oid = undefined;
     if (git_ref) |r| {
-        var ref_buf: [512]u8 = undefined;
-        const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{r});
+        const spec_z = try alloc.dupeZ(u8, r);
+        defer alloc.free(spec_z);
         var obj: ?*c.git_object = null;
-        try check(c.git_revparse_single(&obj, repo, ref_name.ptr));
+        if (c.git_revparse_single(&obj, repo, spec_z.ptr) != 0) {
+            var ref_buf: [512]u8 = undefined;
+            const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{r});
+            try check(c.git_revparse_single(&obj, repo, ref_name.ptr));
+        }
         defer c.git_object_free(obj);
         var peeled: ?*c.git_object = null;
         try check(c.git_object_peel(&peeled, obj, c.GIT_OBJECT_COMMIT));
@@ -539,11 +555,6 @@ pub fn importRefTo(store: *Store, git_repo_path: []const u8, git_ref: ?[]const u
     }
 
     try map.save(store);
-
-    const head_branch = try store.headBranch();
-    defer alloc.free(head_branch);
-    const branch = if (dest_branch) |b| b else head_branch;
-    try store.updateRef(branch, tip);
 
     return tip;
 }
@@ -2811,4 +2822,59 @@ test "lookupGitRef translates a git revision into an sdt change" {
         .missing => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "importRefChange resolves a tag or a raw sha and moves no sdt ref" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src");
+    const abs = try tmp.dir.realPathFileAlloc(io, "src", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    const m1 = try commitOnto(repo, "refs/heads/master", "f.txt", "m1\n", "m1\n", null, 1_600_000_001);
+    const m2 = try commitOnto(repo, "refs/heads/master", "f.txt", "m2\n", "m2\n", &m1, 1_600_000_002);
+    try check(c.git_repository_set_head(repo, "refs/heads/master"));
+
+    var tag_ref: ?*c.git_reference = null;
+    try check(c.git_reference_create(&tag_ref, repo, "refs/tags/v1", &m1, 0, null));
+    c.git_reference_free(tag_ref);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+
+    const tagged = try importRefChange(&store, abs, "v1");
+    const tc = try store.readChange(tagged);
+    defer object.freeChange(alloc, tc);
+    try testing.expectEqualStrings("m1\n", tc.message);
+    try testing.expect(!store.refExists(branch));
+
+    const hex = gitOidHex(&m2);
+    const by_sha = try importRefChange(&store, abs, hex[0..]);
+    const sc = try store.readChange(by_sha);
+    defer object.freeChange(alloc, sc);
+    try testing.expectEqualStrings("m2\n", sc.message);
+    try testing.expectEqual(@as(usize, 1), sc.parents.len);
+    try testing.expect(sc.parents[0].eql(tagged));
+    try testing.expect(!store.refExists(branch));
+
+    const to_tip = try importRefTo(&store, abs, "master", "graded");
+    try testing.expect(store.refExists("graded"));
+    try testing.expect(to_tip.eql(by_sha));
 }

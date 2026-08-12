@@ -62,7 +62,11 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a back -d 'rewind n moments, default 1'
     \\complete -c sdt -n __fish_use_subcommand -a rewind -d 'rewind to any @ref'
     \\complete -c sdt -n __fish_use_subcommand -a moments -d 'captured states and their verdicts'
-    \\complete -c sdt -n __fish_use_subcommand -a grade -d 'run checks in the background'
+    \\complete -c sdt -n __fish_use_subcommand -a grade -d 'run checks now, or grade a git ref'
+    \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l repo -d 'grade a ref in another git repo' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l fast -d 'use the fast tier'
+    \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l full -d 'use the full tier'
+    \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l json -d 'machine-readable output'
     \\complete -c sdt -n __fish_use_subcommand -a doctor -d 'what is on, what is degraded, and why'
     \\complete -c sdt -n __fish_use_subcommand -a recap -d 'green and red spans, and what thrashed'
     \\complete -c sdt -n __fish_use_subcommand -a super -d 'paths holding more than one version'
@@ -131,7 +135,7 @@ const zsh_script =
     \\    'back:rewind n moments, default 1'
     \\    'rewind:rewind to any @ref'
     \\    'moments:captured states and their verdicts'
-    \\    'grade:run checks in the background'
+    \\    'grade:run checks now, or grade a git ref'
     \\    'doctor:what is on, what is degraded, and why'
     \\    'recap:green and red spans, and what thrashed'
     \\    'super:paths holding more than one version'
@@ -159,6 +163,8 @@ const zsh_script =
     \\    _describe -t commands 'sdt command' commands
     \\  elif (( CURRENT == 3 )) && [[ ${words[2]} == completions ]]; then
     \\    compadd fish zsh bash
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (grade|gd) ]]; then
+    \\    compadd -- --repo --fast --full --json
     \\  fi
     \\}
     \\_gr "$@"
@@ -179,6 +185,10 @@ const bash_script =
     \\  fi
     \\  if [[ $COMP_CWORD -eq 2 && "$prev" == "completions" ]]; then
     \\    COMPREPLY=( $(compgen -W "fish zsh bash" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "grade" || "${COMP_WORDS[1]}" == "gd" ]]; then
+    \\    COMPREPLY=( $(compgen -W "--repo --fast --full --json" -- "$cur") )
     \\    return 0
     \\  fi
     \\}
