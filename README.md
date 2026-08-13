@@ -38,6 +38,8 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Scriptable output | `sdt status --json` and `sdt log --json`; `sdt completions <fish\|zsh\|bash>`. |
 | Bidirectional git interop | Import and export full history, branches, and tags. Push and pull to GitHub. |
 | Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
+| History you can edit | `rebase`, `squash`, `split` (by path or by hunk), `reorder`, `amend --at`, `drop`. Every one is reversible with `sdt undo`. |
+| Converges without a service | The operation log is a DAG with a merge that cannot fail, so two machines reconcile through `sdt sync`, or through any dumb transport that moves files. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
 | Sealed secrets | Commit your `.env` safely. Values are encrypted per-variable into one file; the plaintext is never an object. Team access is a wrapped key, not a service. |
 | Encrypted sharing | `sdt send` hands a repo to someone peer to peer, or as a link or file no host can read. |
@@ -128,12 +130,38 @@ sdt absorb                 # fold edits into the changes they belong to
 sdt gc                     # reclaim unreachable objects
 ```
 
+Editing history. Every one of these is reversible with `sdt undo`:
+
+```
+sdt rebase <ref>           # rb   replay this branch onto a new base
+sdt squash [n] [--at <ref>]# sq   collapse adjacent changes
+sdt split <ref> -- <paths> # spl  split a change, including one that is not the tip
+sdt split <ref> --hunk src/a.zig:1,3    # or by hunk
+sdt reorder 3 1 2          # ro   permute the last N changes
+sdt amend --at <ref>       # am   fold working edits into a named change
+sdt drop <ref>             # dr   remove a change, keep its content in the tree
+sdt point <ref>            # pt   move the branch tip anywhere
+```
+
 Working with git:
 
 ```
 sdt clone <git-url> [dir]
-sdt import <git-repo>   /   sdt export <git-repo>
+sdt import <git-repo>   /   sdt export <git-repo> [branch] [--force]
 sdt push [remote] [branch]     # uses your existing git credentials
+sdt push --require-green       # a red or ungraded tree does not leave the machine
+sdt attest [ref]               # post the verdict, and its warrant, as a commit status
+```
+
+`sdt attest` puts the warrant where your team already looks. The status reads
+`green · independent · relevance 5/5 · discriminating`, so a required check in
+branch protection tells you what the green is worth, not merely that it is green.
+
+Telling a coding agent whether its work passed:
+
+```
+sdt grade --json           # one object, real exit codes: 0 green, 10 red, 11 ungraded
+sdt hook install           # prints a Claude Code Stop hook; it writes no settings file
 ```
 
 Large files (Git LFS):

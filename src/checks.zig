@@ -28,6 +28,18 @@ extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_
 extern "c" fn chdir(path: [*:0]const u8) c_int;
 extern "c" fn setpriority(which: c_int, who: c_uint, prio: c_int) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+/// Credentials the parent may be holding that a check has no business reading.
+/// A check command comes from repo config, so it is not more trusted than the
+/// repo; a token in the environment would otherwise be readable by any of them.
+pub const scrubbed_env = [_][*:0]const u8{
+    "SDT_GITHUB_TOKEN",
+    "GITHUB_TOKEN",
+    "GIT_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_API_TOKEN",
+};
 extern "c" fn _exit(code: c_int) noreturn;
 
 extern "c" fn setpgid(pid: std.c.pid_t, pgid: std.c.pid_t) c_int;
@@ -569,6 +581,7 @@ pub fn run(
         // Layer 4 is enforced, not advisory. A grade that competes with the
         // developer's own build is worse than no grade.
         _ = setpriority(PRIO_PROCESS, 0, launch.nice);
+        for (scrubbed_env) |name| _ = unsetenv(name);
         for (env_z) |pair| _ = setenv(pair[0].ptr, pair[1].ptr, 1);
         // stdout and stderr go to /dev/null: a background grade must never
         // write into the developer's terminal.
@@ -800,6 +813,29 @@ test "run reports success and failure of a real command" {
     const bad = try run(alloc, io, abs, "exit 7", .{});
     try testing.expectEqual(@as(i32, 7), bad.exit_code);
     try testing.expectEqual(verdict.Result.red, bad.result());
+}
+
+test "a check cannot read the parent's credentials" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(abs);
+
+    _ = setenv("GITHUB_TOKEN", "ghp_secret", 1);
+    _ = setenv("SDT_GITHUB_TOKEN", "sdt_secret", 1);
+    defer {
+        _ = unsetenv("GITHUB_TOKEN");
+        _ = unsetenv("SDT_GITHUB_TOKEN");
+    }
+
+    const seen = try run(alloc, io, abs, "test -z \"$GITHUB_TOKEN\" && test -z \"$SDT_GITHUB_TOKEN\"", .{});
+    try testing.expectEqual(verdict.Result.green, seen.result());
+
+    const passed = try run(alloc, io, abs, "test -n \"$PATH\"", .{});
+    try testing.expectEqual(verdict.Result.green, passed.result());
 }
 
 test "run executes in the directory it was given" {

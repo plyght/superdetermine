@@ -42,6 +42,7 @@ const blame = @import("blame.zig");
 const completions = @import("completions.zig");
 const absorb = @import("absorb.zig");
 const lfs = @import("lfs.zig");
+const attest = @import("attest.zig");
 const proc = @import("proc.zig");
 const seal = @import("seal.zig");
 const keyring = @import("keyring.zig");
@@ -138,6 +139,7 @@ const sections = [_]Section{
         .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
         .{ .name = "push", .alias = "ps", .args = "[remote] [branch] [--require-green]", .desc = "uses your existing git credentials" },
         .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
+        .{ .name = "attest", .alias = "at", .args = "[ref] [--dry-run]", .desc = "post the warrant as a GitHub commit status" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
     } },
     .{ .title = "housekeeping", .entries = &.{
@@ -232,6 +234,7 @@ const aliases = [_]Alias{
     .{ .short = "cl", .full = "clone" },
     .{ .short = "ps", .full = "push" },
     .{ .short = "pl", .full = "pull" },
+    .{ .short = "at", .full = "attest" },
     .{ .short = "cfg", .full = "config" },
     .{ .short = "comp", .full = "completions" },
     .{ .short = "sl", .full = "seal" },
@@ -407,6 +410,12 @@ pub fn main(init: std.process.Init) !void {
         try cmdPush(io, alloc, w, rest);
     } else if (eq(cmd, "pull")) {
         try cmdPull(io, alloc, w, rest);
+    } else if (eq(cmd, "attest")) {
+        const code = try cmdAttest(io, alloc, w, rest);
+        if (code != 0) {
+            try w.flush();
+            std.process.exit(code);
+        }
     } else if (eq(cmd, "clone")) {
         try cmdClone(io, alloc, w, rest);
     } else if (eq(cmd, "config")) {
@@ -2953,6 +2962,221 @@ fn cmdGradeRef(
         try ui.hint(w, "no attribution for these commits, so the warrant is unknown rather than clean");
     }
     return (grade.Report{ .status = grade.statusOf(v), .v = v, .tier = tier, .ran = 1 }).exitCode();
+}
+
+// Resolve a revision to the full git sha the remote knows it by. `lookupGitRef`
+// answers in sdt ids and `branchTipHex` only takes a branch name, so the git
+// side of the question is asked of git.
+fn gitShaOf(alloc: std.mem.Allocator, repo_path: []const u8, spec: []const u8) !?[]u8 {
+    const peeled = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{spec});
+    defer alloc.free(peeled);
+    const out = proc.capture(
+        alloc,
+        &.{ "git", "-C", repo_path, "rev-parse", "--verify", "--quiet", peeled },
+        "",
+    ) catch return null;
+    defer out.deinit(alloc);
+    if (!out.ok()) return null;
+    const sha = std.mem.trim(u8, out.stdout, " \t\r\n");
+    if (!attest.isFullSha(sha)) return null;
+    return try alloc.dupe(u8, sha);
+}
+
+/// Tell a git host what this tree's warrant says. The status is a label, not a
+/// gate: whoever configures branch protection decides what to do with it, and
+/// a hollow green posts as a success that says out loud that it is hollow.
+/// Nothing here runs unless the user typed `sdt attest`.
+fn cmdAttest(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !u8 {
+    var s = (try openRepo(io, alloc, w)) orelse return 0;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const repo_abs = try work.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(repo_abs);
+
+    var git_ref: []const u8 = "HEAD";
+    var remote_name: []const u8 = "origin";
+    var tier: verdict.Tier = .full;
+    var dry_run = false;
+    var as_json = false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--dry-run")) {
+            dry_run = true;
+        } else if (eq(a, "--json")) {
+            as_json = true;
+        } else if (eq(a, "--fast")) {
+            tier = .fast;
+        } else if (eq(a, "--full")) {
+            tier = .full;
+        } else if (eq(a, "--remote")) {
+            i += 1;
+            if (i < rest.len) remote_name = rest[i];
+        } else if (a.len != 0 and a[0] != '-') {
+            git_ref = a;
+        }
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    if (!set.has(tier)) {
+        try w.print("{s}{s}{s} no {s} check configured, so there is nothing to attest to\n", .{
+            ui.on(.red), ui.cross, ui.off(), tier.label(),
+        });
+        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+        return grade.exit_no_check;
+    }
+
+    const sha = (try gitShaOf(alloc, repo_abs, git_ref)) orelse {
+        try w.print("{s}{s}{s} could not resolve {s}{s}{s} to a git commit here\n", .{
+            ui.on(.red),  ui.cross, ui.off(),
+            ui.on(.bold), git_ref,  ui.off(),
+        });
+        try ui.hint(w, "a status attaches to a git sha, so the change has to exist in .git first");
+        return grade.exit_ungraded;
+    };
+    defer alloc.free(sha);
+
+    const remote_url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
+        try w.print("unknown remote '{s}'. pass `--remote <name>`, or set it in git\n", .{remote_name});
+        return grade.exit_ungraded;
+    };
+    defer alloc.free(remote_url);
+
+    const target = (try attest.targetFromRemote(alloc, remote_url)) orelse {
+        try w.print("{s}{s}{s} remote '{s}' is not a hosted repository, so there is nowhere to post\n", .{
+            ui.on(.red), ui.cross, ui.off(), remote_name,
+        });
+        return grade.exit_ungraded;
+    };
+    defer target.deinit(alloc);
+
+    const change_oid = git.importRefChange(&s, repo_abs, git_ref) catch |e| {
+        try w.print("{s}{s}{s} could not read {s}{s}{s} out of git: {s}\n", .{
+            ui.on(.red),   ui.cross, ui.off(),
+            ui.on(.bold),  git_ref,  ui.off(),
+            @errorName(e),
+        });
+        return grade.exit_ungraded;
+    };
+
+    const change = try s.readChange(change_oid);
+    defer object.freeChange(alloc, change);
+
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+    const cached = ix.best(
+        change.tree,
+        verdict.commandHash(set.command(.fast)),
+        verdict.commandHash(set.command(.full)),
+    );
+
+    const v = cached orelse blk: {
+        const rules = warrant.pathRules(&s, alloc);
+        defer rules.deinit(alloc);
+        const ctx = gradeContext(alloc, &s, work, set, rules);
+        break :blk try grade.gradeChange(ctx, change_oid, tier);
+    };
+
+    var desc_buf: [attest.max_description]u8 = undefined;
+    const description = attest.describe(&desc_buf, v);
+    var ctx_buf: [32]u8 = undefined;
+    const context = attest.contextFor(&ctx_buf, v.tier);
+    const state = attest.stateFor(v);
+
+    const url = attest.statusUrl(alloc, target, sha) catch {
+        try w.print("{s}{s}{s} {s} is not a full git sha\n", .{ ui.on(.red), ui.cross, ui.off(), sha });
+        return grade.exit_ungraded;
+    };
+    defer alloc.free(url);
+
+    const exit_result: u8 = if (v.result == .green) grade.exit_green else grade.exit_red;
+
+    if (dry_run) {
+        if (as_json) {
+            try attestJson(w, url, context, state, description, v, null);
+        } else {
+            try w.print("{s}would POST{s} {s}\n", .{ ui.on(.dim), ui.off(), url });
+            try w.print("  {s}{s}{s}  {s}  {s}\n", .{
+                ui.on(.cyan), context, ui.off(), state.label(), description,
+            });
+        }
+        return exit_result;
+    }
+
+    const tok = attest.envToken() orelse {
+        try w.print("{s}{s}{s} no token, so nothing was sent\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "set SDT_GITHUB_TOKEN (or GITHUB_TOKEN) to a token with `repo:status`; `--dry-run` shows what would go");
+        return attest.exit_no_token;
+    };
+    const token = std.mem.span(tok);
+    if (token.len == 0) {
+        try w.print("{s}{s}{s} the token in the environment is empty, so nothing was sent\n", .{
+            ui.on(.red), ui.cross, ui.off(),
+        });
+        return attest.exit_no_token;
+    }
+
+    const body = try attest.buildBody(alloc, state, context, description);
+    defer alloc.free(body);
+
+    const code = attest.post(alloc, url, token, body) catch |e| {
+        try w.print("{s}{s}{s} could not reach {s}: {s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), target.api_base, @errorName(e),
+        });
+        return attest.exit_network;
+    };
+    if (code < 200 or code >= 300) {
+        try w.print("{s}{s}{s} {s} refused the status (HTTP {d})\n", .{
+            ui.on(.red), ui.cross, ui.off(), target.api_base, code,
+        });
+        try ui.hint(w, "the token needs `repo:status` here, and the commit has to be pushed already");
+        return attest.exit_network;
+    }
+
+    if (as_json) {
+        try attestJson(w, url, context, state, description, v, code);
+        return exit_result;
+    }
+
+    const colour: ui.Color = if (v.result == .green) .green else .red;
+    try w.print("{s}{s}{s} {s}{s}{s} on {s}{s}{s}\n", .{
+        ui.on(colour), if (v.result == .green) ui.check else ui.cross, ui.off(),
+        ui.on(.cyan),  context,                                        ui.off(),
+        ui.on(.bold),  sha[0..12],                                     ui.off(),
+    });
+    try w.print("  {s}\n", .{description});
+    if (v.isHollow()) {
+        try ui.hint(w, "posted as a success, and the description says the green proves little");
+    }
+    return exit_result;
+}
+
+fn attestJson(
+    w: *std.Io.Writer,
+    url: []const u8,
+    context: []const u8,
+    state: attest.State,
+    description: []const u8,
+    v: verdict.Verdict,
+    code: ?u16,
+) !void {
+    try w.writeAll("{\"url\":");
+    try writeJsonString(w, url);
+    try w.writeAll(",\"context\":");
+    try writeJsonString(w, context);
+    try w.print(",\"state\":\"{s}\",\"description\":", .{state.label()});
+    try writeJsonString(w, description);
+    try w.print(",\"result\":\"{s}\",\"tier\":\"{s}\",\"hollow\":{s},\"http_status\":", .{
+        v.result.label(), v.tier.label(), if (v.isHollow()) "true" else "false",
+    });
+    if (code) |c| {
+        try w.print("{d}}}\n", .{c});
+    } else {
+        try w.writeAll("null}\n");
+    }
 }
 
 fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {

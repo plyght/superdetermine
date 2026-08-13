@@ -101,6 +101,12 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a sync -d 'mirror superdetermine HEAD into the colocated .git'
     \\complete -c sdt -n __fish_use_subcommand -a push -d 'push to a remote'
     \\complete -c sdt -n __fish_use_subcommand -a pull -d 'pull from a remote'
+    \\complete -c sdt -n __fish_use_subcommand -a attest -d 'post the warrant as a GitHub commit status'
+    \\complete -c sdt -n '__fish_seen_subcommand_from attest at' -l remote -d 'which remote names the repository' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from attest at' -l dry-run -d 'show what would be posted, send nothing'
+    \\complete -c sdt -n '__fish_seen_subcommand_from attest at' -l fast -d 'use the fast tier'
+    \\complete -c sdt -n '__fish_seen_subcommand_from attest at' -l full -d 'use the full tier'
+    \\complete -c sdt -n '__fish_seen_subcommand_from attest at' -l json -d 'machine-readable output'
     \\complete -c sdt -n __fish_use_subcommand -a init -d 'create a superdetermine repo here'
     \\complete -c sdt -n __fish_use_subcommand -a config -d 'get/set config'
     \\complete -c sdt -n __fish_use_subcommand -a update -d 'update sdt to the latest release'
@@ -178,6 +184,8 @@ const zsh_script =
     \\    'sync:mirror superdetermine HEAD into the colocated .git'
     \\    'push:push to a remote'
     \\    'pull:pull from a remote'
+    \\    'attest:post the warrant as a GitHub commit status'
+    \\    'at:post the warrant as a GitHub commit status'
     \\    'init:create a superdetermine repo here'
     \\    'config:get/set config'
     \\    'update:update sdt to the latest release'
@@ -195,6 +203,8 @@ const zsh_script =
     \\    compadd fish zsh bash
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (grade|gd) ]]; then
     \\    compadd -- --repo --fast --full --json
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (attest|at) ]]; then
+    \\    compadd -- --remote --dry-run --fast --full --json
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (squash|sq) ]]; then
     \\    compadd -- -m --at
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (split|spl) ]]; then
@@ -218,7 +228,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab absorb am amend b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve sh share sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve sh share sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
@@ -229,6 +239,10 @@ const bash_script =
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "grade" || "${COMP_WORDS[1]}" == "gd" ]]; then
     \\    COMPREPLY=( $(compgen -W "--repo --fast --full --json" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "attest" || "${COMP_WORDS[1]}" == "at" ]]; then
+    \\    COMPREPLY=( $(compgen -W "--remote --dry-run --fast --full --json" -- "$cur") )
     \\    return 0
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "squash" || "${COMP_WORDS[1]}" == "sq" ]]; then
