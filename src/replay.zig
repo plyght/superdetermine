@@ -129,7 +129,7 @@ pub fn applyTreeDelta(
     var pit = paths.keyIterator();
     while (pit.next()) |kp| {
         const path = kp.*;
-        const resolved = try resolveEntry(
+        const resolved = try merge.resolveEntry(
             store,
             alloc,
             path,
@@ -155,73 +155,6 @@ pub fn applyTreeDelta(
     entries.deinit(alloc);
 
     return .{ .tree = tree_oid, .conflicts = try conflicts.toOwnedSlice(alloc) };
-}
-
-fn blobOf(e: ?object.TreeEntry) ?Oid {
-    return if (e) |x| x.blob else null;
-}
-
-fn modeOf(e: ?object.TreeEntry) ?object.Mode {
-    return if (e) |x| x.mode else null;
-}
-
-fn oidEqOpt(a: ?Oid, b: ?Oid) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.?.eql(b.?);
-}
-
-const ModeResolution = struct { mode: object.Mode, conflict: bool };
-
-fn resolveMode(from: ?object.Mode, ours: ?object.Mode, theirs: ?object.Mode) ModeResolution {
-    const o = ours orelse return .{ .mode = theirs orelse .regular, .conflict = false };
-    const t = theirs orelse return .{ .mode = o, .conflict = false };
-    if (o == t) return .{ .mode = o, .conflict = false };
-    if (from) |f| {
-        if (f == o) return .{ .mode = t, .conflict = false };
-        if (f == t) return .{ .mode = o, .conflict = false };
-    }
-    return .{ .mode = t, .conflict = true };
-}
-
-fn isSymlink(e: ?object.TreeEntry) bool {
-    return if (e) |x| x.mode == .symlink else false;
-}
-
-fn resolveEntry(
-    store: *Store,
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    from: ?object.TreeEntry,
-    ours: ?object.TreeEntry,
-    theirs: ?object.TreeEntry,
-    conflicts: *std.ArrayList([]u8),
-    sset: superpose.Settings,
-    superposed: *usize,
-) !?object.TreeEntry {
-    const fb = blobOf(from);
-    const ob = blobOf(ours);
-    const tb = blobOf(theirs);
-
-    const before = conflicts.items.len;
-    var blob: ?Oid = null;
-
-    const both_diverged = ob != null and tb != null and
-        !oidEqOpt(ob, tb) and !oidEqOpt(ob, fb) and !oidEqOpt(tb, fb);
-
-    if (both_diverged and (isSymlink(from) or isSymlink(ours) or isSymlink(theirs))) {
-        try conflicts.append(alloc, try alloc.dupe(u8, path));
-        blob = tb;
-    } else {
-        blob = try merge.resolvePath(store, alloc, path, fb, ob, tb, conflicts, sset, superposed);
-    }
-
-    const b = blob orelse return null;
-    const m = resolveMode(modeOf(from), modeOf(ours), modeOf(theirs));
-    if (m.conflict and conflicts.items.len == before) {
-        try conflicts.append(alloc, try alloc.dupe(u8, path));
-    }
-    return .{ .mode = m.mode, .path = path, .blob = b };
 }
 
 // --- tests ---

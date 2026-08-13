@@ -27,10 +27,13 @@ const Oid = oid.Oid;
 pub const dir_name = ".sdt";
 pub const legacy_dir_name = ".gr";
 
+pub const chunk_key_file = "chunkkey";
+
 pub const Store = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     root: std.Io.Dir, // handle to the `.gr` directory
+    gear: ?cdc.GearTable = null,
 
     pub const Error = error{
         NotARepo,
@@ -48,6 +51,13 @@ pub const Store = struct {
         try dir.createDirPath(io, dir_name ++ "/objects");
         try dir.createDirPath(io, dir_name ++ "/refs/heads");
         try dir.writeFile(io, .{ .sub_path = dir_name ++ "/HEAD", .data = "ref: refs/heads/main\n" });
+
+        const hex = std.fmt.bytesToHex(try cdc.randomKey(io), .lower);
+        var line: [cdc.key_len * 2 + 1]u8 = undefined;
+        @memcpy(line[0 .. cdc.key_len * 2], &hex);
+        line[cdc.key_len * 2] = '\n';
+        try dir.writeFile(io, .{ .sub_path = dir_name ++ "/" ++ chunk_key_file, .data = &line });
+
         return open(io, alloc, dir);
     }
 
@@ -55,7 +65,24 @@ pub const Store = struct {
     pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
         const root = dir.openDir(io, dir_name, .{}) catch
             dir.openDir(io, legacy_dir_name, .{}) catch return Error.NotARepo;
-        return .{ .io = io, .alloc = alloc, .root = root };
+        var s: Store = .{ .io = io, .alloc = alloc, .root = root };
+        s.gear = loadGear(io, root);
+        return s;
+    }
+
+    fn loadGear(io: std.Io, root: std.Io.Dir) cdc.GearTable {
+        var buf: [cdc.key_len * 2 + 16]u8 = undefined;
+        const raw = root.readFile(io, chunk_key_file, &buf) catch return cdc.legacy_gear;
+        const hex = std.mem.trim(u8, raw, " \t\r\n");
+        if (hex.len != cdc.key_len * 2) return cdc.legacy_gear;
+        var key: cdc.Key = undefined;
+        _ = std.fmt.hexToBytes(&key, hex) catch return cdc.legacy_gear;
+        return cdc.gearFromKey(key);
+    }
+
+    fn gearTable(self: *Store) *const cdc.GearTable {
+        if (self.gear == null) self.gear = loadGear(self.io, self.root);
+        return &self.gear.?;
     }
 
     /// Walk up from `dir` to find the nearest repo (like git's discovery).
@@ -122,7 +149,7 @@ pub const Store = struct {
     pub fn writeFileContent(self: *Store, data: []const u8) !Oid {
         var chunk_oids: std.ArrayList(Oid) = .empty;
         defer chunk_oids.deinit(self.alloc);
-        var chunker = cdc.Chunker.init(data, .{});
+        var chunker = cdc.Chunker.initWith(data, .{}, self.gearTable());
         while (chunker.next()) |ch| {
             const co = try self.writeRaw(data[ch.offset..][0..ch.len]);
             try chunk_oids.append(self.alloc, co);
@@ -274,6 +301,94 @@ test "file content chunk roundtrip + dedup" {
     edited[data.len / 2] ^= 0xff;
     const blob2 = try store.writeFileContent(edited);
     try testing.expect(!blob2.eql(blob));
+}
+
+fn legacyStore(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
+    var s = try Store.init(io, alloc, dir);
+    s.deinit();
+    try dir.deleteFile(io, dir_name ++ "/" ++ chunk_key_file);
+    return Store.open(io, alloc, dir);
+}
+
+fn pinnedContent(alloc: std.mem.Allocator, n: usize) ![]u8 {
+    const data = try alloc.alloc(u8, n);
+    var h = oid.Blake3.init(.{});
+    h.update("superdetermine store keyed chunking");
+    h.final(data);
+    return data;
+}
+
+test "a new repo gets a chunk key; a repo without one keeps legacy boundaries" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp_keyed = std.testing.tmpDir(.{});
+    defer tmp_keyed.cleanup();
+    var tmp_legacy = std.testing.tmpDir(.{});
+    defer tmp_legacy.cleanup();
+
+    var keyed = try Store.init(io, alloc, tmp_keyed.dir);
+    defer keyed.deinit();
+    var legacy = try legacyStore(io, alloc, tmp_legacy.dir);
+    defer legacy.deinit();
+
+    try testing.expect(!std.mem.eql(u64, &keyed.gear.?, &cdc.legacy_gear));
+    try testing.expectEqualSlices(u64, &cdc.legacy_gear, &legacy.gear.?);
+
+    const data = try pinnedContent(alloc, 4 * 1024 * 1024);
+    defer alloc.free(data);
+
+    const keyed_blob = try keyed.writeFileContent(data);
+    const legacy_blob = try legacy.writeFileContent(data);
+    try testing.expect(!keyed_blob.eql(legacy_blob));
+
+    const back = try keyed.readFileContent(keyed_blob);
+    defer alloc.free(back);
+    try testing.expectEqualSlices(u8, data, back);
+
+    var reopened = try Store.open(io, alloc, tmp_keyed.dir);
+    defer reopened.deinit();
+    try testing.expectEqualSlices(u64, &keyed.gear.?, &reopened.gear.?);
+    const again = try reopened.writeFileContent(data);
+    try testing.expect(again.eql(keyed_blob));
+}
+
+test "objects transfer correctly between repos with different chunk keys" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+
+    var src = try Store.init(io, alloc, tmp_a.dir);
+    defer src.deinit();
+    var dst = try Store.init(io, alloc, tmp_b.dir);
+    defer dst.deinit();
+    try testing.expect(!std.mem.eql(u64, &src.gear.?, &dst.gear.?));
+
+    const data = try pinnedContent(alloc, 5 * 1024 * 1024);
+    defer alloc.free(data);
+    const blob_oid = try src.writeFileContent(data);
+
+    const raw = try src.readRaw(blob_oid);
+    defer alloc.free(raw);
+    _ = try dst.writeRaw(raw);
+    const blob = try object.Blob.decode(alloc, raw);
+    defer alloc.free(blob.chunks);
+    for (blob.chunks) |c| {
+        const chunk = try src.readRaw(c);
+        defer alloc.free(chunk);
+        _ = try dst.writeRaw(chunk);
+    }
+
+    const back = try dst.readFileContent(blob_oid);
+    defer alloc.free(back);
+    try testing.expectEqualSlices(u8, data, back);
+
+    const rechunked = try dst.writeFileContent(data);
+    try testing.expect(!rechunked.eql(blob_oid));
 }
 
 test "refs and HEAD" {

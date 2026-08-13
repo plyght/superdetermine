@@ -93,18 +93,30 @@ pub fn diffLines(alloc: std.mem.Allocator, old: []const u8, new: []const u8) ![]
     return ops.toOwnedSlice(alloc);
 }
 
-/// Emit a git-ish unified diff. Real `@@` hunks: runs of unchanged context
-/// beyond 3 lines are collapsed, and each surviving change group gets an
-/// `@@ -oldstart,oldcount +newstart,newcount @@` header.
-pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !void {
-    try w.print("{s}--- a/{s}{s}\n", .{ ui.on(.bold), path, ui.off() });
-    try w.print("{s}+++ b/{s}{s}\n", .{ ui.on(.bold), path, ui.off() });
+/// One `@@` group of a unified diff: the half-open op range it covers plus the
+/// 1-based line spans it occupies on each side.
+pub const Hunk = struct {
+    start: usize,
+    end: usize,
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+};
 
+pub const HunkError = error{
+    NoSuchHunk,
+    BinaryHasNoHunks,
+};
+
+/// Group a line-op run into the same hunks `writeUnified` prints, so a hunk
+/// number a caller read off `sdt diff` means the same thing everywhere.
+pub fn hunks(alloc: std.mem.Allocator, ops: []const LineOp) ![]Hunk {
     const context = 3;
     // Mark which ops belong to a hunk (a change, or context within `context`
     // lines of a change).
-    const in_hunk = try std.heap.page_allocator.alloc(bool, ops.len);
-    defer std.heap.page_allocator.free(in_hunk);
+    const in_hunk = try alloc.alloc(bool, ops.len);
+    defer alloc.free(in_hunk);
     @memset(in_hunk, false);
     for (ops, 0..) |op, idx| {
         if (op.tag == .keep) continue;
@@ -113,6 +125,9 @@ pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !v
         var k = lo;
         while (k < hi) : (k += 1) in_hunk[k] = true;
     }
+
+    var list: std.ArrayList(Hunk) = .empty;
+    errdefer list.deinit(alloc);
 
     var idx: usize = 0;
     // 1-based line numbers in old/new files.
@@ -146,29 +161,103 @@ pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !v
                 .add => new_count += 1,
             }
         }
-        const old_start = if (old_count == 0) old_line - 1 else old_line;
-        const new_start = if (new_count == 0) new_line - 1 else new_line;
-        try w.print("{s}@@ -{d},{d} +{d},{d} @@{s}\n", .{ ui.on(.cyan), old_start, old_count, new_start, new_count, ui.off() });
-        var h = start;
-        while (h < end) : (h += 1) {
-            const op = ops[h];
+        try list.append(alloc, .{
+            .start = start,
+            .end = end,
+            .old_start = if (old_count == 0) old_line - 1 else old_line,
+            .old_count = old_count,
+            .new_start = if (new_count == 0) new_line - 1 else new_line,
+            .new_count = new_count,
+        });
+        old_line += old_count;
+        new_line += new_count;
+        idx = end;
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+/// How many hunks `sdt diff` would print for this pair of file contents.
+pub fn hunkCount(alloc: std.mem.Allocator, old: []const u8, new: []const u8) !usize {
+    if (looksBinary(old) or looksBinary(new)) return HunkError.BinaryHasNoHunks;
+    const ops = try diffLines(alloc, old, new);
+    defer alloc.free(ops);
+    const hs = try hunks(alloc, ops);
+    defer alloc.free(hs);
+    return hs.len;
+}
+
+fn endsWithNewline(buf: []const u8) bool {
+    return buf.len != 0 and buf[buf.len - 1] == '\n';
+}
+
+/// Rebuild file content with only the 1-based hunks in `selected` applied to
+/// `old`. Selecting none yields `old`, selecting every hunk yields `new`, and
+/// the two halves of any selection compose back to `new`.
+pub fn applyHunks(
+    alloc: std.mem.Allocator,
+    old: []const u8,
+    new: []const u8,
+    selected: []const usize,
+) ![]u8 {
+    if (looksBinary(old) or looksBinary(new)) return HunkError.BinaryHasNoHunks;
+
+    const ops = try diffLines(alloc, old, new);
+    defer alloc.free(ops);
+    const hs = try hunks(alloc, ops);
+    defer alloc.free(hs);
+
+    const take = try alloc.alloc(bool, ops.len);
+    defer alloc.free(take);
+    @memset(take, false);
+    for (selected) |n| {
+        if (n == 0 or n > hs.len) return HunkError.NoSuchHunk;
+        const h = hs[n - 1];
+        var k = h.start;
+        while (k < h.end) : (k += 1) take[k] = true;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var last: ?LineOp = null;
+    for (ops, 0..) |op, i| {
+        const emit = switch (op.tag) {
+            .keep => true,
+            .del => !take[i],
+            .add => take[i],
+        };
+        if (!emit) continue;
+        try out.appendSlice(alloc, op.text);
+        try out.append(alloc, '\n');
+        last = op;
+    }
+    if (last) |op| {
+        const kept = if (op.tag == .add) endsWithNewline(new) else endsWithNewline(old);
+        if (!kept) _ = out.pop();
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Emit a git-ish unified diff. Real `@@` hunks: runs of unchanged context
+/// beyond 3 lines are collapsed, and each surviving change group gets an
+/// `@@ -oldstart,oldcount +newstart,newcount @@` header.
+pub fn writeUnified(w: *std.Io.Writer, path: []const u8, ops: []const LineOp) !void {
+    try w.print("{s}--- a/{s}{s}\n", .{ ui.on(.bold), path, ui.off() });
+    try w.print("{s}+++ b/{s}{s}\n", .{ ui.on(.bold), path, ui.off() });
+
+    const alloc = std.heap.page_allocator;
+    const hs = try hunks(alloc, ops);
+    defer alloc.free(hs);
+
+    for (hs) |h| {
+        try w.print("{s}@@ -{d},{d} +{d},{d} @@{s}\n", .{ ui.on(.cyan), h.old_start, h.old_count, h.new_start, h.new_count, ui.off() });
+        for (ops[h.start..h.end]) |op| {
             switch (op.tag) {
-                .keep => {
-                    try w.print(" {s}\n", .{op.text});
-                    old_line += 1;
-                    new_line += 1;
-                },
-                .del => {
-                    try w.print("{s}-{s}{s}\n", .{ ui.on(.red), op.text, ui.off() });
-                    old_line += 1;
-                },
-                .add => {
-                    try w.print("{s}+{s}{s}\n", .{ ui.on(.green), op.text, ui.off() });
-                    new_line += 1;
-                },
+                .keep => try w.print(" {s}\n", .{op.text}),
+                .del => try w.print("{s}-{s}{s}\n", .{ ui.on(.red), op.text, ui.off() }),
+                .add => try w.print("{s}+{s}{s}\n", .{ ui.on(.green), op.text, ui.off() }),
             }
         }
-        idx = end;
     }
 }
 
@@ -242,7 +331,7 @@ pub fn freeChanges(alloc: std.mem.Allocator, changes: []FileChange) void {
     alloc.free(changes);
 }
 
-fn looksBinary(data: []const u8) bool {
+pub fn looksBinary(data: []const u8) bool {
     return std.mem.indexOfScalar(u8, data, 0) != null;
 }
 
@@ -317,6 +406,73 @@ test "diffLines identical is all keep" {
     defer alloc.free(ops);
     try testing.expectEqual(@as(usize, 3), ops.len);
     for (ops) |op| try testing.expect(op.tag == .keep);
+}
+
+test "hunks groups distant edits separately and adjacent ones together" {
+    const alloc = testing.allocator;
+    const old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+    const new = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10a\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20a\n";
+
+    const ops = try diffLines(alloc, old, new);
+    defer alloc.free(ops);
+    const hs = try hunks(alloc, ops);
+    defer alloc.free(hs);
+
+    try testing.expectEqual(@as(usize, 3), hs.len);
+    try testing.expectEqual(@as(usize, 1), hs[0].old_start);
+    try testing.expectEqual(@as(usize, 7), hs[1].old_start);
+    try testing.expectEqual(@as(usize, 3), try hunkCount(alloc, old, new));
+}
+
+test "applyHunks takes only the chosen hunks and the halves compose" {
+    const alloc = testing.allocator;
+    const old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+    const new = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10a\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20a\n";
+
+    const middle = try applyHunks(alloc, old, new, &[_]usize{2});
+    defer alloc.free(middle);
+    try testing.expect(std.mem.indexOf(u8, middle, "10a\n") != null);
+    try testing.expect(std.mem.indexOf(u8, middle, "1a\n") == null);
+    try testing.expect(std.mem.indexOf(u8, middle, "20a\n") == null);
+
+    const rest = try applyHunks(alloc, middle, new, &[_]usize{ 1, 2 });
+    defer alloc.free(rest);
+    try testing.expectEqualStrings(new, rest);
+
+    const none = try applyHunks(alloc, old, new, &[_]usize{});
+    defer alloc.free(none);
+    try testing.expectEqualStrings(old, none);
+
+    const all = try applyHunks(alloc, old, new, &[_]usize{ 1, 2, 3 });
+    defer alloc.free(all);
+    try testing.expectEqualStrings(new, all);
+}
+
+test "applyHunks refuses a bad number and refuses binary" {
+    const alloc = testing.allocator;
+    try testing.expectError(
+        HunkError.NoSuchHunk,
+        applyHunks(alloc, "a\n", "b\n", &[_]usize{2}),
+    );
+    try testing.expectError(
+        HunkError.NoSuchHunk,
+        applyHunks(alloc, "a\n", "b\n", &[_]usize{0}),
+    );
+    try testing.expectError(
+        HunkError.BinaryHasNoHunks,
+        applyHunks(alloc, "a\x00b", "a\x00c", &[_]usize{1}),
+    );
+    try testing.expectError(
+        HunkError.BinaryHasNoHunks,
+        hunkCount(alloc, "a\x00b", "a\x00c"),
+    );
+}
+
+test "applyHunks keeps a missing trailing newline" {
+    const alloc = testing.allocator;
+    const got = try applyHunks(alloc, "a\nb\n", "a\nB", &[_]usize{1});
+    defer alloc.free(got);
+    try testing.expectEqualStrings("a\nB", got);
 }
 
 test "diffTrees reports modified file" {

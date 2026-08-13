@@ -2,6 +2,7 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const applog = @import("applog.zig");
+const opdag = @import("opdag.zig");
 const checks = @import("checks.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
@@ -71,6 +72,8 @@ pub fn record(store: *Store, op: OpRecord) !void {
     defer alloc.free(line);
 
     try applog.append(store, "oplog", line);
+
+    _ = opdag.commit(store, alloc, op.kind.label(), op.timestamp, op.branch) catch Oid.zero();
 }
 
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) !OpRecord {
@@ -275,6 +278,10 @@ fn currentPointer(records: []const OpRecord) usize {
 
 const testing = std.testing;
 
+test {
+    _ = @import("opdag.zig");
+}
+
 test "record, lastOp, and single-level undo" {
     const io = std.testing.io;
     const alloc = testing.allocator;
@@ -361,6 +368,56 @@ test "undo of unborn branch deletes the ref" {
     try testing.expect(store.refExists("feature"));
     try undo(&store, null);
     try testing.expect(!store.refExists("feature"));
+}
+
+test "the linear log keeps one operation head, and undo tracks it" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const a = Oid.ofBytes("dag A");
+    const b = Oid.ofBytes("dag B");
+
+    try store.updateRef("main", a);
+    try record(&store, .{ .kind = .snapshot, .branch = "main", .prev = Oid.zero(), .new = a, .timestamp = 1 });
+    try store.updateRef("main", b);
+    try record(&store, .{ .kind = .snapshot, .branch = "main", .prev = a, .new = b, .timestamp = 2 });
+
+    {
+        const hs = try opdag.heads(&store, alloc);
+        defer alloc.free(hs);
+        try testing.expectEqual(@as(usize, 1), hs.len);
+
+        var view = try opdag.currentView(&store, alloc);
+        defer view.deinit(alloc);
+        try testing.expect(!view.diverged());
+        try testing.expect(view.find("main").?.tips[0].eql(b));
+        try testing.expect((try opdag.resolve(&store, alloc)) == null);
+    }
+
+    try undo(&store, null);
+    try testing.expect((try store.readRef("main")).eql(a));
+
+    {
+        const hs = try opdag.heads(&store, alloc);
+        defer alloc.free(hs);
+        try testing.expectEqual(@as(usize, 1), hs.len);
+
+        var view = try opdag.currentView(&store, alloc);
+        defer view.deinit(alloc);
+        try testing.expect(view.find("main").?.tips[0].eql(a));
+    }
+
+    try redo(&store, null);
+    try testing.expect((try store.readRef("main")).eql(b));
+
+    const lo = (try lastOp(&store, alloc)).?;
+    defer alloc.free(lo.branch);
+    try testing.expectEqual(OpKind.redo, lo.kind);
 }
 
 test "lastOp is null on empty log" {

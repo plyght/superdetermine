@@ -499,8 +499,9 @@ pub fn importHead(store: *Store, git_repo_path: []const u8) !Oid {
     return importRefTo(store, git_repo_path, null, null);
 }
 
-/// Import one git branch's full history into `store`. `git_ref` is a git branch
-/// shorthand (null means the repo's HEAD) and `dest_branch` is the sdt branch to
+/// Import one git branch's full history into `store`. `git_ref` is any git
+/// revspec — a branch shorthand, tag, remote-tracking ref, raw SHA, `HEAD~3`
+/// (null means the repo's HEAD) — and `dest_branch` is the sdt branch to
 /// point at the imported tip (null means the sdt HEAD branch).
 pub fn importRefTo(store: *Store, git_repo_path: []const u8, git_ref: ?[]const u8, dest_branch: ?[]const u8) !Oid {
     const alloc = store.alloc;

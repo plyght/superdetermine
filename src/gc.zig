@@ -2,6 +2,8 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const oplog = @import("oplog.zig");
+const moment = @import("moment.zig");
+const opdag = @import("opdag.zig");
 const branches = @import("branches.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
@@ -13,6 +15,14 @@ pub const Stats = struct {
     bytes_freed: u64,
     kept: usize,
 };
+
+fn markChunks(store: *Store, marked: *Marked, o: Oid) !void {
+    const raw = store.readRaw(o) catch return;
+    defer store.alloc.free(raw);
+    const blob = object.Blob.decode(store.alloc, raw) catch return;
+    defer store.alloc.free(blob.chunks);
+    for (blob.chunks) |c| _ = try marked.getOrPut(c.bytes);
+}
 
 fn markObject(store: *Store, marked: *Marked, root: Oid) !void {
     if (root.isZero()) return;
@@ -72,6 +82,35 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
     for (records) |r| {
         try markObject(store, &marked, r.prev);
         try markObject(store, &marked, r.new);
+    }
+
+    const captured = moment.reachableObjects(store, alloc) catch &[_]Oid{};
+    defer alloc.free(captured);
+    for (captured) |o| {
+        if ((try marked.getOrPut(o.bytes)).found_existing) continue;
+        markChunks(store, &marked, o) catch continue;
+    }
+
+    const op_heads = opdag.heads(store, alloc) catch &[_]Oid{};
+    defer {
+        alloc.free(op_heads);
+    }
+    var op_stack: std.ArrayList(Oid) = .empty;
+    defer op_stack.deinit(alloc);
+    for (op_heads) |h| try op_stack.append(alloc, h);
+    while (op_stack.items.len > 0) {
+        const o = op_stack.pop().?;
+        if (o.isZero()) continue;
+        if ((try marked.getOrPut(o.bytes)).found_existing) continue;
+        const op = opdag.readOperation(store, alloc, o) catch continue;
+        defer opdag.freeOperation(alloc, op);
+        for (op.parents) |p| try op_stack.append(alloc, p);
+        _ = try marked.getOrPut(op.view.bytes);
+        const view = opdag.readView(store, alloc, op.view) catch continue;
+        defer view.deinit(alloc);
+        for (view.refs) |r| {
+            for (r.tips) |t| try markObject(store, &marked, t);
+        }
     }
 
     var stats: Stats = .{ .swept = 0, .bytes_freed = 0, .kept = 0 };

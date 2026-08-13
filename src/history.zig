@@ -5,6 +5,7 @@ const store_mod = @import("store.zig");
 const replay = @import("replay.zig");
 const merge = @import("merge.zig");
 const oplog = @import("oplog.zig");
+const diff = @import("diff.zig");
 const Oid = oid.Oid;
 const Store = store_mod.Store;
 
@@ -14,6 +15,16 @@ pub const Error = error{
     NothingToDo,
     OutOfRange,
     NotAPermutation,
+    NoSuchHunk,
+    BinaryHasNoHunks,
+    PathNotModified,
+};
+
+/// A hunk-level selection within one file: 1-based hunk numbers, counted the
+/// way `sdt diff` prints them.
+pub const HunkSpec = struct {
+    path: []const u8,
+    indices: []const usize,
 };
 
 pub const Result = struct {
@@ -382,6 +393,82 @@ fn scopedTree(
     return store.writeTree(.{ .entries = entries.items });
 }
 
+fn entryFor(entries: []const object.TreeEntry, path: []const u8) ?object.TreeEntry {
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.path, path)) return e;
+    }
+    return null;
+}
+
+/// The parent tree with only the named hunks of the named files applied. Hunks
+/// exist only where a file was modified in place, so an added, deleted or
+/// binary path is refused rather than half-carried.
+fn hunkTree(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    parent_tree: Oid,
+    change_tree: Oid,
+    specs: []const HunkSpec,
+) !Oid {
+    const from = try store.readTree(parent_tree);
+    defer object.freeTree(alloc, from);
+    const to = try store.readTree(change_tree);
+    defer object.freeTree(alloc, to);
+
+    var entries: std.ArrayList(object.TreeEntry) = .empty;
+    defer entries.deinit(alloc);
+    try entries.appendSlice(alloc, from.entries);
+
+    for (specs) |spec| {
+        if (spec.indices.len == 0) return Error.OutOfRange;
+        const old_entry = entryFor(from.entries, spec.path) orelse return Error.PathNotModified;
+        const new_entry = entryFor(to.entries, spec.path) orelse return Error.PathNotModified;
+        if (old_entry.blob.eql(new_entry.blob)) return Error.PathNotModified;
+
+        const old_data = try store.readFileContent(old_entry.blob);
+        defer alloc.free(old_data);
+        const new_data = try store.readFileContent(new_entry.blob);
+        defer alloc.free(new_data);
+
+        const partial = diff.applyHunks(alloc, old_data, new_data, spec.indices) catch |e| switch (e) {
+            diff.HunkError.BinaryHasNoHunks => return Error.BinaryHasNoHunks,
+            diff.HunkError.NoSuchHunk => return Error.NoSuchHunk,
+            else => return e,
+        };
+        defer alloc.free(partial);
+
+        const blob = try store.writeFileContent(partial);
+        for (entries.items) |*e| {
+            if (!std.mem.eql(u8, e.path, spec.path)) continue;
+            e.mode = new_entry.mode;
+            e.blob = blob;
+            break;
+        }
+    }
+
+    std.sort.pdq(object.TreeEntry, entries.items, {}, object.Tree.lessThan);
+    return store.writeTree(.{ .entries = entries.items });
+}
+
+/// Which piece of a change to lift out: whole files, or hunks within files.
+pub const Selection = union(enum) {
+    paths: []const []const u8,
+    hunks: []const HunkSpec,
+};
+
+fn selectedTree(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    parent_tree: Oid,
+    change_tree: Oid,
+    selection: Selection,
+) !Oid {
+    return switch (selection) {
+        .paths => |p| scopedTree(store, alloc, parent_tree, change_tree, p),
+        .hunks => |h| hunkTree(store, alloc, parent_tree, change_tree, h),
+    };
+}
+
 /// Split one change into two by path. The remainder keeps the original
 /// change_id, because it is the piece that still reaches the original tree; the
 /// extracted piece is new and gets a derived id.
@@ -395,6 +482,33 @@ pub fn split(
     timestamp: i64,
 ) !Result {
     if (paths.len == 0) return Error.OutOfRange;
+    return splitBy(store, alloc, branch, target, .{ .paths = paths }, message, timestamp);
+}
+
+/// Split one change into two by hunk. Same identity rule as the path form: the
+/// remainder keeps the change_id because it still reaches the original tree.
+pub fn splitHunks(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    target: Oid,
+    specs: []const HunkSpec,
+    message: []const u8,
+    timestamp: i64,
+) !Result {
+    if (specs.len == 0) return Error.OutOfRange;
+    return splitBy(store, alloc, branch, target, .{ .hunks = specs }, message, timestamp);
+}
+
+fn splitBy(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    target: Oid,
+    selection: Selection,
+    message: []const u8,
+    timestamp: i64,
+) !Result {
     const tip = try tipOf(store, branch);
 
     const chain = try chainOf(store, alloc, tip);
@@ -407,7 +521,7 @@ pub fn split(
     defer object.freeChange(alloc, change);
 
     const parent_tree = try replay.parentTreeOf(store, alloc, change);
-    const partial = try scopedTree(store, alloc, parent_tree, change.tree, paths);
+    const partial = try selectedTree(store, alloc, parent_tree, change.tree, selection);
     if (partial.eql(parent_tree)) return Error.NothingToDo;
     if (partial.eql(change.tree)) return Error.NothingToDo;
 
@@ -859,6 +973,247 @@ test "split refuses when the paths cover none or all of the change" {
 
     const everything = [_][]const u8{"only"};
     try testing.expectError(Error.NothingToDo, split(&f.store, alloc, "main", c1, &everything, "", 1));
+}
+
+const wide_old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+const wide_new = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10a\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20a\n";
+const only_mid = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10a\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+
+test "split by hunk lifts one hunk of three out of a single file" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_new) }};
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "three edits");
+
+    try f.store.updateRef("main", c1);
+    const id_c1 = try f.changeIdOf(c1);
+
+    const indices = [_]usize{2};
+    const specs = [_]HunkSpec{.{ .path = "app.zig", .indices = &indices }};
+    const r = try splitHunks(&f.store, alloc, "main", c1, &specs, "just the middle", 21);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+    try testing.expect(chain[0].eql(c0));
+
+    const first = try f.text(try f.treeOf(chain[1]), "app.zig");
+    defer alloc.free(first);
+    try testing.expectEqualStrings(only_mid, first);
+
+    const msg = try f.messageOf(chain[1]);
+    defer alloc.free(msg);
+    try testing.expectEqualStrings("just the middle", msg);
+
+    try testing.expect((try f.treeOf(chain[2])).eql(try f.treeOf(c1)));
+    const kept = try f.changeIdOf(chain[2]);
+    try testing.expectEqualSlices(u8, &id_c1, &kept);
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c1));
+}
+
+test "split by hunk spans two files in one selection" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a.zig", .blob = try f.blob(wide_old) },
+        .{ .mode = .regular, .path = "b.zig", .blob = try f.blob("x\ny\nz\n") },
+    };
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a.zig", .blob = try f.blob(wide_new) },
+        .{ .mode = .regular, .path = "b.zig", .blob = try f.blob("x\nY\nz\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "both files");
+
+    try f.store.updateRef("main", c1);
+
+    const a_idx = [_]usize{ 1, 3 };
+    const b_idx = [_]usize{1};
+    const specs = [_]HunkSpec{
+        .{ .path = "a.zig", .indices = &a_idx },
+        .{ .path = "b.zig", .indices = &b_idx },
+    };
+    const r = try splitHunks(&f.store, alloc, "main", c1, &specs, "edges", 22);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+
+    const first_tree = try f.treeOf(chain[1]);
+    const a_text = try f.text(first_tree, "a.zig");
+    defer alloc.free(a_text);
+    try testing.expect(std.mem.indexOf(u8, a_text, "1a\n") != null);
+    try testing.expect(std.mem.indexOf(u8, a_text, "20a\n") != null);
+    try testing.expect(std.mem.indexOf(u8, a_text, "10a\n") == null);
+
+    const b_text = try f.text(first_tree, "b.zig");
+    defer alloc.free(b_text);
+    try testing.expectEqualStrings("x\nY\nz\n", b_text);
+
+    try testing.expect((try f.treeOf(chain[2])).eql(try f.treeOf(c1)));
+}
+
+test "identity: a hunk split's two halves reproduce the original tree exactly" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "src/validate.zig", .blob = try f.blob(wide_old) },
+        .{ .mode = .regular, .path = "src/log.zig", .blob = try f.blob("a\nb\nc\nd\ne\nf\ng\nh\ni\n") },
+        .{ .mode = .regular, .path = "untouched", .blob = try f.blob("intact\n") },
+    };
+    const t0 = try f.tree(&e0);
+    const c0 = try f.commit(t0, &.{}, "root");
+
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "src/validate.zig", .blob = try f.blob(wide_new) },
+        .{ .mode = .regular, .path = "src/log.zig", .blob = try f.blob("a\nb\nc\nd\nE\nf\ng\nh\ni\n") },
+        .{ .mode = .regular, .path = "untouched", .blob = try f.blob("intact\n") },
+    };
+    const t1 = try f.tree(&e1);
+    const c1 = try f.commit(t1, &.{c0}, "validation and logging");
+
+    try f.store.updateRef("main", c1);
+
+    const idx = [_]usize{ 1, 2 };
+    const specs = [_]HunkSpec{.{ .path = "src/validate.zig", .indices = &idx }};
+    const r = try splitHunks(&f.store, alloc, "main", c1, &specs, "validation only", 23);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+
+    const extracted = try f.treeOf(chain[1]);
+    const remainder = try f.treeOf(chain[2]);
+    try testing.expect(!extracted.eql(t0));
+    try testing.expect(!extracted.eql(t1));
+    try testing.expect(remainder.eql(t1));
+
+    const logging = try f.text(extracted, "src/log.zig");
+    defer alloc.free(logging);
+    try testing.expectEqualStrings("a\nb\nc\nd\ne\nf\ng\nh\ni\n", logging);
+
+    const replayed = try replay.applyTreeDelta(&f.store, alloc, extracted, t1, extracted);
+    defer replay.freeResult(alloc, replayed);
+    try testing.expect(replayed.clean());
+    try testing.expect(replayed.tree.eql(t1));
+}
+
+test "split by hunk of a non-top change keeps the descendants" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_new) }};
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "three edits");
+    var e2 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_new) },
+        .{ .mode = .regular, .path = "later", .blob = try f.blob("later\n") },
+    };
+    const c2 = try f.commit(try f.tree(&e2), &.{c1}, "later work");
+
+    try f.store.updateRef("main", c2);
+
+    const indices = [_]usize{2};
+    const specs = [_]HunkSpec{.{ .path = "app.zig", .indices = &indices }};
+    const r = try splitHunks(&f.store, alloc, "main", c1, &specs, "middle first", 24);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 4), chain.len);
+    try testing.expect(chain[0].eql(c0));
+
+    const first = try f.text(try f.treeOf(chain[1]), "app.zig");
+    defer alloc.free(first);
+    try testing.expectEqualStrings(only_mid, first);
+    try testing.expect(!(try f.has(try f.treeOf(chain[1]), "later")));
+
+    try testing.expect((try f.treeOf(chain[2])).eql(try f.treeOf(c1)));
+
+    const tip_tree = try f.treeOf(chain[3]);
+    try testing.expect(tip_tree.eql(try f.treeOf(c2)));
+    try testing.expect(try f.has(tip_tree, "later"));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+}
+
+test "split by hunk refuses an empty, a total, and an impossible selection" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) },
+        .{ .mode = .regular, .path = "bin", .blob = try f.blob("head\x00old\n") },
+    };
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_new) },
+        .{ .mode = .regular, .path = "bin", .blob = try f.blob("head\x00new\n") },
+        .{ .mode = .regular, .path = "fresh", .blob = try f.blob("fresh\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "everything");
+    try f.store.updateRef("main", c1);
+
+    const none = [_]HunkSpec{};
+    try testing.expectError(Error.OutOfRange, splitHunks(&f.store, alloc, "main", c1, &none, "", 1));
+
+    const no_indices = [_]usize{};
+    const empty_spec = [_]HunkSpec{.{ .path = "app.zig", .indices = &no_indices }};
+    try testing.expectError(Error.OutOfRange, splitHunks(&f.store, alloc, "main", c1, &empty_spec, "", 1));
+
+    const bad_idx = [_]usize{4};
+    const bad = [_]HunkSpec{.{ .path = "app.zig", .indices = &bad_idx }};
+    try testing.expectError(Error.NoSuchHunk, splitHunks(&f.store, alloc, "main", c1, &bad, "", 1));
+
+    const bin_idx = [_]usize{1};
+    const binary = [_]HunkSpec{.{ .path = "bin", .indices = &bin_idx }};
+    try testing.expectError(Error.BinaryHasNoHunks, splitHunks(&f.store, alloc, "main", c1, &binary, "", 1));
+
+    const added = [_]HunkSpec{.{ .path = "fresh", .indices = &bin_idx }};
+    try testing.expectError(Error.PathNotModified, splitHunks(&f.store, alloc, "main", c1, &added, "", 1));
+
+    const absent = [_]HunkSpec{.{ .path = "nope", .indices = &bin_idx }};
+    try testing.expectError(Error.PathNotModified, splitHunks(&f.store, alloc, "main", c1, &absent, "", 1));
+
+    try testing.expect((try f.store.readRef("main")).eql(c1));
+}
+
+test "split by hunk refuses when the selection covers the whole change" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_new) }};
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "three edits");
+    try f.store.updateRef("main", c1);
+
+    const all = [_]usize{ 1, 2, 3 };
+    const specs = [_]HunkSpec{.{ .path = "app.zig", .indices = &all }};
+    try testing.expectError(Error.NothingToDo, splitHunks(&f.store, alloc, "main", c1, &specs, "", 1));
+    try testing.expect((try f.store.readRef("main")).eql(c1));
 }
 
 test "reorder rewrites three changes into the requested order" {

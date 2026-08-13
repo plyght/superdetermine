@@ -28,6 +28,7 @@ const fork = @import("fork.zig");
 const recap = @import("recap.zig");
 const flow = @import("flow.zig");
 const superpose = @import("superpose.zig");
+const hook = @import("hook.zig");
 const live = @import("live.zig");
 const net = @import("net.zig");
 const ignore = @import("ignore.zig");
@@ -80,7 +81,7 @@ const sections = [_]Section{
         .{ .name = "point", .alias = "pt", .args = "<ref>", .desc = "move this branch's tip to any ref" },
         .{ .name = "rebase", .alias = "rb", .args = "<ref>", .desc = "replay this branch onto a new base" },
         .{ .name = "squash", .alias = "sq", .args = "[n] [-m msg]", .desc = "collapse adjacent changes into one" },
-        .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths>", .desc = "split one change in two, by path" },
+        .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths> | --hunk p:n", .desc = "split one change in two, by path or hunk" },
         .{ .name = "reorder", .alias = "ro", .args = "<order...>", .desc = "reorder the last changes, 1 = oldest" },
     } },
     .{ .title = "who wrote this", .entries = &.{
@@ -125,6 +126,7 @@ const sections = [_]Section{
         .{ .name = "serve --link", .args = "<dir>", .desc = "host a `send --link` export over HTTP" },
         .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
         .{ .name = "watch", .desc = "experimental: auto-save on every change" },
+        .{ .name = "hook", .args = "[install [--write <path>]]", .desc = "tell a coding agent whether its work passed" },
     } },
     .{ .title = "git, side by side", .entries = &.{
         .{ .name = "clone", .alias = "cl", .args = "<src> [dir]", .desc = "a git repo, a share URL, or a bundle" },
@@ -422,6 +424,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdSplit(io, alloc, w, rest);
     } else if (eq(cmd, "reorder")) {
         try cmdReorder(io, alloc, w, rest);
+    } else if (eq(cmd, "hook")) {
+        hook.run(io, alloc, w, rest);
     } else if (eq(cmd, "gc")) {
         try cmdGc(io, alloc, w, rest);
     } else if (eq(cmd, "lfs")) {
@@ -855,6 +859,18 @@ fn reportHistoryError(w: *std.Io.Writer, e: anyerror, what: []const u8) !bool {
         history.Error.OutOfRange => try w.writeAll("that is more history than this branch has\n"),
         history.Error.NotAChange => try w.writeAll("that ref is not a change on this branch\n"),
         history.Error.NotAPermutation => try w.writeAll("the order must list each position exactly once, starting at 1\n"),
+        history.Error.NoSuchHunk => {
+            try w.writeAll("that change does not have a hunk with that number\n");
+            try ui.hint(w, "`sdt diff` numbers the hunks of each file from 1, top to bottom");
+        },
+        history.Error.BinaryHasNoHunks => {
+            try w.writeAll("that file is binary, so it has no hunks to select\n");
+            try ui.hint(w, "move the whole file instead: `sdt split <ref> -- <path>`");
+        },
+        history.Error.PathNotModified => {
+            try w.writeAll("that path is not modified in place by this change, so it has no hunks\n");
+            try ui.hint(w, "added and deleted files move whole: `sdt split <ref> -- <path>`");
+        },
         else => return false,
     }
     return true;
@@ -946,11 +962,49 @@ fn cmdSquash(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     try reportRewrite(io, alloc, w, &s, before_tree, r, "squashed");
 }
 
+/// Parse `1,3-5` into 1-based hunk numbers. Ranges are inclusive and a bare
+/// number is a range of one.
+fn parseHunkNumbers(alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayList(usize)) !void {
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |part| {
+        if (part.len == 0) return error.BadHunkSelector;
+        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+            const lo = std.fmt.parseInt(usize, part[0..dash], 10) catch return error.BadHunkSelector;
+            const hi = std.fmt.parseInt(usize, part[dash + 1 ..], 10) catch return error.BadHunkSelector;
+            if (lo == 0 or hi < lo) return error.BadHunkSelector;
+            var n = lo;
+            while (n <= hi) : (n += 1) try out.append(alloc, n);
+        } else {
+            const n = std.fmt.parseInt(usize, part, 10) catch return error.BadHunkSelector;
+            if (n == 0) return error.BadHunkSelector;
+            try out.append(alloc, n);
+        }
+    }
+    if (out.items.len == 0) return error.BadHunkSelector;
+}
+
+fn badHunkSelector(w: *std.Io.Writer, sel: []const u8) !void {
+    try w.print("not a hunk selector: {s}\n", .{sel});
+    try ui.hint(w, "the form is <path>:<n>, e.g. `--hunk src/a.zig:1,3-4`");
+}
+
+fn splitUsage(w: *std.Io.Writer) !void {
+    try w.writeAll("usage: sdt split [ref] [-m msg] -- <paths>\n");
+    try w.writeAll("       sdt split [ref] [-m msg] --hunk <path>:<n[,n][,a-b]> ...\n");
+    try ui.hint(w, "the listed paths become the first change; everything else stays in the second");
+    try ui.hint(w, "--hunk works within a file: `sdt split --hunk src/a.zig:1,3-4` takes those hunks only");
+}
+
 fn cmdSplit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var spec: []const u8 = "";
     var message: []const u8 = "";
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(alloc);
+    var hunks: std.ArrayList(history.HunkSpec) = .empty;
+    defer {
+        for (hunks.items) |h| alloc.free(h.indices);
+        hunks.deinit(alloc);
+    }
 
     var after_sep = false;
     var i: usize = 0;
@@ -963,14 +1017,41 @@ fn cmdSplit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         } else if (eq(a, "-m") or eq(a, "--message")) {
             i += 1;
             if (i < rest.len) message = rest[i];
+        } else if (eq(a, "--hunk") or eq(a, "-H")) {
+            i += 1;
+            if (i >= rest.len) {
+                try splitUsage(w);
+                return;
+            }
+            const sel = rest[i];
+            const colon = std.mem.lastIndexOfScalar(u8, sel, ':') orelse 0;
+            if (colon == 0 or colon + 1 == sel.len) {
+                try badHunkSelector(w, sel);
+                return;
+            }
+            var numbers: std.ArrayList(usize) = .empty;
+            errdefer numbers.deinit(alloc);
+            parseHunkNumbers(alloc, sel[colon + 1 ..], &numbers) catch {
+                numbers.deinit(alloc);
+                try badHunkSelector(w, sel);
+                return;
+            };
+            try hunks.append(alloc, .{
+                .path = sel[0..colon],
+                .indices = try numbers.toOwnedSlice(alloc),
+            });
         } else if (spec.len == 0 and a.len != 0 and a[0] != '-') {
             spec = a;
         }
     }
 
-    if (paths.items.len == 0) {
-        try w.writeAll("usage: sdt split [ref] [-m msg] -- <paths>\n");
-        try ui.hint(w, "the listed paths become the first change; everything else stays in the second");
+    if (paths.items.len != 0 and hunks.items.len != 0) {
+        try w.writeAll("split takes paths or --hunk selectors, not both at once\n");
+        try ui.hint(w, "run the path split first, then split the result by hunk");
+        return;
+    }
+    if (paths.items.len == 0 and hunks.items.len == 0) {
+        try splitUsage(w);
         return;
     }
 
@@ -990,7 +1071,12 @@ fn cmdSplit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         };
     const before_tree = branches.headTree(&s);
 
-    const r = history.split(&s, alloc, branch, target, paths.items, message, nowSeconds(io)) catch |e| {
+    const attempt = if (hunks.items.len != 0)
+        history.splitHunks(&s, alloc, branch, target, hunks.items, message, nowSeconds(io))
+    else
+        history.split(&s, alloc, branch, target, paths.items, message, nowSeconds(io));
+
+    const r = attempt catch |e| {
         if (try reportHistoryError(w, e, "split")) return;
         return e;
     };
@@ -2178,9 +2264,10 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer rules.deinit(alloc);
 
     const ctx = gradeContext(alloc, &s, work, set, rules);
-    const r = try sched.tick(&s, work, ctx, momentSettings(&s, alloc), .{});
+    const r = try sched.tick(&s, work, ctx, momentSettings(&s, alloc), sched.settings(&s, alloc));
 
     if (r.skipped) |why| {
+        if (r.captured) try w.writeAll("captured a moment\n");
         try w.print("{s}skipped: {s}{s}\n", .{ ui.on(.dim), why, ui.off() });
         return;
     }

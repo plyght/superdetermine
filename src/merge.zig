@@ -69,7 +69,8 @@ pub fn freeMergeResult(alloc: std.mem.Allocator, r: MergeResult) void {
 
 const PathMap = std.StringHashMap(object.TreeEntry);
 
-/// Load a stored tree into a path->blob map. Keys are duped into `alloc`.
+/// Load a stored tree into a path->TreeEntry map, carrying each entry's mode.
+/// Keys are duped into `alloc`.
 fn loadPathMap(store: *Store, alloc: std.mem.Allocator, tree: ?Oid, map: *PathMap) !void {
     const t = tree orelse return;
     const loaded = try store.readTree(t);
@@ -636,10 +637,6 @@ pub fn abort(store: *Store, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !voi
 // --- tests ---
 
 const testing = std.testing;
-
-test {
-    _ = @import("replay.zig");
-}
 
 fn commitTree(store: *Store, tree: Oid, parents: []const Oid, msg: []const u8) !Oid {
     const change = object.Change{

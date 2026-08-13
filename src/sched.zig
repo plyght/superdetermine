@@ -52,6 +52,23 @@ pub const Settings = struct {
     battery_floor: u8 = 30,
 };
 
+pub fn settings(store: *Store, alloc: std.mem.Allocator) Settings {
+    var out = Settings{};
+    if (config.get(store, alloc, "checks.battery_floor") catch null) |maybe| {
+        defer alloc.free(maybe);
+        out.battery_floor = std.fmt.parseInt(u8, std.mem.trim(u8, maybe, " \t"), 10) catch out.battery_floor;
+    }
+    if (config.get(store, alloc, "checks.budget") catch null) |maybe| {
+        defer alloc.free(maybe);
+        out.budget_ms = std.fmt.parseInt(i64, std.mem.trim(u8, maybe, " \t"), 10) catch out.budget_ms;
+    }
+    if (config.get(store, alloc, "moments.interval_ms") catch null) |maybe| {
+        defer alloc.free(maybe);
+        out.min_interval_ms = std.fmt.parseInt(i64, std.mem.trim(u8, maybe, " \t"), 10) catch out.min_interval_ms;
+    }
+    return out;
+}
+
 /// A held tick lock. Dropping it releases the lock.
 pub const Lock = struct {
     file: std.Io.File,
@@ -157,8 +174,6 @@ pub fn tick(
         return .{ .skipped = "another gr process is already grading" };
     defer lock.release();
 
-    if (!powerOk(alloc, set)) return .{ .skipped = "on battery below the floor" };
-
     // Stamp before the work, not after: a tick that takes two minutes must not
     // leave every other invocation in that window thinking a tick is overdue.
     const started = nowMillis(io);
@@ -184,6 +199,10 @@ pub fn tick(
     }
 
     if (!ctx.set.enabled) return out;
+    if (!powerOk(alloc, set)) {
+        out.skipped = "on battery below the floor, so nothing was graded";
+        return out;
+    }
 
     const tier: verdict.Tier = if (ctx.set.has(.full)) .full else .fast;
     if (!ctx.set.has(tier)) return out;
@@ -620,7 +639,7 @@ test "a tick with no checks configured still captures and stays quiet" {
         .set = .{},
         .rules = .{},
     };
-    const r = try tick(&store, work, ctx, .{ .enabled = true, .keyframe_interval = 4 }, .{});
+    const r = try tick(&store, work, ctx, .{ .enabled = true, .keyframe_interval = 4 }, .{ .battery_floor = 0 });
     try testing.expect(r.captured);
     try testing.expectEqual(@as(usize, 0), r.graded);
 }
@@ -653,7 +672,7 @@ test "a tick grades the head and finds a transition boundary" {
     // Three good states then a broken one, each captured and each ticked.
     for ([_][]const u8{ "good 1", "good 2", "good 3", "broken" }) |body| {
         try work.writeFile(io, .{ .sub_path = "a.txt", .data = body });
-        _ = try tick(&store, work, ctx, mset, .{});
+        _ = try tick(&store, work, ctx, mset, .{ .battery_floor = 0 });
     }
 
     var ix = try verdict.Index.load(&store, alloc);
@@ -686,6 +705,6 @@ test "a second tick inside the throttle window is skipped, not queued" {
         .set = .{},
         .rules = .{},
     };
-    _ = try tick(&store, work, ctx, .{ .enabled = true }, .{});
+    _ = try tick(&store, work, ctx, .{ .enabled = true }, .{ .battery_floor = 0 });
     try testing.expect(!due(&store, .{ .min_interval_ms = 3000 }));
 }
