@@ -73,7 +73,7 @@ pub const Index = struct {
             defer self.alloc.free(line);
             try out.appendSlice(self.alloc, line);
         }
-        try store.root.writeFile(store.io, .{ .sub_path = "index", .data = out.items });
+        try store.writeFileAtomic("index", out.items);
     }
 
     /// Returns the cached blob Oid iff a prior entry for `path` matches the

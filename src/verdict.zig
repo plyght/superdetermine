@@ -6,10 +6,21 @@ const Oid = oid.Oid;
 
 /// The verdict store: what a given tree did when a given check ran against it.
 ///
-/// A verdict is keyed by `(tree Oid, tier, command hash)` and never by a moment
-/// id, which is what makes "a tree is never graded twice, ever" true even across
-/// branches, forks, rewinds and retention trims. Two moments that happen to hold
-/// identical content share one verdict for free.
+/// A verdict is keyed by `(tree Oid, tier, command hash, declared-input digest)`
+/// and never by a moment id, which is what makes "a tree is never graded twice,
+/// ever" true even across branches, forks, rewinds and retention trims. Two
+/// moments that happen to hold identical content share one verdict for free.
+///
+/// The input digest is the environment dimension. A graded run sees whatever
+/// the project ignores, so a lockfile, a `.env` or a toolchain outside the tree
+/// can decide the answer without appearing in the tree at all; `checks.inputs`
+/// names those files and their itemized digest joins the key. It is zero when
+/// nothing is declared, which is exactly the key this store always used.
+///
+/// `lookup` is the memoization decision and matches the whole key, freshness
+/// included. `Index` is the historical record — the newest verdict for a tree at
+/// a tier under a command, whatever environment produced it — which is what the
+/// UI, `@green` and the grading policy read.
 ///
 /// A verdict is not a boolean. `Result` is the claim; the warrant fields beside
 /// it are why the claim is worth anything. Nothing here ever gates: no push is
@@ -39,6 +50,40 @@ pub const Result = enum {
     red,
 
     pub fn label(self: Result) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// What actually happened to the check process, which is a different question
+/// from what the check decided.
+///
+/// A red that means "the suite failed on this tree" is a fact about the code and
+/// is worth keeping forever. A red that means "the machine slept, the OOM killer
+/// fired, or the run hit its deadline" is a fact about the machine and binds to
+/// no tree at all. Caching the second as the first is how a transient kill
+/// becomes a permanent verdict nothing ever re-runs.
+pub const Outcome = enum {
+    /// The check exited zero.
+    pass,
+    /// The check exited non-zero of its own accord.
+    fail,
+    /// The check was still running when its deadline passed.
+    timeout,
+    /// The run could not be performed: no fork, no clone, no exec.
+    @"error",
+    /// The check died on a signal it did not choose.
+    cancelled,
+
+    /// Only a decision the check itself reached may be remembered.
+    pub fn cacheable(self: Outcome) bool {
+        return self == .pass or self == .fail;
+    }
+
+    pub fn result(self: Outcome) Result {
+        return if (self == .pass) .green else .red;
+    }
+
+    pub fn label(self: Outcome) []const u8 {
         return @tagName(self);
     }
 };
@@ -97,6 +142,14 @@ pub const Verdict = struct {
     relevance_hit: u16 = 0,
     relevance_total: u16 = 0,
     discrimination: Discrimination = .unknown,
+    /// The declared-input digest this run was made under, zero when none were
+    /// declared. Also the object id of the itemized manifest, so a miss can name
+    /// the file that caused it.
+    inputs: Oid = Oid.zero(),
+    /// Wall clock at which the check ran, which is what `checks.fresh` ages.
+    /// Zero on a verdict recorded before this field existed.
+    ran_ms: i64 = 0,
+    outcome: Outcome = .pass,
 
     pub fn isGreen(self: Verdict) bool {
         return self.result == .green;
@@ -114,6 +167,7 @@ pub const Key = struct {
     tree: Oid,
     tier: Tier,
     command: Oid,
+    inputs: Oid = Oid.zero(),
 };
 
 // --- encoding ---
@@ -122,12 +176,14 @@ fn formatLine(alloc: std.mem.Allocator, v: Verdict) ![]u8 {
     var tree_hex: [Oid.len * 2]u8 = undefined;
     var cmd_hex: [Oid.len * 2]u8 = undefined;
     var rs_hex: [Oid.len * 2]u8 = undefined;
+    var in_hex: [Oid.len * 2]u8 = undefined;
     _ = v.tree.toHex(&tree_hex);
     _ = v.command.toHex(&cmd_hex);
     _ = v.readset.toHex(&rs_hex);
+    _ = v.inputs.toHex(&in_hex);
     return std.fmt.allocPrint(
         alloc,
-        "{s} {s} {s} {s} {d} {d} {d} {s} {s} {d} {d} {s}\n",
+        "{s} {s} {s} {s} {d} {d} {d} {s} {s} {d} {d} {s} {s} {d} {s}\n",
         .{
             &tree_hex,
             v.tier.label(),
@@ -141,6 +197,9 @@ fn formatLine(alloc: std.mem.Allocator, v: Verdict) ![]u8 {
             v.relevance_hit,
             v.relevance_total,
             v.discrimination.label(),
+            &in_hex,
+            v.ran_ms,
+            v.outcome.label(),
         },
     );
 }
@@ -160,11 +219,19 @@ fn parseLine(line: []const u8) !Verdict {
     const tot_s = it.next() orelse return error.InvalidVerdict;
     const dis_s = it.next() orelse return error.InvalidVerdict;
 
+    // Everything past here postdates the format, so a line written before it
+    // still parses: no declared inputs, no run time, and the outcome implied by
+    // the result it already recorded.
+    const in_s = it.next() orelse "";
+    const ran_s = it.next() orelse "";
+    const out_s = it.next() orelse "";
+
+    const result = enumFromLabel(Result, res_s, .red);
     return .{
         .tree = Oid.fromHex(tree_s) catch return error.InvalidVerdict,
         .tier = Tier.fromLabel(tier_s) orelse return error.InvalidVerdict,
         .command = Oid.fromHex(cmd_s) catch return error.InvalidVerdict,
-        .result = enumFromLabel(Result, res_s, .red),
+        .result = result,
         .exit_code = std.fmt.parseInt(i32, exit_s, 10) catch return error.InvalidVerdict,
         .duration_ms = std.fmt.parseInt(u32, dur_s, 10) catch 0,
         .ms = std.fmt.parseInt(i64, ms_s, 10) catch 0,
@@ -173,6 +240,9 @@ fn parseLine(line: []const u8) !Verdict {
         .relevance_hit = std.fmt.parseInt(u16, hit_s, 10) catch 0,
         .relevance_total = std.fmt.parseInt(u16, tot_s, 10) catch 0,
         .discrimination = enumFromLabel(Discrimination, dis_s, .unknown),
+        .inputs = Oid.fromHex(in_s) catch Oid.zero(),
+        .ran_ms = std.fmt.parseInt(i64, ran_s, 10) catch 0,
+        .outcome = enumFromLabel(Outcome, out_s, if (result == .green) .pass else .fail),
     };
 }
 
@@ -188,7 +258,11 @@ pub fn commandHash(command: []const u8) Oid {
 
 // --- store ---
 
+/// Append a verdict, unless its outcome says the run never reached a decision.
+/// The refusal lives here rather than at each call site because a verdict that
+/// binds to an infrastructure failure is worthless from every direction.
 pub fn record(store: *Store, v: Verdict) !void {
+    if (!v.outcome.cacheable()) return;
     const alloc = store.alloc;
     const line = try formatLine(alloc, v);
     defer alloc.free(line);
@@ -215,6 +289,23 @@ pub fn readAll(store: *Store, alloc: std.mem.Allocator) ![]Verdict {
 /// The verdict for a key, or null. Later records win, so a re-grade after a
 /// flaky run supersedes without anyone rewriting history.
 pub fn lookup(store: *Store, alloc: std.mem.Allocator, key: Key) !?Verdict {
+    return lookupFresh(store, alloc, key, 0, 0);
+}
+
+/// `lookup`, plus an age ceiling on greens.
+///
+/// `fresh_ms` of zero is the whole existing behaviour: a pass answers forever.
+/// Above zero a pass older than the window stops answering, and so does one
+/// whose run time was never recorded, because "unknown age" cannot be shown to
+/// be inside any window. Reds are never aged out: re-running them is the job of
+/// an explicit re-grade, not of a clock.
+pub fn lookupFresh(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    key: Key,
+    now_ms: i64,
+    fresh_ms: i64,
+) !?Verdict {
     const all = try readAll(store, alloc);
     defer alloc.free(all);
 
@@ -223,9 +314,21 @@ pub fn lookup(store: *Store, alloc: std.mem.Allocator, key: Key) !?Verdict {
         if (!v.tree.eql(key.tree)) continue;
         if (v.tier != key.tier) continue;
         if (!v.command.eql(key.command)) continue;
+        if (!v.inputs.eql(key.inputs)) continue;
         found = v;
     }
+    if (found) |v| {
+        if (isStale(v, now_ms, fresh_ms)) return null;
+    }
     return found;
+}
+
+/// Whether a green has aged past the window. False whenever no window is set.
+pub fn isStale(v: Verdict, now_ms: i64, fresh_ms: i64) bool {
+    if (fresh_ms <= 0) return false;
+    if (v.result != .green) return false;
+    if (v.ran_ms == 0) return true;
+    return now_ms - v.ran_ms > fresh_ms;
 }
 
 /// An in-memory index for callers that ask about many trees at once (the
@@ -286,6 +389,7 @@ fn sample(tree: Oid, tier: Tier, cmd: Oid, result: Result) Verdict {
         .duration_ms = 1234,
         .ms = 1_700_000_000_000,
         .readset = Oid.zero(),
+        .outcome = if (result == .green) .pass else .fail,
     };
 }
 
@@ -377,6 +481,226 @@ test "an independent discriminating green is not hollow" {
     v.independence = .independent;
     v.discrimination = .discriminating;
     try testing.expect(!v.isHollow());
+}
+
+test "a verdict log written before declared inputs still parses" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("legacy-tree");
+    const cmd = commandHash("zig build test");
+    var tree_hex: [Oid.len * 2]u8 = undefined;
+    var cmd_hex: [Oid.len * 2]u8 = undefined;
+    var rs_hex: [Oid.len * 2]u8 = undefined;
+    _ = tree.toHex(&tree_hex);
+    _ = cmd.toHex(&cmd_hex);
+    _ = Oid.zero().toHex(&rs_hex);
+
+    // Exactly the twelve fields the format had before this change.
+    const line = try std.fmt.allocPrint(
+        alloc,
+        "{s} full {s} green 0 4321 1700000000000 {s} independent 3 4 discriminating\n",
+        .{ &tree_hex, &cmd_hex, &rs_hex },
+    );
+    defer alloc.free(line);
+    try applog.append(&store, log_path, line);
+
+    const got = (try lookup(&store, alloc, .{ .tree = tree, .tier = .full, .command = cmd })).?;
+    try testing.expectEqual(Result.green, got.result);
+    try testing.expectEqual(@as(u32, 4321), got.duration_ms);
+    try testing.expectEqual(Independence.independent, got.independence);
+    try testing.expectEqual(Discrimination.discriminating, got.discrimination);
+    // The new fields take the only values that are honest about an old line.
+    try testing.expect(got.inputs.isZero());
+    try testing.expectEqual(@as(i64, 0), got.ran_ms);
+    try testing.expectEqual(Outcome.pass, got.outcome);
+
+    // A legacy red implies a failure, not an infrastructure problem.
+    const red_line = try std.fmt.allocPrint(
+        alloc,
+        "{s} fast {s} red 1 10 1700000000000 {s} unknown 0 0 unknown\n",
+        .{ &tree_hex, &cmd_hex, &rs_hex },
+    );
+    defer alloc.free(red_line);
+    try applog.append(&store, log_path, red_line);
+    const red = (try lookup(&store, alloc, .{ .tree = tree, .tier = .fast, .command = cmd })).?;
+    try testing.expectEqual(Outcome.fail, red.outcome);
+}
+
+test "a repo that declares no inputs keeps byte-identical keys" {
+    const tree = Oid.ofBytes("t");
+    const cmd = commandHash("make");
+    const key = Key{ .tree = tree, .tier = .full, .command = cmd };
+
+    // The default is the zero digest, so nothing about an existing repo's key
+    // moves and every recorded verdict stays addressable.
+    try testing.expect(key.inputs.isZero());
+
+    var expected: [Oid.len + 1 + Oid.len]u8 = undefined;
+    @memcpy(expected[0..Oid.len], &tree.bytes);
+    expected[Oid.len] = @intFromEnum(Tier.full);
+    @memcpy(expected[Oid.len + 1 ..], &cmd.bytes);
+    try testing.expectEqualSlices(u8, &expected, &keyBytes(key));
+
+    // And the index key does not move when inputs are declared: the log is the
+    // historical record, not the memoization decision.
+    var with = key;
+    with.inputs = Oid.ofBytes("some lockfile digest");
+    try testing.expectEqualSlices(u8, &keyBytes(key), &keyBytes(with));
+}
+
+test "a declared input changing is a different key" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-a");
+    const cmd = commandHash("bun test");
+    const before = Oid.ofBytes("lockfile v1");
+
+    var v = sample(tree, .full, cmd, .green);
+    v.inputs = before;
+    try record(&store, v);
+
+    try testing.expect((try lookup(&store, alloc, .{
+        .tree = tree,
+        .tier = .full,
+        .command = cmd,
+        .inputs = before,
+    })) != null);
+
+    // The lockfile moved, so the memoized answer no longer applies.
+    try testing.expect((try lookup(&store, alloc, .{
+        .tree = tree,
+        .tier = .full,
+        .command = cmd,
+        .inputs = Oid.ofBytes("lockfile v2"),
+    })) == null);
+
+    // The log still remembers it happened, which is what the UI reads.
+    var ix = try Index.load(&store, alloc);
+    defer ix.deinit();
+    try testing.expect(ix.get(.{ .tree = tree, .tier = .full, .command = cmd }) != null);
+}
+
+test "a pass stops answering once it is older than the freshness window" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-f");
+    const cmd = commandHash("pytest");
+    const key = Key{ .tree = tree, .tier = .full, .command = cmd };
+    const now: i64 = 1_700_000_000_000;
+
+    var green = sample(tree, .full, cmd, .green);
+    green.ran_ms = now - 10 * std.time.ms_per_min;
+    try record(&store, green);
+
+    // No window configured is the existing behaviour: it answers forever.
+    try testing.expect((try lookupFresh(&store, alloc, key, now, 0)) != null);
+    // Inside the window it still answers.
+    try testing.expect((try lookupFresh(&store, alloc, key, now, 30 * std.time.ms_per_min)) != null);
+    // Past it, it does not.
+    try testing.expect((try lookupFresh(&store, alloc, key, now, 5 * std.time.ms_per_min)) == null);
+
+    // A red is a fact about the code, not a measurement that goes off.
+    const red_tree = Oid.ofBytes("tree-r");
+    var red = sample(red_tree, .full, cmd, .red);
+    red.ran_ms = now - 10 * std.time.ms_per_min;
+    try record(&store, red);
+    try testing.expect((try lookupFresh(&store, alloc, .{
+        .tree = red_tree,
+        .tier = .full,
+        .command = cmd,
+    }, now, std.time.ms_per_min)) != null);
+
+    // A green whose age is unknown cannot be shown to be inside any window.
+    const old_tree = Oid.ofBytes("tree-o");
+    try record(&store, sample(old_tree, .full, cmd, .green));
+    try testing.expect((try lookupFresh(&store, alloc, .{
+        .tree = old_tree,
+        .tier = .full,
+        .command = cmd,
+    }, now, std.time.ms_per_min)) == null);
+}
+
+test "a run that never reached a decision is never recorded" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-k");
+    const cmd = commandHash("zig build test");
+
+    for ([_]Outcome{ .timeout, .@"error", .cancelled }) |o| {
+        var v = sample(tree, .full, cmd, .red);
+        v.outcome = o;
+        try testing.expect(!o.cacheable());
+        try record(&store, v);
+    }
+
+    // Nothing was written, so the next lookup runs the check instead of
+    // serving a red that says only that the machine misbehaved.
+    try testing.expect((try lookup(&store, alloc, .{
+        .tree = tree,
+        .tier = .full,
+        .command = cmd,
+    })) == null);
+
+    var fail = sample(tree, .full, cmd, .red);
+    fail.outcome = .fail;
+    try record(&store, fail);
+    try testing.expect((try lookup(&store, alloc, .{
+        .tree = tree,
+        .tier = .full,
+        .command = cmd,
+    })) != null);
+}
+
+test "the outcome survives a roundtrip" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-x");
+    const cmd = commandHash("x");
+    var v = sample(tree, .full, cmd, .red);
+    v.outcome = .fail;
+    v.inputs = Oid.ofBytes("inputs");
+    v.ran_ms = 1_700_000_123_456;
+    try record(&store, v);
+
+    const got = (try lookup(&store, alloc, .{
+        .tree = tree,
+        .tier = .full,
+        .command = cmd,
+        .inputs = v.inputs,
+    })).?;
+    try testing.expectEqual(Outcome.fail, got.outcome);
+    try testing.expectEqual(@as(i64, 1_700_000_123_456), got.ran_ms);
+    try testing.expect(got.inputs.eql(v.inputs));
 }
 
 test "index answers many trees in one pass" {

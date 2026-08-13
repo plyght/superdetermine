@@ -46,6 +46,9 @@ pub const Context = struct {
     scratch_parent: ?[]const u8 = null,
 };
 
+/// The historical key: what the log knows about this tree at this tier under
+/// this command, whatever environment produced it. `Index` ignores the input
+/// dimension by construction, so this is the key the policy and the UI ask with.
 fn keyFor(ctx: Context, tree: Oid, tier: verdict.Tier) verdict.Key {
     return .{
         .tree = tree,
@@ -54,11 +57,55 @@ fn keyFor(ctx: Context, tree: Oid, tier: verdict.Tier) verdict.Key {
     };
 }
 
+/// The memoization key: the historical key plus the declared inputs the run
+/// would see. Only this one may authorise skipping a run.
+fn cacheKey(ctx: Context, tree: Oid, tier: verdict.Tier, inputs: Oid) verdict.Key {
+    var key = keyFor(ctx, tree, tier);
+    key.inputs = inputs;
+    return key;
+}
+
+fn nowMillis(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1_000_000));
+}
+
+/// What the declared inputs hold right now. Empty when none are declared, which
+/// digests to zero and leaves the key exactly as it has always been.
+pub fn currentInputs(ctx: Context) !checks.InputSet {
+    if (ctx.set.inputs.len == 0) return .{ .entries = &.{} };
+    const abs = try ctx.work_dir.realPathFileAlloc(ctx.store.io, ".", ctx.alloc);
+    defer ctx.alloc.free(abs);
+    return checks.collectInputs(ctx.store.io, ctx.alloc, abs, ctx.set.inputs);
+}
+
+/// Which declared input made the memoized verdict stop applying, as a path the
+/// caller can print. Null when the environment is not what changed.
+///
+/// This is the whole reason the digest is itemized: "your key changed" is not
+/// something anyone can act on, and "bun.lock changed" is.
+pub fn missReason(
+    ctx: Context,
+    tree: Oid,
+    tier: verdict.Tier,
+    current: checks.InputSet,
+) !?[]u8 {
+    const alloc = ctx.alloc;
+    var ix = try verdict.Index.load(ctx.store, alloc);
+    defer ix.deinit();
+
+    const prior = ix.get(keyFor(ctx, tree, tier)) orelse return null;
+    const before = checks.loadInputs(ctx.store, prior.inputs) catch return null;
+    defer before.deinit(alloc);
+
+    const path = current.firstDifference(before) orelse return null;
+    return try alloc.dupe(u8, path);
+}
+
 /// The verdict for a state, running the check only if it must.
 ///
 /// Three layers of avoidance, in increasing cost order:
-///   1. a memoized verdict for this exact `(tree, tier, command)`, so a tree is
-///      never graded twice, ever;
+///   1. a memoized verdict for this exact `(tree, tier, command, inputs)` and
+///      inside the freshness window, so a tree is never graded twice, ever;
 ///   2. an unchanged read-set relative to an already-graded neighbour, in which
 ///      case that verdict is carried over and recorded against this tree;
 ///   3. an actual run.
@@ -70,8 +117,13 @@ pub fn gradeState(
     const alloc = ctx.alloc;
     if (!ctx.set.has(tier)) return checks.Error.NoCheckConfigured;
 
-    const key = keyFor(ctx, m.full_tree, tier);
-    if (try verdict.lookup(ctx.store, alloc, key)) |cached| return cached;
+    const inputs = try currentInputs(ctx);
+    defer inputs.deinit(alloc);
+    const inputs_oid = try checks.storeInputs(ctx.store, inputs);
+
+    const now = nowMillis(ctx.store.io);
+    const key = cacheKey(ctx, m.full_tree, tier, inputs_oid);
+    if (try verdict.lookupFresh(ctx.store, alloc, key, now, ctx.set.fresh_ms)) |cached| return cached;
 
     const entries = try moment.entriesOf(ctx.store, m);
     defer workspace.freeTreeEntries(alloc, entries);
@@ -96,8 +148,14 @@ pub fn gradeState(
     // The guard on `paths_changed` is what makes this sound: a read-set can
     // say what the check opened, never what it looked for and failed to find,
     // so an added or removed path must always force a real run.
+    // The neighbour's verdict may predate a change to the declared inputs or
+    // have aged out, and carrying it forward would launder exactly the staleness
+    // the key exists to catch, so the same two conditions gate it here.
     if (prev) |p| {
-        if (!p.verdict.readset.isZero() and !span.paths_changed) {
+        if (!p.verdict.readset.isZero() and !span.paths_changed and
+            p.verdict.inputs.eql(inputs_oid) and
+            !verdict.isStale(p.verdict, now, ctx.set.fresh_ms))
+        {
             if (readset.load(ctx.store, p.verdict.readset)) |rs| {
                 defer rs.deinit(alloc);
                 if (!rs.intersectsAny(span.changed)) {
@@ -148,13 +206,21 @@ pub fn gradeState(
         .relevance_hit = rel.hit,
         .relevance_total = rel.total,
         .discrimination = .unknown,
+        .inputs = inputs_oid,
+        .ran_ms = now,
+        .outcome = outcome.outcome,
     };
+
+    // A run that never reached a decision is not a verdict about anything, so
+    // it is neither recorded nor worth spending a discrimination probe on. It
+    // is still returned, because the caller has to be told what happened.
+    if (!v.outcome.cacheable()) return v;
 
     // Discrimination costs one run and is only worth asking when the check
     // itself changed. Memoized through the same verdict cache as everything
     // else, because the hybrid tree is addressed by content like any other.
     if (v.result == .green and prev != null and warrant.shouldMeasureDiscrimination(span)) {
-        v.discrimination = measureDiscrimination(ctx, prev.?.entries, entries, tier) catch .unknown;
+        v.discrimination = measureDiscrimination(ctx, prev.?.entries, entries, tier, inputs_oid) catch .unknown;
     }
 
     try verdict.record(ctx.store, v);
@@ -172,8 +238,13 @@ pub fn gradeChange(
     const change = try ctx.store.readChange(change_oid);
     defer object.freeChange(alloc, change);
 
-    const key = keyFor(ctx, change.tree, tier);
-    if (try verdict.lookup(ctx.store, alloc, key)) |cached| return cached;
+    const inputs = try currentInputs(ctx);
+    defer inputs.deinit(alloc);
+    const inputs_oid = try checks.storeInputs(ctx.store, inputs);
+
+    const now = nowMillis(ctx.store.io);
+    const key = cacheKey(ctx, change.tree, tier, inputs_oid);
+    if (try verdict.lookupFresh(ctx.store, alloc, key, now, ctx.set.fresh_ms)) |cached| return cached;
 
     const tree = try ctx.store.readTree(change.tree);
     defer object.freeTree(alloc, tree);
@@ -229,6 +300,9 @@ pub fn gradeChange(
         .relevance_hit = rel.hit,
         .relevance_total = rel.total,
         .discrimination = .unknown,
+        .inputs = inputs_oid,
+        .ran_ms = now,
+        .outcome = outcome.outcome,
     };
 
     try verdict.record(ctx.store, v);
@@ -281,6 +355,7 @@ fn measureDiscrimination(
     previous: []const object.TreeEntry,
     target: []const object.TreeEntry,
     tier: verdict.Tier,
+    inputs_oid: Oid,
 ) !verdict.Discrimination {
     const alloc = ctx.alloc;
 
@@ -293,8 +368,9 @@ fn measureDiscrimination(
 
     // The hybrid is a tree like any other, so the verdict cache memoizes it for
     // free across every future state that produces the same combination.
-    const key = keyFor(ctx, hybrid_tree, tier);
-    if (try verdict.lookup(ctx.store, alloc, key)) |cached| {
+    const key = cacheKey(ctx, hybrid_tree, tier, inputs_oid);
+    const now = nowMillis(ctx.store.io);
+    if (try verdict.lookupFresh(ctx.store, alloc, key, now, ctx.set.fresh_ms)) |cached| {
         return warrant.discriminationFrom(cached.result);
     }
 
@@ -312,6 +388,10 @@ fn measureDiscrimination(
     );
     defer graded.deinit(alloc);
 
+    // A probe that was killed or timed out answers nothing, so it neither
+    // teaches the cache anything nor licenses a claim about the check.
+    if (!graded.outcome.cacheable()) return .unknown;
+
     try verdict.record(ctx.store, .{
         .tree = hybrid_tree,
         .tier = tier,
@@ -321,6 +401,9 @@ fn measureDiscrimination(
         .duration_ms = graded.outcome.duration_ms,
         .ms = 0,
         .readset = Oid.zero(),
+        .inputs = inputs_oid,
+        .ran_ms = now,
+        .outcome = graded.outcome.outcome,
     });
 
     return warrant.discriminationFrom(graded.outcome.result());
@@ -361,6 +444,10 @@ pub fn bisect(
         const mid = lo + (hi - lo) / 2;
         const v = gradeState(ctx, moments[mid], tier) catch break;
         if (v.duration_ms != 0) runs += 1;
+        // A midpoint that timed out or was killed said nothing about itself, and
+        // reading it as red would move the boundary to a state never measured.
+        // Stop with the interval still honest instead.
+        if (!v.outcome.cacheable()) break;
         if (v.result == .green) lo = mid else hi = mid;
     }
 
@@ -448,6 +535,149 @@ pub fn headState(
         .result = if (head_v) |v| v.result else null,
         .prior_green = prior_green,
     };
+}
+
+// --- what an agent gets back ---
+
+/// What `sdt grade` decided, in the one form a caller can branch on.
+///
+/// An agent runs this command and needs an answer, not prose: the tree is good,
+/// the tree is bad, nothing was measured, the run never finished, or there is
+/// nothing configured to measure with. Those are five different situations and
+/// exiting zero for all of them makes the command useless to anything that is
+/// not a human reading a terminal.
+pub const Status = enum {
+    /// A check ran, or a memoized verdict says one did, and it passed.
+    green,
+    /// A check ran and failed. This is a fact about the code.
+    red,
+    /// The check did not reach a decision: it timed out, was killed, or could
+    /// not be launched. This is a fact about the machine, and nothing was cached.
+    incomplete,
+    /// There is no verdict: nothing had been graded and nothing needed grading.
+    ungraded,
+    /// No check is configured for this tier, so there is nothing to grade with.
+    no_check,
+
+    pub fn label(self: Status) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// The exit codes. They are part of the interface, so they are named here and
+/// not spelled out at the call site.
+pub const exit_green: u8 = 0;
+pub const exit_red: u8 = 10;
+pub const exit_ungraded: u8 = 11;
+pub const exit_incomplete: u8 = 12;
+pub const exit_no_check: u8 = 14;
+
+pub const Report = struct {
+    status: Status,
+    tier: verdict.Tier = .full,
+    /// The verdict the status is about, when one exists.
+    v: ?verdict.Verdict = null,
+    /// How many checks actually executed.
+    ran: usize = 0,
+    captured: bool = false,
+    cut: bool = false,
+    boundary: ?Break = null,
+    /// The declared input that invalidated the memoized verdict, owned.
+    miss: ?[]const u8 = null,
+    /// Why the tick declined to do anything. Borrowed, never owned.
+    skipped: ?[]const u8 = null,
+
+    pub fn deinit(self: Report, alloc: std.mem.Allocator) void {
+        if (self.miss) |m| alloc.free(m);
+    }
+
+    pub fn exitCode(self: Report) u8 {
+        return switch (self.status) {
+            .green => exit_green,
+            .red => exit_red,
+            .incomplete => exit_incomplete,
+            .ungraded => exit_ungraded,
+            .no_check => exit_no_check,
+        };
+    }
+
+    /// Exactly one JSON object and nothing else, warrant axes included: the
+    /// axes are the reason a green here means more than a green anywhere else,
+    /// and an agent that cannot see them cannot use them.
+    pub fn writeJson(self: Report, w: *std.Io.Writer) !void {
+        try w.print("{{\"status\":\"{s}\",\"exit_code\":{d},\"tier\":\"{s}\"", .{
+            self.status.label(), self.exitCode(), self.tier.label(),
+        });
+        try w.print(",\"ran\":{d},\"captured\":{s},\"cut\":{s}", .{
+            self.ran,
+            if (self.captured) "true" else "false",
+            if (self.cut) "true" else "false",
+        });
+
+        if (self.v) |v| {
+            var tree_hex: [Oid.len * 2]u8 = undefined;
+            _ = v.tree.toHex(&tree_hex);
+            try w.writeAll(",\"tree\":");
+            try writeJsonString(w, &tree_hex);
+            try w.print(",\"result\":\"{s}\",\"outcome\":\"{s}\"", .{
+                v.result.label(), v.outcome.label(),
+            });
+            try w.print(",\"check_exit_code\":{d},\"duration_ms\":{d}", .{
+                v.exit_code, v.duration_ms,
+            });
+            try w.print(
+                ",\"warrant\":{{\"independence\":\"{s}\",\"relevance_hit\":{d}," ++
+                    "\"relevance_total\":{d},\"discrimination\":\"{s}\",\"hollow\":{s}}}",
+                .{
+                    v.independence.label(),
+                    v.relevance_hit,
+                    v.relevance_total,
+                    v.discrimination.label(),
+                    if (v.isHollow()) "true" else "false",
+                },
+            );
+        } else {
+            try w.writeAll(",\"tree\":null,\"result\":null,\"outcome\":null");
+            try w.writeAll(",\"check_exit_code\":null,\"duration_ms\":null,\"warrant\":null");
+        }
+
+        try w.writeAll(",\"cache_miss\":");
+        if (self.miss) |m| try writeJsonString(w, m) else try w.writeAll("null");
+
+        try w.writeAll(",\"skipped\":");
+        if (self.skipped) |s| try writeJsonString(w, s) else try w.writeAll("null");
+
+        try w.writeAll(",\"boundary\":");
+        if (self.boundary) |b| {
+            try w.print("{{\"last_green\":{d},\"first_red\":{d},\"runs\":{d}}}", .{
+                b.last_green, b.first_red, b.runs,
+            });
+        } else try w.writeAll("null");
+
+        try w.writeAll("}\n");
+    }
+};
+
+/// The status a verdict implies, which is where the outcome taxonomy reaches
+/// the caller: a red that was never the check's own answer is not a red.
+pub fn statusOf(v: verdict.Verdict) Status {
+    if (!v.outcome.cacheable()) return .incomplete;
+    return if (v.result == .green) .green else .red;
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        else => {
+            if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c);
+        },
+    };
+    try w.writeByte('"');
 }
 
 // --- tests ---
@@ -818,6 +1048,255 @@ test "a change and a moment holding the same tree share one verdict" {
     const second = try gradeChange(ctx, change_oid, .full);
     try testing.expectEqual(verdict.Result.green, second.result);
     try testing.expectEqual(first.duration_ms, second.duration_ms);
+}
+
+test "a repo that declares no inputs grades exactly as it always did" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{
+        .enabled = true,
+        .full = "echo x >> ../runs.log; exit 0",
+    };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    const first = try gradeState(ctx, m, .full);
+    try testing.expect(first.inputs.isZero());
+    try testing.expect(first.ran_ms != 0);
+    try testing.expectEqual(verdict.Outcome.pass, first.outcome);
+
+    // The key is the one it always was, so the memoized verdict still answers.
+    const second = try gradeState(ctx, m, .full);
+    try testing.expectEqual(first.duration_ms, second.duration_ms);
+    try testing.expect(verdict.lookup(&f.store, alloc, keyFor(ctx, m.full_tree, .full)) catch null != null);
+}
+
+test "a declared input changing forces a re-run, and the miss names the file" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    // The lockfile is not tracked, so nothing about the tree moves when it does.
+    try f.work.writeFile(io, .{ .sub_path = "bun.lock", .data = "v1" });
+    const inputs = [_][]const u8{"bun.lock"};
+    const set = checks.Settings{
+        .enabled = true,
+        .full = "true",
+        .inputs = &inputs,
+    };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    const first = try gradeState(ctx, m, .full);
+    try testing.expectEqual(verdict.Result.green, first.result);
+    try testing.expect(!first.inputs.isZero());
+
+    // Same tree, same command, same everything the old key could see.
+    const again = try gradeState(ctx, m, .full);
+    try testing.expectEqual(first.duration_ms, again.duration_ms);
+
+    try f.work.writeFile(io, .{ .sub_path = "bun.lock", .data = "v2" });
+
+    const current = try currentInputs(ctx);
+    defer current.deinit(alloc);
+    const why = (try missReason(ctx, m.full_tree, .full, current)).?;
+    defer alloc.free(why);
+    try testing.expectEqualStrings("bun.lock", why);
+
+    const third = try gradeState(ctx, m, .full);
+    // A real run against the same tree, under a key that now differs.
+    try testing.expect(!third.inputs.eql(first.inputs));
+    try testing.expect(third.duration_ms > 0);
+
+    // Nothing moved this time, so there is nothing to name.
+    const settled = try currentInputs(ctx);
+    defer settled.deinit(alloc);
+    try testing.expect((try missReason(ctx, m.full_tree, .full, settled)) == null);
+}
+
+test "an input outside the repo re-grades the same tree" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    // A toolchain file above the worktree, addressed absolutely.
+    const outside = try std.fmt.allocPrint(alloc, "{s}/toolchain.txt", .{f.scratch});
+    defer alloc.free(outside);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outside, .data = "0.16.0" });
+
+    const inputs = [_][]const u8{outside};
+    const set = checks.Settings{ .enabled = true, .full = "true", .inputs = &inputs };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    const first = try gradeState(ctx, m, .full);
+    try testing.expect(!first.inputs.isZero());
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = outside, .data = "0.17.0" });
+    const second = try gradeState(ctx, m, .full);
+    try testing.expect(!second.inputs.eql(first.inputs));
+    try testing.expect(second.duration_ms > 0);
+}
+
+test "a green past the freshness window is measured again" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    {
+        const set = checks.Settings{ .enabled = true, .full = "true" };
+        const ctx = f.ctx(alloc, set);
+        const first = try gradeState(ctx, m, .full);
+        try testing.expectEqual(verdict.Result.green, first.result);
+        // Inside a generous window the memoized answer still stands.
+        const inside = try gradeState(ctx, m, .full);
+        try testing.expectEqual(first.duration_ms, inside.duration_ms);
+    }
+
+    // A window of one millisecond has already elapsed by the time this runs.
+    const set = checks.Settings{ .enabled = true, .full = "true", .fresh_ms = 1 };
+    const ctx = f.ctx(alloc, set);
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+    const stale = try gradeState(ctx, m, .full);
+    try testing.expectEqual(verdict.Result.green, stale.result);
+    try testing.expect(stale.duration_ms > 0);
+}
+
+test "a check killed mid-run is reported, not remembered" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{ .enabled = true, .full = "kill -9 $$" };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    const v = try gradeState(ctx, m, .full);
+    try testing.expectEqual(verdict.Outcome.cancelled, v.outcome);
+    try testing.expectEqual(Status.incomplete, statusOf(v));
+
+    // Nothing was written, so the next call measures rather than serving a red
+    // that only ever meant "the machine interfered".
+    try testing.expect((try verdict.lookup(&f.store, alloc, keyFor(ctx, m.full_tree, .full))) == null);
+    const again = try gradeState(ctx, m, .full);
+    try testing.expect(again.duration_ms > 0);
+    try testing.expectEqual(verdict.Outcome.cancelled, again.outcome);
+}
+
+test "a check that hangs past its deadline is not remembered either" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{
+        .enabled = true,
+        .full = "sleep 30",
+        .timeout_full_ms = 200,
+        .kill_grace_ms = 50,
+    };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    const v = try gradeState(ctx, m, .full);
+    try testing.expectEqual(verdict.Outcome.timeout, v.outcome);
+    try testing.expectEqual(Status.incomplete, statusOf(v));
+    try testing.expect((try verdict.lookup(&f.store, alloc, keyFor(ctx, m.full_tree, .full))) == null);
+}
+
+test "the report gives an agent an exit code and one JSON object" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{ .enabled = true, .full = "grep -q good a.txt" };
+    const ctx = f.ctx(alloc, set);
+
+    const good = try snap(&f, alloc, "a.txt", "good");
+    defer alloc.free(good.branch);
+    const v = try gradeState(ctx, good, .full);
+
+    const green = Report{ .status = statusOf(v), .tier = .full, .v = v, .ran = 1, .captured = true };
+    try testing.expectEqual(exit_green, green.exitCode());
+
+    var buf: [4096]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buf);
+    try green.writeJson(&out);
+    const json = out.buffered();
+
+    // Exactly one object, and a trailing newline.
+    try testing.expect(json[0] == '{');
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\n"));
+    try testing.expect(std.mem.endsWith(u8, json, "}\n"));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("green", root.get("status").?.string);
+    try testing.expectEqual(@as(i64, 0), root.get("exit_code").?.integer);
+    try testing.expectEqualStrings("full", root.get("tier").?.string);
+    try testing.expectEqualStrings("pass", root.get("outcome").?.string);
+    try testing.expectEqual(@as(i64, 1), root.get("ran").?.integer);
+
+    // The warrant axes are the differentiator, so an agent can see all of them.
+    const warrant_axes = root.get("warrant").?.object;
+    try testing.expect(warrant_axes.get("independence") != null);
+    try testing.expect(warrant_axes.get("relevance_hit") != null);
+    try testing.expect(warrant_axes.get("relevance_total") != null);
+    try testing.expect(warrant_axes.get("discrimination") != null);
+    try testing.expect(warrant_axes.get("hollow") != null);
+
+    const bad = try snap(&f, alloc, "a.txt", "broken");
+    defer alloc.free(bad.branch);
+    const rv = try gradeState(ctx, bad, .full);
+    const red = Report{ .status = statusOf(rv), .tier = .full, .v = rv, .ran = 1 };
+    try testing.expectEqual(exit_red, red.exitCode());
+
+    try testing.expectEqual(exit_ungraded, (Report{ .status = .ungraded, .tier = .full }).exitCode());
+    try testing.expectEqual(exit_no_check, (Report{ .status = .no_check, .tier = .full }).exitCode());
+    try testing.expectEqual(exit_incomplete, (Report{ .status = .incomplete, .tier = .full }).exitCode());
+}
+
+test "a report with nothing graded is still one valid JSON object" {
+    const alloc = testing.allocator;
+    var buf: [2048]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buf);
+
+    const miss = try alloc.dupe(u8, "bun.lock");
+    const r = Report{
+        .status = .ungraded,
+        .tier = .fast,
+        .miss = miss,
+        .skipped = "on battery below the floor, so nothing was graded",
+    };
+    defer r.deinit(alloc);
+    try r.writeJson(&out);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.buffered(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("ungraded", root.get("status").?.string);
+    try testing.expectEqual(@as(i64, 11), root.get("exit_code").?.integer);
+    try testing.expectEqual(std.json.Value.null, root.get("result").?);
+    try testing.expectEqual(std.json.Value.null, root.get("warrant").?);
+    try testing.expectEqualStrings("bun.lock", root.get("cache_miss").?.string);
+    try testing.expect(root.get("skipped").?.string.len != 0);
 }
 
 test "the warrant on a change with no attribution is unknown, not fabricated" {

@@ -256,6 +256,10 @@ pub const Session = struct {
     key: [key_len]u8,
     role: Role,
     confirmed: bool,
+    // The record counter is per-session, not per-call: restarting it would
+    // reuse a nonce under the same key the moment a second stream is sent.
+    send_index: u64 = 0,
+    recv_index: u64 = 0,
 
     fn sendKey(self: *const Session) [key_len]u8 {
         return recordKey(self.key, self.role);
@@ -277,7 +281,7 @@ pub const Session = struct {
         const frame = try alloc.alloc(u8, 1 + record_chunk_len + Aead.tag_length);
         defer alloc.free(frame);
 
-        var index: u64 = 0;
+        var index: u64 = self.send_index;
         var offset: usize = 0;
         while (true) {
             const take = @min(record_chunk_len, payload.len - offset);
@@ -298,6 +302,7 @@ pub const Session = struct {
             index += 1;
             if (final) break;
         }
+        self.send_index = index;
     }
 
     pub fn recvStream(self: *Session, io: std.Io, alloc: std.mem.Allocator, ch: Channel) ![]u8 {
@@ -308,7 +313,7 @@ pub const Session = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
 
-        var index: u64 = 0;
+        var index: u64 = self.recv_index;
         while (true) {
             const frame = try readFrameAlloc(ch, alloc);
             defer alloc.free(frame);
@@ -332,6 +337,7 @@ pub const Session = struct {
             index += 1;
             if (final) break;
         }
+        self.recv_index = index;
 
         return out.toOwnedSlice(alloc);
     }
@@ -874,6 +880,33 @@ test "record streams round trip in both directions" {
     const ack = try t.sender.recvStream(io, alloc, .{ .r = &back_reader, .w = undefined });
     defer alloc.free(ack);
     try testing.expectEqualStrings("ack", ack);
+}
+
+test "a second stream never reuses a record nonce" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var t = try runHandshake(io, "42-galaxy-gadget", "42-galaxy-gadget");
+
+    var first = allocWriter(alloc);
+    defer first.deinit();
+    try t.sender.sendStream(io, alloc, .{ .r = undefined, .w = &first.writer }, "same payload");
+
+    var second = allocWriter(alloc);
+    defer second.deinit();
+    try t.sender.sendStream(io, alloc, .{ .r = undefined, .w = &second.writer }, "same payload");
+
+    try testing.expect(t.sender.send_index >= 2);
+    try testing.expect(!std.mem.eql(u8, first.written(), second.written()));
+
+    var r1: std.Io.Reader = .fixed(first.written());
+    const got1 = try t.receiver.recvStream(io, alloc, .{ .r = &r1, .w = undefined });
+    defer alloc.free(got1);
+    try testing.expectEqualStrings("same payload", got1);
+
+    var r2: std.Io.Reader = .fixed(second.written());
+    const got2 = try t.receiver.recvStream(io, alloc, .{ .r = &r2, .w = undefined });
+    defer alloc.free(got2);
+    try testing.expectEqualStrings("same payload", got2);
 }
 
 test "an empty payload round trips" {

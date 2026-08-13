@@ -189,6 +189,38 @@ pub fn author(store: *Store, alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, "you <you@localhost>");
 }
 
+/// Parse a duration written the way a person writes one: `750ms`, `90s`, `30m`,
+/// `2h`, `1d`, or a bare number meaning seconds. Null when it is not a duration,
+/// so a caller can keep its default rather than silently reading a typo as zero.
+pub fn parseDurationMs(raw: []const u8) ?i64 {
+    const s = std.mem.trim(u8, raw, ws);
+    if (s.len == 0) return null;
+
+    var digits: usize = 0;
+    while (digits < s.len and s[digits] >= '0' and s[digits] <= '9') digits += 1;
+    if (digits == 0) return null;
+
+    const n = std.fmt.parseInt(i64, s[0..digits], 10) catch return null;
+    const unit = std.mem.trim(u8, s[digits..], ws);
+
+    const scale: i64 = if (unit.len == 0)
+        std.time.ms_per_s
+    else if (std.mem.eql(u8, unit, "ms"))
+        1
+    else if (std.mem.eql(u8, unit, "s"))
+        std.time.ms_per_s
+    else if (std.mem.eql(u8, unit, "m"))
+        std.time.ms_per_min
+    else if (std.mem.eql(u8, unit, "h"))
+        std.time.ms_per_hour
+    else if (std.mem.eql(u8, unit, "d"))
+        std.time.ms_per_day
+    else
+        return null;
+
+    return std.math.mul(i64, n, scale) catch null;
+}
+
 /// The default branch name for `sdt init`, from global `init.defaultBranch`,
 /// else "main". Caller frees.
 pub fn defaultBranch(io: std.Io, alloc: std.mem.Allocator) ![]u8 {
@@ -276,6 +308,24 @@ test "global config roundtrip and local-over-global precedence" {
     const lo = try get(&store, alloc, "user.name");
     defer if (lo) |v| alloc.free(v);
     try testing.expectEqualStrings("LocalName", lo.?);
+}
+
+test "durations parse in the units people write them in" {
+    try testing.expectEqual(@as(i64, 750), parseDurationMs("750ms").?);
+    try testing.expectEqual(@as(i64, 90_000), parseDurationMs("90s").?);
+    try testing.expectEqual(@as(i64, 1_800_000), parseDurationMs("30m").?);
+    try testing.expectEqual(@as(i64, 7_200_000), parseDurationMs("2h").?);
+    try testing.expectEqual(@as(i64, 86_400_000), parseDurationMs("1d").?);
+    // A bare number is seconds.
+    try testing.expectEqual(@as(i64, 45_000), parseDurationMs("45").?);
+    try testing.expectEqual(@as(i64, 1_800_000), parseDurationMs("  30m  ").?);
+    try testing.expectEqual(@as(i64, 0), parseDurationMs("0").?);
+
+    // Not a duration at all, which must not read as zero.
+    try testing.expect(parseDurationMs("") == null);
+    try testing.expect(parseDurationMs("soon") == null);
+    try testing.expect(parseDurationMs("m") == null);
+    try testing.expect(parseDurationMs("30 minutes") == null);
 }
 
 test "a setting written before the rename is still honoured" {

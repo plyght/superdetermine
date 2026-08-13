@@ -48,13 +48,21 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a absorb -d 'fold edits into the changes they belong to'
     \\complete -c sdt -n __fish_use_subcommand -a point -d "move this branch's tip to any ref"
     \\complete -c sdt -n __fish_use_subcommand -a rebase -d 'replay this branch onto a new base'
+    \\complete -c sdt -n __fish_use_subcommand -a amend -d 'fold working edits into a named change'
     \\complete -c sdt -n __fish_use_subcommand -a squash -d 'collapse adjacent changes into one'
     \\complete -c sdt -n __fish_use_subcommand -a split -d 'split one change in two, by path or hunk'
+    \\complete -c sdt -n __fish_use_subcommand -a drop -d 'remove a change, keep its edits in the tree'
     \\complete -c sdt -n __fish_use_subcommand -a reorder -d 'reorder the last changes, 1 = oldest'
     \\complete -c sdt -n '__fish_seen_subcommand_from squash sq' -s m -d 'message for the collapsed change' -r
     \\complete -c sdt -n '__fish_seen_subcommand_from squash sq' -l at -d 'end the span at this ref' -r
     \\complete -c sdt -n '__fish_seen_subcommand_from split spl' -s m -d 'message for the extracted change' -r
     \\complete -c sdt -n '__fish_seen_subcommand_from split spl' -l hunk -d 'take hunks of one file: <path>:<n[,n][,a-b]>' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from amend am absorb ab' -l at -d 'the change to fold the edits into' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from amend am absorb ab' -l hunk -d 'fold hunks of one file: <path>:<n[,n][,a-b]>' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from describe desc' -s m -d 'the message' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from describe desc' -l at -d 'rename this change, not the tip' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from branch b br branches' -s d -d 'delete a branch' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from branch b br branches' -s D -d 'delete a branch, unmerged history included' -r
     \\complete -c sdt -n __fish_use_subcommand -a provenance -d 'show which agent/prompt produced each change'
     \\complete -c sdt -n __fish_use_subcommand -a why -d 'who last authored a file'
     \\complete -c sdt -n __fish_use_subcommand -a undo -d 'revert the last change-making operation'
@@ -133,8 +141,10 @@ const zsh_script =
     \\    'absorb:fold edits into the changes they belong to'
     \\    'point:move this branch tip to any ref'
     \\    'rebase:replay this branch onto a new base'
+    \\    'amend:fold working edits into a named change'
     \\    'squash:collapse adjacent changes into one'
     \\    'split:split one change in two, by path or hunk'
+    \\    'drop:remove a change, keep its edits in the tree'
     \\    'reorder:reorder the last changes, 1 = oldest'
     \\    'provenance:show which agent/prompt produced each change'
     \\    'why:who last authored a file'
@@ -189,6 +199,12 @@ const zsh_script =
     \\    compadd -- -m --at
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (split|spl) ]]; then
     \\    compadd -- -m --hunk --
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (amend|am|absorb|ab) ]]; then
+    \\    compadd -- --at --hunk --
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (describe|desc) ]]; then
+    \\    compadd -- -m --at
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (branch|b|br|branches) ]]; then
+    \\    compadd -- -d -D
     \\  fi
     \\}
     \\_gr "$@"
@@ -202,7 +218,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab absorb b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve sh share sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb am amend b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve sh share sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
@@ -221,6 +237,18 @@ const bash_script =
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "split" || "${COMP_WORDS[1]}" == "spl" ]]; then
     \\    COMPREPLY=( $(compgen -W "-m --hunk --" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "amend" || "${COMP_WORDS[1]}" == "am" || "${COMP_WORDS[1]}" == "absorb" || "${COMP_WORDS[1]}" == "ab" ]]; then
+    \\    COMPREPLY=( $(compgen -W "--at --hunk --" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "describe" || "${COMP_WORDS[1]}" == "desc" ]]; then
+    \\    COMPREPLY=( $(compgen -W "-m --at" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "branch" || "${COMP_WORDS[1]}" == "b" || "${COMP_WORDS[1]}" == "br" ]]; then
+    \\    COMPREPLY=( $(compgen -W "-d -D" -- "$cur") )
     \\    return 0
     \\  fi
     \\}

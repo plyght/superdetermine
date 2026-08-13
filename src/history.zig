@@ -18,6 +18,9 @@ pub const Error = error{
     NoSuchHunk,
     BinaryHasNoHunks,
     PathNotModified,
+    CurrentBranch,
+    NoSuchBranch,
+    BranchNotMerged,
 };
 
 /// A hunk-level selection within one file: 1-based hunk numbers, counted the
@@ -450,8 +453,10 @@ fn hunkTree(
     return store.writeTree(.{ .entries = entries.items });
 }
 
-/// Which piece of a change to lift out: whole files, or hunks within files.
+/// Which piece of a change to lift out: everything, whole files, or hunks
+/// within files.
 pub const Selection = union(enum) {
+    whole,
     paths: []const []const u8,
     hunks: []const HunkSpec,
 };
@@ -464,6 +469,7 @@ fn selectedTree(
     selection: Selection,
 ) !Oid {
     return switch (selection) {
+        .whole => change_tree,
         .paths => |p| scopedTree(store, alloc, parent_tree, change_tree, p),
         .hunks => |h| hunkTree(store, alloc, parent_tree, change_tree, h),
     };
@@ -582,6 +588,199 @@ pub fn reorder(
     defer rw.deinit();
     for (order) |p| _ = try rw.push(span[p - 1]);
     return rw.finish(branch, tip, timestamp);
+}
+
+/// Rename any change, not only the tip. The change keeps its identity and its
+/// tree; only the message differs, so every descendant replays onto an identical
+/// tree and comes out byte-identical apart from its new parent.
+pub fn reword(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    target: Oid,
+    message: []const u8,
+    timestamp: i64,
+) !Result {
+    if (message.len == 0) return Error.NothingToDo;
+    const tip = try tipOf(store, branch);
+
+    const chain = try chainOf(store, alloc, tip);
+    defer alloc.free(chain);
+
+    const idx = indexOf(chain, target) orelse return Error.NotAChange;
+    try requireLinear(store, alloc, chain[idx..]);
+
+    const change = store.readChange(target) catch return Error.NotAChange;
+    defer object.freeChange(alloc, change);
+    if (std.mem.eql(u8, change.message, message)) return Error.NothingToDo;
+
+    const parent: ?Oid = if (idx == 0) null else chain[idx - 1];
+
+    var rw = Rewriter.init(store, alloc, change.tree, parent);
+    defer rw.deinit();
+    _ = try rw.write(metaOf(change), change.tree, change.change_id, message);
+    try rw.pushAll(chain[idx + 1 ..]);
+    return rw.finish(branch, tip, timestamp);
+}
+
+/// Fold part of the working tree into a change that is already history.
+///
+/// `work_tree` is the working tree as a tree object, and `selection` says which
+/// part of the difference between the branch tip and that tree belongs to
+/// `target`. The selected part is three-way merged into the target's own tree,
+/// so an edit lands where it belongs even when later changes touched the same
+/// file; anything that cannot be merged is reported rather than picked for you.
+pub fn amendInto(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    target: Oid,
+    work_tree: Oid,
+    selection: Selection,
+    timestamp: i64,
+) !Result {
+    const tip = try tipOf(store, branch);
+
+    const chain = try chainOf(store, alloc, tip);
+    defer alloc.free(chain);
+
+    const idx = indexOf(chain, target) orelse return Error.NotAChange;
+    try requireLinear(store, alloc, chain[idx..]);
+
+    const tip_change = store.readChange(tip) catch return Error.NotAChange;
+    defer object.freeChange(alloc, tip_change);
+    const change = store.readChange(target) catch return Error.NotAChange;
+    defer object.freeChange(alloc, change);
+
+    const partial = try selectedTree(store, alloc, tip_change.tree, work_tree, selection);
+    if (partial.eql(tip_change.tree)) return Error.NothingToDo;
+
+    const parent: ?Oid = if (idx == 0) null else chain[idx - 1];
+
+    var rw = Rewriter.init(store, alloc, change.tree, parent);
+    defer rw.deinit();
+
+    const folded = try replay.applyTreeDelta(store, alloc, tip_change.tree, partial, change.tree);
+    try rw.take(folded);
+    _ = try rw.write(metaOf(change), rw.tree, change.change_id, change.message);
+
+    try rw.pushAll(chain[idx + 1 ..]);
+    return rw.finish(branch, tip, timestamp);
+}
+
+/// Remove one change from history and leave its content alone. The caller keeps
+/// the working tree as it is, so what the change held comes back as uncommitted
+/// edits instead of disappearing.
+pub fn drop(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    target: Oid,
+    timestamp: i64,
+) !Result {
+    const tip = try tipOf(store, branch);
+
+    const chain = try chainOf(store, alloc, tip);
+    defer alloc.free(chain);
+
+    const idx = indexOf(chain, target) orelse return Error.NotAChange;
+    try requireLinear(store, alloc, chain[idx..]);
+
+    const change = store.readChange(target) catch return Error.NotAChange;
+    defer object.freeChange(alloc, change);
+
+    const parent: ?Oid = if (idx == 0) null else chain[idx - 1];
+    if (parent == null and chain.len == 1) {
+        try deleteRef(store, branch);
+        try oplog.record(store, .{
+            .kind = .other,
+            .branch = branch,
+            .prev = tip,
+            .new = Oid.zero(),
+            .timestamp = timestamp,
+        });
+        return .{ .prev = tip, .new = Oid.zero(), .rewritten = 0, .conflicts = try alloc.alloc([]u8, 0) };
+    }
+
+    const base_tree = try replay.parentTreeOf(store, alloc, change);
+
+    var rw = Rewriter.init(store, alloc, base_tree, parent);
+    defer rw.deinit();
+    try rw.pushAll(chain[idx + 1 ..]);
+    return rw.finish(branch, tip, timestamp);
+}
+
+fn deleteRef(store: *Store, name: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    const p = try std.fmt.bufPrint(&buf, "refs/heads/{s}", .{name});
+    store.root.deleteFile(store.io, p) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => return e,
+    };
+}
+
+/// True when some other branch already reaches `tip`, which is what makes
+/// deleting the ref safe: the changes stay addressable through that branch.
+fn reachedElsewhere(store: *Store, alloc: std.mem.Allocator, name: []const u8, tip: Oid) !bool {
+    var stack: std.ArrayList(Oid) = .empty;
+    defer stack.deinit(alloc);
+
+    var heads = store.root.openDir(store.io, "refs/heads", .{ .iterate = true }) catch return false;
+    defer heads.close(store.io);
+    var it = heads.iterate();
+    while (try it.next(store.io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.eql(u8, entry.name, name)) continue;
+        const other = store.readRef(entry.name) catch continue;
+        try stack.append(alloc, other);
+    }
+
+    var seen = std.AutoHashMap([Oid.len]u8, void).init(alloc);
+    defer seen.deinit();
+
+    while (stack.pop()) |cur| {
+        if (cur.isZero()) continue;
+        if (cur.eql(tip)) return true;
+        if ((try seen.getOrPut(cur.bytes)).found_existing) continue;
+        const change = store.readChange(cur) catch continue;
+        defer object.freeChange(alloc, change);
+        for (change.parents) |p| try stack.append(alloc, p);
+    }
+    return false;
+}
+
+/// Delete a branch ref. The branch you are on is never deleted, and a branch
+/// holding changes no other branch reaches is refused unless `force`, because
+/// `sdt export` publishes every branch and dropping the only pointer to a piece
+/// of history is not something to do by accident. The oplog entry makes it a
+/// `sdt undo` away either way. Returns the tip the ref held.
+pub fn deleteBranch(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    force: bool,
+    timestamp: i64,
+) !Oid {
+    if (name.len == 0) return Error.NoSuchBranch;
+    const head = store.headBranch() catch return Error.NoSuchBranch;
+    defer alloc.free(head);
+    if (std.mem.eql(u8, head, name)) return Error.CurrentBranch;
+    if (!store.refExists(name)) return Error.NoSuchBranch;
+
+    const tip = store.readRef(name) catch Oid.zero();
+    if (!force and !tip.isZero() and !try reachedElsewhere(store, alloc, name, tip)) {
+        return Error.BranchNotMerged;
+    }
+
+    try deleteRef(store, name);
+    try oplog.record(store, .{
+        .kind = .other,
+        .branch = name,
+        .prev = tip,
+        .new = Oid.zero(),
+        .timestamp = timestamp,
+    });
+    return tip;
 }
 
 // --- tests ---
@@ -1321,6 +1520,384 @@ test "changeOfMoment maps an id prefix and a tree back onto a change" {
     );
 }
 
+const only_first = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+const first_and_last = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20a\n";
+
+test "reword renames a change in the middle and keeps its descendants" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "the remainder");
+    var e2 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+        .{ .mode = .regular, .path = "c", .blob = try f.blob("c\n") },
+    };
+    const c2 = try f.commit(try f.tree(&e2), &.{c1}, "later work");
+
+    try f.store.updateRef("main", c2);
+    const id_c1 = try f.changeIdOf(c1);
+    const id_c2 = try f.changeIdOf(c2);
+
+    const r = try reword(&f.store, alloc, "main", c1, "add the b module", 31);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+    try testing.expect(chain[0].eql(c0));
+
+    const renamed = try f.messageOf(chain[1]);
+    defer alloc.free(renamed);
+    try testing.expectEqualStrings("add the b module", renamed);
+
+    const kept = try f.messageOf(chain[2]);
+    defer alloc.free(kept);
+    try testing.expectEqualStrings("later work", kept);
+
+    try testing.expect((try f.treeOf(chain[1])).eql(try f.treeOf(c1)));
+    try testing.expect((try f.treeOf(chain[2])).eql(try f.treeOf(c2)));
+
+    const got_c1 = try f.changeIdOf(chain[1]);
+    const got_c2 = try f.changeIdOf(chain[2]);
+    try testing.expectEqualSlices(u8, &id_c1, &got_c1);
+    try testing.expectEqualSlices(u8, &id_c2, &got_c2);
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+}
+
+test "reword refuses a message that changes nothing and a ref off this branch" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "f", .blob = try f.blob("0\n") }};
+    const t0 = try f.tree(&e0);
+    const c0 = try f.commit(t0, &.{}, "zero");
+    const elsewhere = try f.commit(t0, &.{}, "not on this branch");
+    try f.store.updateRef("main", c0);
+
+    try testing.expectError(Error.NothingToDo, reword(&f.store, alloc, "main", c0, "", 1));
+    try testing.expectError(Error.NothingToDo, reword(&f.store, alloc, "main", c0, "zero", 1));
+    try testing.expectError(Error.NotAChange, reword(&f.store, alloc, "main", elsewhere, "new", 1));
+    try testing.expect((try f.store.readRef("main")).eql(c0));
+}
+
+test "amend routes two hunks of one file into two different earlier changes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) },
+        .{ .mode = .regular, .path = "one", .blob = try f.blob("one\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "first");
+    var e2 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_old) },
+        .{ .mode = .regular, .path = "one", .blob = try f.blob("one\n") },
+        .{ .mode = .regular, .path = "two", .blob = try f.blob("two\n") },
+    };
+    const c2 = try f.commit(try f.tree(&e2), &.{c1}, "second");
+
+    try f.store.updateRef("main", c2);
+    const id_c1 = try f.changeIdOf(c1);
+
+    var work_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "app.zig", .blob = try f.blob(wide_new) },
+        .{ .mode = .regular, .path = "one", .blob = try f.blob("one\n") },
+        .{ .mode = .regular, .path = "two", .blob = try f.blob("two\n") },
+    };
+    const work_tree = try f.tree(&work_entries);
+
+    const top = [_]usize{1};
+    const first_spec = [_]HunkSpec{.{ .path = "app.zig", .indices = &top }};
+    {
+        const r = try amendInto(&f.store, alloc, "main", c1, work_tree, .{ .hunks = &first_spec }, 41);
+        defer r.deinit(alloc);
+        try testing.expect(r.clean());
+        try testing.expectEqual(@as(usize, 2), r.rewritten);
+    }
+
+    {
+        const chain = try f.chain("main");
+        defer alloc.free(chain);
+        try testing.expectEqual(@as(usize, 3), chain.len);
+
+        const folded = try f.text(try f.treeOf(chain[1]), "app.zig");
+        defer alloc.free(folded);
+        try testing.expectEqualStrings(only_first, folded);
+
+        const kept = try f.changeIdOf(chain[1]);
+        try testing.expectEqualSlices(u8, &id_c1, &kept);
+
+        const carried = try f.text(try f.treeOf(chain[2]), "app.zig");
+        defer alloc.free(carried);
+        try testing.expectEqualStrings(only_first, carried);
+    }
+
+    // The tip now holds the first hunk, so what is left of the working tree is
+    // two hunks, numbered from 1 again.
+    const chain_after_first = try f.chain("main");
+    defer alloc.free(chain_after_first);
+    const second = chain_after_first[2];
+
+    const last = [_]usize{2};
+    const second_spec = [_]HunkSpec{.{ .path = "app.zig", .indices = &last }};
+    {
+        const r = try amendInto(&f.store, alloc, "main", second, work_tree, .{ .hunks = &second_spec }, 42);
+        defer r.deinit(alloc);
+        try testing.expect(r.clean());
+    }
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+
+    const first_change = try f.text(try f.treeOf(chain[1]), "app.zig");
+    defer alloc.free(first_change);
+    try testing.expectEqualStrings(only_first, first_change);
+
+    const second_change = try f.text(try f.treeOf(chain[2]), "app.zig");
+    defer alloc.free(second_change);
+    try testing.expectEqualStrings(first_and_last, second_change);
+
+    try testing.expect(try f.has(try f.treeOf(chain[2]), "two"));
+}
+
+test "amend folds a whole working tree into a change below the tip" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "add b");
+    var e2 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+        .{ .mode = .regular, .path = "c", .blob = try f.blob("c\n") },
+    };
+    const c2 = try f.commit(try f.tree(&e2), &.{c1}, "add c");
+    try f.store.updateRef("main", c2);
+
+    var work_entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b fixed\n") },
+        .{ .mode = .regular, .path = "c", .blob = try f.blob("c\n") },
+    };
+    const work_tree = try f.tree(&work_entries);
+
+    const r = try amendInto(&f.store, alloc, "main", c1, work_tree, .whole, 43);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 3), chain.len);
+
+    const fixed = try f.text(try f.treeOf(chain[1]), "b");
+    defer alloc.free(fixed);
+    try testing.expectEqualStrings("b fixed\n", fixed);
+
+    const tip_tree = try f.treeOf(chain[2]);
+    try testing.expect(tip_tree.eql(work_tree));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+}
+
+test "amend refuses a no-op selection, a foreign ref, and a merge in the way" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "f", .blob = try f.blob("0\n") }};
+    const t0 = try f.tree(&e0);
+    const c0 = try f.commit(t0, &.{}, "zero");
+    var e1 = [_]object.TreeEntry{.{ .mode = .regular, .path = "f", .blob = try f.blob("0\n1\n") }};
+    const t1 = try f.tree(&e1);
+    const c1 = try f.commit(t1, &.{c0}, "one");
+    try f.store.updateRef("main", c1);
+
+    try testing.expectError(
+        Error.NothingToDo,
+        amendInto(&f.store, alloc, "main", c0, t1, .whole, 1),
+    );
+    try testing.expectError(
+        Error.NotAChange,
+        amendInto(&f.store, alloc, "main", t0, t0, .whole, 1),
+    );
+
+    const side = try f.commit(t1, &.{c0}, "side");
+    const merged = try f.commit(t1, &.{ c1, side }, "merged");
+    try f.store.updateRef("merge-branch", merged);
+    try testing.expectError(
+        replay.Error.MergeChangeNotReplayable,
+        amendInto(&f.store, alloc, "merge-branch", merged, t0, .whole, 1),
+    );
+    try testing.expect((try f.store.readRef("main")).eql(c1));
+}
+
+test "drop removes a change and leaves the descendants reachable" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "debris", .blob = try f.blob("debris\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "the debris");
+    var e2 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "debris", .blob = try f.blob("debris\n") },
+        .{ .mode = .regular, .path = "keep", .blob = try f.blob("keep\n") },
+    };
+    const c2 = try f.commit(try f.tree(&e2), &.{c1}, "keep this");
+    try f.store.updateRef("main", c2);
+
+    const r = try drop(&f.store, alloc, "main", c1, 51);
+    defer r.deinit(alloc);
+    try testing.expect(r.clean());
+
+    const chain = try f.chain("main");
+    defer alloc.free(chain);
+    try testing.expectEqual(@as(usize, 2), chain.len);
+    try testing.expect(chain[0].eql(c0));
+
+    const tip_tree = try f.treeOf(chain[1]);
+    try testing.expect(try f.has(tip_tree, "keep"));
+    try testing.expect(!(try f.has(tip_tree, "debris")));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+}
+
+test "drop of the tip moves the branch back one change" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "add b");
+    try f.store.updateRef("main", c1);
+
+    const r = try drop(&f.store, alloc, "main", c1, 52);
+    defer r.deinit(alloc);
+    try testing.expect(r.new.eql(c0));
+    try testing.expectEqual(@as(usize, 0), r.rewritten);
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c1));
+}
+
+test "drop of the only change leaves the branch unborn and undo restores it" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    try f.store.updateRef("main", c0);
+
+    const r = try drop(&f.store, alloc, "main", c0, 53);
+    defer r.deinit(alloc);
+    try testing.expect(r.new.isZero());
+    try testing.expect(!f.store.refExists("main"));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c0));
+}
+
+test "branch delete refuses the current branch and an unknown name" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    try f.store.updateRef("main", c0);
+
+    try testing.expectError(Error.CurrentBranch, deleteBranch(&f.store, alloc, "main", false, 1));
+    try testing.expectError(Error.CurrentBranch, deleteBranch(&f.store, alloc, "main", true, 1));
+    try testing.expectError(Error.NoSuchBranch, deleteBranch(&f.store, alloc, "ghost", true, 1));
+    try testing.expect(f.store.refExists("main"));
+}
+
+test "branch delete refuses history no other branch holds, until forced" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "scratch", .blob = try f.blob("scratch\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "scratch work");
+
+    try f.store.updateRef("main", c0);
+    try f.store.updateRef("scratch", c1);
+
+    try testing.expectError(Error.BranchNotMerged, deleteBranch(&f.store, alloc, "scratch", false, 1));
+    try testing.expect(f.store.refExists("scratch"));
+
+    const tip = try deleteBranch(&f.store, alloc, "scratch", true, 2);
+    try testing.expect(tip.eql(c1));
+    try testing.expect(!f.store.refExists("scratch"));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("scratch")).eql(c1));
+}
+
+test "branch delete goes through unforced once another branch reaches the tip" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const alloc = testing.allocator;
+
+    var e0 = [_]object.TreeEntry{.{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") }};
+    const c0 = try f.commit(try f.tree(&e0), &.{}, "root");
+    var e1 = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a", .blob = try f.blob("a\n") },
+        .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+    };
+    const c1 = try f.commit(try f.tree(&e1), &.{c0}, "done");
+
+    try f.store.updateRef("main", c1);
+    try f.store.updateRef("merged-already", c0);
+
+    const tip = try deleteBranch(&f.store, alloc, "merged-already", false, 1);
+    try testing.expect(tip.eql(c0));
+    try testing.expect(!f.store.refExists("merged-already"));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("merged-already")).eql(c0));
+}
+
 test "undo of a rewrite restores the exact prior ref for every driver" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -1369,7 +1946,38 @@ test "undo of a rewrite restores the exact prior ref for every driver" {
     try testing.expect((try f.store.readRef("main")).eql(c2));
 
     {
-        const r = try point(&f.store, alloc, "main", c0, 4);
+        const r = try reword(&f.store, alloc, "main", c1, "renamed", 4);
+        defer r.deinit(alloc);
+    }
+    try testing.expect(!(try f.store.readRef("main")).eql(c2));
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+
+    {
+        var work_entries = [_]object.TreeEntry{
+            .{ .mode = .regular, .path = "a", .blob = try f.blob("a amended\n") },
+            .{ .mode = .regular, .path = "b", .blob = try f.blob("b\n") },
+            .{ .mode = .regular, .path = "c", .blob = try f.blob("c\n") },
+            .{ .mode = .regular, .path = "d", .blob = try f.blob("d\n") },
+        };
+        const work_tree = try f.tree(&work_entries);
+        const r = try amendInto(&f.store, alloc, "main", c1, work_tree, .whole, 5);
+        defer r.deinit(alloc);
+    }
+    try testing.expect(!(try f.store.readRef("main")).eql(c2));
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+
+    {
+        const r = try drop(&f.store, alloc, "main", c1, 6);
+        defer r.deinit(alloc);
+    }
+    try testing.expect(!(try f.store.readRef("main")).eql(c2));
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(c2));
+
+    {
+        const r = try point(&f.store, alloc, "main", c0, 7);
         defer r.deinit(alloc);
     }
     try testing.expect((try f.store.readRef("main")).eql(c0));

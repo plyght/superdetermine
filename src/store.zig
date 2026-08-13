@@ -29,6 +29,20 @@ pub const legacy_dir_name = ".gr";
 
 pub const chunk_key_file = "chunkkey";
 
+const tmp_prefix = "tmp-";
+var tmp_seq: std.atomic.Value(u64) = .init(0);
+
+fn tempName(io: std.Io, buf: []u8) ![]const u8 {
+    var rand: [8]u8 = undefined;
+    try io.randomSecure(&rand);
+    const n = tmp_seq.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrint(buf, tmp_prefix ++ "{d}-{d}-{x:0>16}", .{
+        std.c.getpid(),
+        n,
+        std.mem.readInt(u64, &rand, .little),
+    }) catch unreachable;
+}
+
 pub const Store = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -127,10 +141,18 @@ pub const Store = struct {
         _ = o.toHex(&hex);
         const shard = std.fmt.bufPrint(&buf, "objects/{s}", .{hex[0..2]}) catch unreachable;
         try self.root.createDirPath(self.io, shard);
+
+        var namebuf: [64]u8 = undefined;
+        const name = try tempName(self.io, &namebuf);
+        var tbuf: [96]u8 = undefined;
+        const tp = std.fmt.bufPrint(&tbuf, "objects/{s}/{s}", .{ hex[0..2], name }) catch unreachable;
+
+        errdefer self.root.deleteFile(self.io, tp) catch {};
+        // Stage beside the destination, then rename: a reader in another
+        // process sees the object whole or not at all, never truncated.
+        try self.root.writeFile(self.io, .{ .sub_path = tp, .data = content });
         const p = objectPath(o, &buf);
-        // Write atomically-ish: content addressing makes concurrent identical
-        // writes harmless, so a direct write is acceptable here.
-        try self.root.writeFile(self.io, .{ .sub_path = p, .data = content });
+        try self.root.rename(tp, self.root, p, self.io);
         return o;
     }
 
@@ -202,6 +224,14 @@ pub const Store = struct {
 
     // --- refs & HEAD ---
 
+    pub fn writeFileAtomic(self: *Store, sub_path: []const u8, data: []const u8) !void {
+        var namebuf: [64]u8 = undefined;
+        const tp = try tempName(self.io, &namebuf);
+        errdefer self.root.deleteFile(self.io, tp) catch {};
+        try self.root.writeFile(self.io, .{ .sub_path = tp, .data = data });
+        try self.root.rename(tp, self.root, sub_path, self.io);
+    }
+
     /// Read the branch name HEAD points at. Caller frees. Errors InvalidRef if
     /// HEAD is detached (not supported yet) or malformed.
     pub fn headBranch(self: *Store) ![]u8 {
@@ -217,7 +247,7 @@ pub const Store = struct {
     pub fn setHeadBranch(self: *Store, name: []const u8) !void {
         var buf: [256]u8 = undefined;
         const data = try std.fmt.bufPrint(&buf, "ref: refs/heads/{s}\n", .{name});
-        try self.root.writeFile(self.io, .{ .sub_path = "HEAD", .data = data });
+        try self.writeFileAtomic("HEAD", data);
     }
 
     /// Resolve a branch to its change Oid. Errors RefNotFound if unborn.
@@ -237,7 +267,7 @@ pub const Store = struct {
         var hex: [Oid.len * 2 + 1]u8 = undefined;
         _ = o.toHex(hex[0 .. Oid.len * 2]);
         hex[Oid.len * 2] = '\n';
-        try self.root.writeFile(self.io, .{ .sub_path = p, .data = &hex });
+        try self.writeFileAtomic(p, &hex);
     }
 
     /// True if the branch exists (has a commit).
@@ -389,6 +419,105 @@ test "objects transfer correctly between repos with different chunk keys" {
 
     const rechunked = try dst.writeFileContent(data);
     try testing.expect(!rechunked.eql(blob_oid));
+}
+
+fn shardEntryCount(io: std.Io, root: std.Io.Dir, shard: []const u8, prefix: ?[]const u8) !usize {
+    var dir = try root.openDir(io, shard, .{ .iterate = true });
+    defer dir.close(io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (prefix) |pre| {
+            if (!std.mem.startsWith(u8, entry.name, pre)) continue;
+        }
+        n += 1;
+    }
+    return n;
+}
+
+test "a large object lands whole and leaves no temp behind" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const data = try alloc.alloc(u8, 6 * 1024 * 1024 + 12345);
+    defer alloc.free(data);
+    var prng = std.Random.DefaultPrng.init(99);
+    prng.random().bytes(data);
+
+    const o = try store.writeRaw(data);
+    try testing.expect(store.has(o));
+
+    const got = try store.readRaw(o);
+    defer alloc.free(got);
+    try testing.expectEqualSlices(u8, data, got);
+    try testing.expect(Oid.ofBytes(got).eql(o));
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = o.toHex(&hex);
+    var sbuf: [32]u8 = undefined;
+    const shard = try std.fmt.bufPrint(&sbuf, "objects/{s}", .{hex[0..2]});
+    try testing.expectEqual(@as(usize, 0), try shardEntryCount(io, store.root, shard, tmp_prefix));
+    try testing.expectEqual(@as(usize, 1), try shardEntryCount(io, store.root, shard, null));
+}
+
+test "a temp name is never mistaken for an object and never collides" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        seen.deinit(alloc);
+    }
+
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const name = try tempName(io, &buf);
+        try testing.expect(std.mem.startsWith(u8, name, tmp_prefix));
+        try testing.expect(name.len != Oid.len * 2 - 2);
+        try testing.expect(std.mem.indexOfNone(u8, name, "0123456789abcdef") != null);
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        const gop = try seen.getOrPut(alloc, owned);
+        try testing.expect(!gop.found_existing);
+    }
+}
+
+test "writing an existing object skips the temp+rename fast path" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const o = try store.writeRaw("the same content");
+    const before = tmp_seq.load(.monotonic);
+    const again = try store.writeRaw("the same content");
+    try testing.expect(again.eql(o));
+    try testing.expectEqual(before, tmp_seq.load(.monotonic));
+}
+
+test "a rename onto an unwritable destination leaves no litter" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try testing.expectError(error.FileNotFound, store.writeFileAtomic("refs/heads/no/such/dir", "x\n"));
+    try testing.expectEqual(@as(usize, 0), try shardEntryCount(io, store.root, ".", tmp_prefix));
 }
 
 test "refs and HEAD" {

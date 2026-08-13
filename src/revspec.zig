@@ -2,6 +2,8 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const moment = @import("moment.zig");
+const oplog = @import("oplog.zig");
+const opdag = @import("opdag.zig");
 const verdict = @import("verdict.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
@@ -147,18 +149,56 @@ fn hexHasPrefix(hex: []const u8, prefix: []const u8) bool {
     return true;
 }
 
+fn changeRoots(ctx: Context, out: *std.ArrayList(Oid)) !void {
+    if (ctx.store.root.openDir(ctx.store.io, "refs/heads", .{ .iterate = true })) |opened| {
+        var heads = opened;
+        defer heads.close(ctx.store.io);
+        var it = heads.iterate();
+        while (try it.next(ctx.store.io)) |entry| {
+            if (entry.kind != .file) continue;
+            const tip = ctx.store.readRef(entry.name) catch continue;
+            try out.append(ctx.alloc, tip);
+        }
+    } else |_| {}
+
+    const records = oplog.readAll(ctx.store, ctx.alloc) catch &[_]oplog.OpRecord{};
+    defer {
+        for (records) |r| ctx.alloc.free(r.branch);
+        ctx.alloc.free(records);
+    }
+    for (records) |r| {
+        try out.append(ctx.alloc, r.prev);
+        try out.append(ctx.alloc, r.new);
+    }
+
+    const op_heads = opdag.heads(ctx.store, ctx.alloc) catch &[_]Oid{};
+    defer ctx.alloc.free(op_heads);
+
+    var ops: std.ArrayList(Oid) = .empty;
+    defer ops.deinit(ctx.alloc);
+    for (op_heads) |h| try ops.append(ctx.alloc, h);
+
+    var walked = std.AutoHashMap([Oid.len]u8, void).init(ctx.alloc);
+    defer walked.deinit();
+
+    while (ops.pop()) |o| {
+        if (o.isZero()) continue;
+        if ((try walked.getOrPut(o.bytes)).found_existing) continue;
+        const op = opdag.readOperation(ctx.store, ctx.alloc, o) catch continue;
+        defer opdag.freeOperation(ctx.alloc, op);
+        for (op.parents) |p| try ops.append(ctx.alloc, p);
+        const view = opdag.readView(ctx.store, ctx.alloc, op.view) catch continue;
+        defer view.deinit(ctx.alloc);
+        for (view.refs) |r| {
+            for (r.tips) |t| try out.append(ctx.alloc, t);
+        }
+    }
+}
+
 fn matchChanges(ctx: Context, prefix: []const u8, out: *std.ArrayList(Oid)) !void {
     var stack: std.ArrayList(Oid) = .empty;
     defer stack.deinit(ctx.alloc);
-
-    var heads = ctx.store.root.openDir(ctx.store.io, "refs/heads", .{ .iterate = true }) catch return;
-    defer heads.close(ctx.store.io);
-    var it = heads.iterate();
-    while (try it.next(ctx.store.io)) |entry| {
-        if (entry.kind != .file) continue;
-        const tip = ctx.store.readRef(entry.name) catch continue;
-        try stack.append(ctx.alloc, tip);
-    }
+    try changeRoots(ctx, &stack);
 
     var seen = std.AutoHashMap([Oid.len]u8, void).init(ctx.alloc);
     defer seen.deinit();
@@ -166,13 +206,27 @@ fn matchChanges(ctx: Context, prefix: []const u8, out: *std.ArrayList(Oid)) !voi
     while (stack.pop()) |cur| {
         if (cur.isZero()) continue;
         if ((try seen.getOrPut(cur.bytes)).found_existing) continue;
+        const change = ctx.store.readChange(cur) catch continue;
+        defer object.freeChange(ctx.store.alloc, change);
         var hex: [Oid.len * 2]u8 = undefined;
         _ = cur.toHex(&hex);
         if (hexHasPrefix(&hex, prefix)) try out.append(ctx.alloc, cur);
-        const change = ctx.store.readChange(cur) catch continue;
-        defer object.freeChange(ctx.store.alloc, change);
         for (change.parents) |p| try stack.append(ctx.alloc, p);
     }
+}
+
+fn changeMoment(ctx: Context, o: Oid, change: object.Change, branch: []const u8) !Moment {
+    var m = Moment{
+        .id = undefined,
+        .ms = change.timestamp * 1000,
+        .full_tree = change.tree,
+        .repr = change.tree,
+        .kind = .keyframe,
+        .cause = .save,
+        .branch = try ctx.alloc.dupe(u8, branch),
+    };
+    @memcpy(&m.id, o.bytes[0..m.id.len]);
+    return m;
 }
 
 fn resolveChange(ctx: Context, tip: Oid, back: usize) !Resolved {
@@ -190,17 +244,32 @@ fn resolveChange(ctx: Context, tip: Oid, back: usize) !Resolved {
     const branch = ctx.store.headBranch() catch try ctx.store.alloc.dupe(u8, "");
     defer ctx.store.alloc.free(branch);
 
-    var m = Moment{
-        .id = undefined,
-        .ms = change.timestamp * 1000,
-        .full_tree = change.tree,
-        .repr = change.tree,
-        .kind = .keyframe,
-        .cause = .save,
-        .branch = try ctx.alloc.dupe(u8, branch),
-    };
-    @memcpy(&m.id, cur.bytes[0..m.id.len]);
+    const m = try changeMoment(ctx, cur, change, branch);
     return .{ .target = .{ .at = m }, .verdict = verdictFor(ctx, m) };
+}
+
+fn changeLine(ctx: Context) ![]Moment {
+    var out: std.ArrayList(Moment) = .empty;
+    errdefer {
+        for (out.items) |m| ctx.alloc.free(m.branch);
+        out.deinit(ctx.alloc);
+    }
+
+    const branch = ctx.store.headBranch() catch return try out.toOwnedSlice(ctx.alloc);
+    defer ctx.store.alloc.free(branch);
+
+    var cur = ctx.store.readRef(branch) catch return try out.toOwnedSlice(ctx.alloc);
+    while (!cur.isZero()) {
+        const change = ctx.store.readChange(cur) catch break;
+        defer object.freeChange(ctx.store.alloc, change);
+        try out.append(ctx.alloc, try changeMoment(ctx, cur, change, branch));
+        if (change.parents.len == 0) break;
+        cur = change.parents[0];
+    }
+
+    const line = try out.toOwnedSlice(ctx.alloc);
+    std.mem.reverse(Moment, line);
+    return line;
 }
 
 fn pick(ctx: Context, all: []const Moment, candidates: []const usize, back: usize) !Resolved {
@@ -219,6 +288,44 @@ fn pick(ctx: Context, all: []const Moment, candidates: []const usize, back: usiz
         } },
         .verdict = verdictFor(ctx, chosen),
     };
+}
+
+const Sel = union(enum) {
+    all,
+    graded: verdict.Result,
+    save,
+    before: i64,
+};
+
+fn selectorOf(ctx: Context, name: []const u8) !Sel {
+    if (name.len == 0) return .all;
+    if (std.mem.eql(u8, name, "green") or std.mem.eql(u8, name, "red")) {
+        if (ctx.verdicts == null) return Error.NoSuchMoment;
+        return .{ .graded = if (name[0] == 'g') .green else .red };
+    }
+    if (std.mem.eql(u8, name, "save")) return .save;
+    if (std.mem.eql(u8, name, "yesterday")) return .{ .before = ctx.now_ms - 24 * 60 * 60 * 1000 };
+    if (parseAgoMs(name)) |ago| return .{ .before = ctx.now_ms - ago };
+    return Error.UnknownSelector;
+}
+
+fn admits(ctx: Context, sel: Sel, m: Moment) bool {
+    switch (sel) {
+        .all => return true,
+        .graded => |want| {
+            const v = verdictFor(ctx, m) orelse return false;
+            return v.result == want;
+        },
+        .save => return m.cause == .save,
+        .before => |cutoff| return m.ms <= cutoff,
+    }
+}
+
+fn admitted(ctx: Context, sel: Sel, states: []const Moment, out: *std.ArrayList(usize)) !void {
+    out.clearRetainingCapacity();
+    for (states, 0..) |m, i| {
+        if (admits(ctx, sel, m)) try out.append(ctx.alloc, i);
+    }
 }
 
 fn resolveHex(ctx: Context, p: Parsed) !Resolved {
@@ -303,45 +410,27 @@ pub fn resolve(ctx: Context, spec: []const u8) !Resolved {
         return resolveHex(ctx, p);
     }
 
-    const all = try moment.readAll(ctx.store, ctx.alloc);
-    defer moment.freeMoments(ctx.alloc, all);
-
     // `@` alone means the live tree; `@~n` means n moments back from it.
     if (p.selector.len == 0 and p.back == 0) return .{ .target = .live };
+
+    const sel = selectorOf(ctx, p.selector) catch |e| {
+        if (e == Error.UnknownSelector and isHexPrefix(p.selector)) return resolveHex(ctx, p);
+        return e;
+    };
+
+    const all = try moment.readAll(ctx.store, ctx.alloc);
+    defer moment.freeMoments(ctx.alloc, all);
 
     var candidates: std.ArrayList(usize) = .empty;
     defer candidates.deinit(ctx.alloc);
 
-    if (p.selector.len == 0) {
-        for (all, 0..) |_, i| try candidates.append(ctx.alloc, i);
-    } else if (std.mem.eql(u8, p.selector, "green") or std.mem.eql(u8, p.selector, "red")) {
-        if (ctx.verdicts == null) return Error.NoSuchMoment;
-        const want: verdict.Result = if (p.selector[0] == 'g') .green else .red;
-        for (all, 0..) |m, i| {
-            const v = verdictFor(ctx, m) orelse continue;
-            if (v.result == want) try candidates.append(ctx.alloc, i);
-        }
-    } else if (std.mem.eql(u8, p.selector, "save")) {
-        for (all, 0..) |m, i| {
-            if (m.cause == .save) try candidates.append(ctx.alloc, i);
-        }
-    } else if (std.mem.eql(u8, p.selector, "yesterday")) {
-        const cutoff = ctx.now_ms - 24 * 60 * 60 * 1000;
-        for (all, 0..) |m, i| {
-            if (m.ms <= cutoff) try candidates.append(ctx.alloc, i);
-        }
-    } else if (parseAgoMs(p.selector)) |ago| {
-        const cutoff = ctx.now_ms - ago;
-        for (all, 0..) |m, i| {
-            if (m.ms <= cutoff) try candidates.append(ctx.alloc, i);
-        }
-    } else if (isHexPrefix(p.selector)) {
-        return resolveHex(ctx, p);
-    } else {
-        return Error.UnknownSelector;
-    }
+    try admitted(ctx, sel, all, &candidates);
+    if (candidates.items.len > 0) return pick(ctx, all, candidates.items, p.back);
 
-    return pick(ctx, all, candidates.items, p.back);
+    const line = try changeLine(ctx);
+    defer moment.freeMoments(ctx.alloc, line);
+    try admitted(ctx, sel, line, &candidates);
+    return pick(ctx, line, candidates.items, p.back);
 }
 
 // --- ranges ---
@@ -821,6 +910,271 @@ test "a moment id resolves without the sigil too" {
     const r = try resolve(ctx, hex[0..12]);
     defer r.deinit(alloc);
     try testing.expectEqual(@as(i64, base_ms + 2000), r.target.at.ms);
+}
+
+test "every selector composes with ~n" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit();
+
+    const hour = 60 * 60 * 1000;
+    const day = 24 * hour;
+    const m1 = try captureAt(&f, alloc, "one", base_ms - 2 * day, .save);
+    alloc.free(m1.branch);
+    const m2 = try captureAt(&f, alloc, "two", base_ms - day - hour, .poll);
+    alloc.free(m2.branch);
+    const m3 = try captureAt(&f, alloc, "three", base_ms + 1 * hour, .save);
+    alloc.free(m3.branch);
+    const m4 = try captureAt(&f, alloc, "four", base_ms + 2 * hour, .poll);
+    alloc.free(m4.branch);
+    const m5 = try captureAt(&f, alloc, "five", base_ms + 3 * hour, .poll);
+    alloc.free(m5.branch);
+
+    const ctx = Context{ .store = &f.store, .alloc = alloc, .now_ms = base_ms + 4 * hour };
+
+    const Case = struct {
+        spec: []const u8,
+        want: i64,
+    };
+    const cases = [_]Case{
+        .{ .spec = "@~1", .want = base_ms + 2 * hour },
+        .{ .spec = "@~4", .want = base_ms - 2 * day },
+        .{ .spec = "@save", .want = base_ms + 1 * hour },
+        .{ .spec = "@save~1", .want = base_ms - 2 * day },
+        .{ .spec = "@2h", .want = base_ms + 2 * hour },
+        .{ .spec = "@2h~1", .want = base_ms + 1 * hour },
+        .{ .spec = "@2h~0", .want = base_ms + 2 * hour },
+        .{ .spec = "@30m", .want = base_ms + 3 * hour },
+        .{ .spec = "@30m~2", .want = base_ms + 1 * hour },
+        .{ .spec = "@yesterday", .want = base_ms - day - hour },
+        .{ .spec = "@yesterday~1", .want = base_ms - 2 * day },
+    };
+    for (cases) |c| {
+        const r = try resolve(ctx, c.spec);
+        defer r.deinit(alloc);
+        try testing.expectEqual(c.want, r.target.at.ms);
+    }
+
+    const zero = try resolve(ctx, "@~0");
+    defer zero.deinit(alloc);
+    try testing.expect(zero.target == .live);
+
+    const save_zero = try resolve(ctx, "@save~0");
+    defer save_zero.deinit(alloc);
+    try testing.expectEqual(@as(i64, base_ms + 1 * hour), save_zero.target.at.ms);
+
+    for ([_][]const u8{ "@~5", "@save~2", "@2h~4", "@yesterday~2", "@30m~5" }) |spec| {
+        try testing.expectError(Error.NoSuchMoment, resolve(ctx, spec));
+    }
+
+    var buf: [16]u8 = undefined;
+    const hex = m4.shortId(&buf);
+    const by_id = try std.fmt.allocPrint(alloc, "@{s}~2", .{hex[0..6]});
+    defer alloc.free(by_id);
+    const walked = try resolve(ctx, by_id);
+    defer walked.deinit(alloc);
+    try testing.expectEqual(@as(i64, base_ms - day - hour), walked.target.at.ms);
+}
+
+test "@green~2 reaches two greens back, as the README says" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit();
+
+    const cmd = verdict.commandHash("check");
+
+    const bodies = [_][]const u8{ "one", "two", "three", "four" };
+    var stamps: [bodies.len]i64 = undefined;
+    for (bodies, 0..) |body, i| {
+        const ms = base_ms + @as(i64, @intCast(i + 1)) * 1000;
+        stamps[i] = ms;
+        const m = try captureAt(&f, alloc, body, ms, .poll);
+        defer alloc.free(m.branch);
+        try verdict.record(&f.store, .{
+            .tree = m.full_tree,
+            .tier = .full,
+            .command = cmd,
+            .result = .green,
+            .exit_code = 0,
+            .duration_ms = 1,
+            .ms = ms,
+            .readset = Oid.zero(),
+        });
+    }
+
+    var ix = try verdict.Index.load(&f.store, alloc);
+    defer ix.deinit();
+    const ctx = Context{
+        .store = &f.store,
+        .alloc = alloc,
+        .verdicts = &ix,
+        .command_fast = cmd,
+        .command_full = cmd,
+        .now_ms = base_ms + 5000,
+    };
+
+    const zero = try resolve(ctx, "@green~0");
+    defer zero.deinit(alloc);
+    try testing.expectEqual(stamps[3], zero.target.at.ms);
+
+    const two = try resolve(ctx, "@green~2");
+    defer two.deinit(alloc);
+    try testing.expectEqual(stamps[1], two.target.at.ms);
+
+    try testing.expectError(Error.NoSuchMoment, resolve(ctx, "@green~4"));
+
+    const span = try resolveRange(ctx, "@green..");
+    defer span.deinit(alloc);
+    try testing.expectEqual(stamps[3], span.from.?.target.at.ms);
+    try testing.expect(span.to.target == .live);
+
+    const back3 = try resolve(ctx, "@~3");
+    defer back3.deinit(alloc);
+    try testing.expectEqual(stamps[0], back3.target.at.ms);
+}
+
+test "selectors answer from the change history when nothing was captured" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit();
+
+    const root = try commitAt(&f, alloc, "main", "one", &.{});
+    const tip = try commitAt(&f, alloc, "main", "two", &.{root});
+
+    const ctx = Context{ .store = &f.store, .alloc = alloc, .now_ms = base_ms + 25 * 60 * 60 * 1000 };
+
+    const back1 = try resolve(ctx, "@~1");
+    defer back1.deinit(alloc);
+    try testing.expectEqualSlices(u8, root.bytes[0..8], &back1.target.at.id);
+
+    const save = try resolve(ctx, "@save");
+    defer save.deinit(alloc);
+    try testing.expectEqualSlices(u8, tip.bytes[0..8], &save.target.at.id);
+
+    const prev_save = try resolve(ctx, "@save~1");
+    defer prev_save.deinit(alloc);
+    try testing.expectEqualSlices(u8, root.bytes[0..8], &prev_save.target.at.id);
+
+    const yesterday = try resolve(ctx, "@yesterday");
+    defer yesterday.deinit(alloc);
+    try testing.expectEqualSlices(u8, tip.bytes[0..8], &yesterday.target.at.id);
+    try testing.expectEqual(base_ms, yesterday.target.at.ms);
+
+    try testing.expectError(Error.NoSuchMoment, resolve(ctx, "@~2"));
+    try testing.expectError(Error.NoSuchMoment, resolve(ctx, "@save~2"));
+}
+
+test "a change no branch reaches is still addressable, and gc still keeps it" {
+    const gc = @import("gc.zig");
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit();
+
+    const root = try commitAt(&f, alloc, "main", "one", &.{});
+    const orphaned = try commitAt(&f, alloc, "main", "two", &.{root});
+
+    try f.store.updateRef("main", root);
+    try oplog.record(&f.store, .{
+        .kind = .snapshot,
+        .branch = "main",
+        .prev = root,
+        .new = orphaned,
+        .timestamp = @divTrunc(base_ms, 1000),
+    });
+
+    const ctx = Context{ .store = &f.store, .alloc = alloc, .now_ms = base_ms };
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = orphaned.toHex(&hex);
+
+    const found = try resolve(ctx, hex[0..12]);
+    defer found.deinit(alloc);
+    try testing.expectEqualSlices(u8, orphaned.bytes[0..8], &found.target.at.id);
+
+    const parent = try std.fmt.allocPrint(alloc, "@{s}~1", .{hex[0..12]});
+    defer alloc.free(parent);
+    const walked = try resolve(ctx, parent);
+    defer walked.deinit(alloc);
+    try testing.expectEqualSlices(u8, root.bytes[0..8], &walked.target.at.id);
+
+    _ = try gc.collect(&f.store, alloc, false);
+    try testing.expect(f.store.has(orphaned));
+    const after = try resolve(ctx, hex[0..12]);
+    defer after.deinit(alloc);
+    try testing.expectEqualSlices(u8, orphaned.bytes[0..8], &after.target.at.id);
+}
+
+test "a change reachable only through an operation view resolves" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit();
+
+    const root = try commitAt(&f, alloc, "main", "one", &.{});
+    const orphaned = try commitAt(&f, alloc, "main", "two", &.{root});
+
+    _ = try opdag.commit(&f.store, alloc, "snapshot", @divTrunc(base_ms, 1000), "main");
+    try f.store.updateRef("main", root);
+
+    const ctx = Context{ .store = &f.store, .alloc = alloc, .now_ms = base_ms };
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = orphaned.toHex(&hex);
+    const found = try resolve(ctx, hex[0..12]);
+    defer found.deinit(alloc);
+    try testing.expectEqualSlices(u8, orphaned.bytes[0..8], &found.target.at.id);
+
+    var listed: std.ArrayList(Match) = .empty;
+    defer listed.deinit(alloc);
+    try matches(ctx, hex[0..12], &listed);
+    try testing.expectEqual(@as(usize, 1), listed.items.len);
+    try testing.expect(listed.items[0].kind == .change);
+}
+
+test "an unbranched twin still makes a prefix ambiguous" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit();
+
+    const first = try commitAt(&f, alloc, "main", "one", &.{});
+    var first_hex: [Oid.len * 2]u8 = undefined;
+    _ = first.toHex(&first_hex);
+    const prefix = first_hex[0..4];
+
+    const tree = try f.store.writeTree(.{ .entries = &.{} });
+    var i: usize = 0;
+    const twin = while (i < 8_000_000) : (i += 1) {
+        var msg_buf: [32]u8 = undefined;
+        const message = try std.fmt.bufPrint(&msg_buf, "twin {d}", .{i});
+        const enc = try object.Change.encode(.{
+            .tree = tree,
+            .parents = &.{},
+            .change_id = [_]u8{0} ** 16,
+            .timestamp = @divTrunc(base_ms, 1000),
+            .tz_offset_min = 0,
+            .author = "t <t@t>",
+            .message = message,
+        }, alloc);
+        defer alloc.free(enc);
+        var cand_hex: [Oid.len * 2]u8 = undefined;
+        _ = Oid.ofBytes(enc).toHex(&cand_hex);
+        if (!hexHasPrefix(&cand_hex, prefix)) continue;
+        break try f.store.writeRaw(enc);
+    } else return error.NoTwinFound;
+
+    try oplog.record(&f.store, .{
+        .kind = .snapshot,
+        .branch = "side",
+        .prev = Oid.zero(),
+        .new = twin,
+        .timestamp = @divTrunc(base_ms, 1000),
+    });
+
+    const ctx = Context{ .store = &f.store, .alloc = alloc, .now_ms = base_ms };
+    try testing.expectError(Error.AmbiguousMoment, resolve(ctx, prefix));
+
+    const spec = try std.fmt.allocPrint(alloc, "@{s}", .{prefix});
+    defer alloc.free(spec);
+    try testing.expectError(Error.AmbiguousMoment, resolve(ctx, spec));
 }
 
 test "an unresolvable ref comes back as an error, never a panic" {

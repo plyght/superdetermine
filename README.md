@@ -237,3 +237,7 @@ zig build test
 ## Status
 
 Early and opinionated. Interfaces may still change.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

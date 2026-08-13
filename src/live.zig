@@ -89,6 +89,12 @@ pub const MessageKind = enum(u8) {
     note = 'N',
     handoff = 'H',
     bye = 'B',
+    hello = 'E',
+    inventory = 'I',
+    pack = 'P',
+    object = 'O',
+    want = 'W',
+    end = 'X',
 
     /// The kind for a tag byte, or null if this version does not know it.
     pub fn fromByte(b: u8) ?MessageKind {
@@ -153,6 +159,56 @@ pub const HandoffFrame = struct {
     to: []const u8,
 };
 
+/// The opening message of a session: who is calling, which protocol version,
+/// which path subset is in scope, and whether the caller means to hold the
+/// write authority. Both ends send one before anything else moves.
+pub const HelloFrame = struct {
+    version: u16,
+    /// The sender's identity.
+    peer: []const u8,
+    /// A path prefix limiting the transfer, or empty for the whole tree.
+    scope: []const u8,
+    /// True when this end opens the session as the author.
+    writer: bool,
+};
+
+/// One branch tip as it crosses the wire.
+pub const RefAdvert = struct {
+    name: []const u8,
+    tip: Oid,
+};
+
+/// What one end holds: its branch tips, its op-log heads, and the full set of
+/// object ids in its store.
+///
+/// The object list is the whole point. Two content-addressed stores can work
+/// out their difference by set subtraction and nothing else, which is what
+/// makes a resumed transfer send exactly the part that never arrived and a
+/// repeated transfer send nothing at all.
+pub const InventoryFrame = struct {
+    refs: []const RefAdvert,
+    op_heads: []const Oid,
+    objects: []const Oid,
+};
+
+/// Announces how many `object` frames follow before the closing `end`.
+pub const PackFrame = struct {
+    count: u32,
+};
+
+/// One object's raw stored bytes. The id is not carried: the receiver hashes
+/// what it got, so a tampered object lands at a different address instead of
+/// overwriting the real one, and the next want round asks for it again.
+pub const ObjectFrame = struct {
+    raw: []const u8,
+};
+
+/// The ids this end still lacks after walking what it has. An empty want is
+/// how a side says it is finished.
+pub const WantFrame = struct {
+    ids: []const Oid,
+};
+
 /// One protocol message.
 pub const Message = union(MessageKind) {
     moment: MomentFrame,
@@ -160,6 +216,12 @@ pub const Message = union(MessageKind) {
     note: NoteFrame,
     handoff: HandoffFrame,
     bye: void,
+    hello: HelloFrame,
+    inventory: InventoryFrame,
+    pack: PackFrame,
+    object: ObjectFrame,
+    want: WantFrame,
+    end: void,
 };
 
 /// Encode a message as `[kind][u32 payload length][payload]`, big-endian.
@@ -205,6 +267,36 @@ pub fn encode(alloc: std.mem.Allocator, msg: Message) ![]u8 {
             try body.bytes(f.to);
         },
         .bye => {},
+        .hello => |f| {
+            try body.putU16(f.version);
+            try body.putU16(@intCast(f.peer.len));
+            try body.bytes(f.peer);
+            try body.putU16(@intCast(f.scope.len));
+            try body.bytes(f.scope);
+            try body.byte(@intFromBool(f.writer));
+        },
+        .inventory => |f| {
+            try body.putU32(@intCast(f.refs.len));
+            for (f.refs) |r| {
+                try body.putU16(@intCast(r.name.len));
+                try body.bytes(r.name);
+                try body.oid(r.tip);
+            }
+            try body.putU32(@intCast(f.op_heads.len));
+            for (f.op_heads) |h| try body.oid(h);
+            try body.putU32(@intCast(f.objects.len));
+            for (f.objects) |o| try body.oid(o);
+        },
+        .pack => |f| try body.putU32(f.count),
+        .object => |f| {
+            try body.putU32(@intCast(f.raw.len));
+            try body.bytes(f.raw);
+        },
+        .want => |f| {
+            try body.putU32(@intCast(f.ids.len));
+            for (f.ids) |o| try body.oid(o);
+        },
+        .end => {},
     }
 
     var out = Writer.init(alloc);
@@ -290,7 +382,64 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !Message {
             return .{ .handoff = .{ .to = to } };
         },
         .bye => return .{ .bye = {} },
+        .hello => {
+            const version = try body.takeU16();
+            const plen = try body.takeU16();
+            const peer = try alloc.dupe(u8, try body.slice(plen));
+            errdefer alloc.free(peer);
+            const slen = try body.takeU16();
+            const scope = try alloc.dupe(u8, try body.slice(slen));
+            errdefer alloc.free(scope);
+            const flag = (try body.slice(1))[0];
+            if (flag > 1) return Error.BadFrame;
+            return .{ .hello = .{
+                .version = version,
+                .peer = peer,
+                .scope = scope,
+                .writer = flag == 1,
+            } };
+        },
+        .inventory => {
+            const n = try body.takeU32();
+            if (n > body.remaining() / (2 + Oid.len)) return Error.Truncated;
+            const refs = try alloc.alloc(RefAdvert, n);
+            var filled: usize = 0;
+            errdefer {
+                for (refs[0..filled]) |adv| alloc.free(adv.name);
+                alloc.free(refs);
+            }
+            while (filled < n) : (filled += 1) {
+                const nlen = try body.takeU16();
+                const name = try alloc.dupe(u8, try body.slice(nlen));
+                refs[filled] = .{ .name = name, .tip = try body.oid() };
+            }
+            const op_heads = try takeOids(alloc, &body);
+            errdefer alloc.free(op_heads);
+            const objects = try takeOids(alloc, &body);
+            return .{ .inventory = .{
+                .refs = refs,
+                .op_heads = op_heads,
+                .objects = objects,
+            } };
+        },
+        .pack => return .{ .pack = .{ .count = try body.takeU32() } },
+        .object => {
+            const raw_len = try body.takeU32();
+            const raw = try alloc.dupe(u8, try body.slice(raw_len));
+            return .{ .object = .{ .raw = raw } };
+        },
+        .want => return .{ .want = .{ .ids = try takeOids(alloc, &body) } },
+        .end => return .{ .end = {} },
     }
+}
+
+fn takeOids(alloc: std.mem.Allocator, body: *Reader) ![]Oid {
+    const n = try body.takeU32();
+    if (n > body.remaining() / Oid.len) return Error.Truncated;
+    const out = try alloc.alloc(Oid, n);
+    errdefer alloc.free(out);
+    for (out) |*o| o.* = try body.oid();
+    return out;
 }
 
 /// Release whatever `decode` allocated for a message.
@@ -307,6 +456,20 @@ pub fn freeMessage(alloc: std.mem.Allocator, msg: Message) void {
         },
         .handoff => |f| alloc.free(f.to),
         .bye => {},
+        .hello => |f| {
+            alloc.free(f.peer);
+            alloc.free(f.scope);
+        },
+        .inventory => |f| {
+            for (f.refs) |r| alloc.free(r.name);
+            alloc.free(f.refs);
+            alloc.free(f.op_heads);
+            alloc.free(f.objects);
+        },
+        .pack => {},
+        .object => |f| alloc.free(f.raw),
+        .want => |f| alloc.free(f.ids),
+        .end => {},
     }
 }
 
@@ -583,6 +746,10 @@ const Reader = struct {
 
 const testing = std.testing;
 
+test {
+    _ = @import("sync.zig");
+}
+
 const sample_entries = [_]object.TreeEntry{
     .{ .mode = .regular, .path = "src/live.zig", .blob = .{ .bytes = [_]u8{0xa1} ** Oid.len } },
     .{ .mode = .executable, .path = "bin/run", .blob = .{ .bytes = [_]u8{0xb2} ** Oid.len } },
@@ -615,6 +782,33 @@ fn sampleNote() Message {
 
 fn sampleHandoff() Message {
     return .{ .handoff = .{ .to = "nico@studio" } };
+}
+
+const sample_refs = [_]RefAdvert{
+    .{ .name = "main", .tip = .{ .bytes = [_]u8{0xc1} ** Oid.len } },
+    .{ .name = "dev", .tip = .{ .bytes = [_]u8{0xc2} ** Oid.len } },
+};
+const sample_oids = [_]Oid{
+    .{ .bytes = [_]u8{0xd1} ** Oid.len },
+    .{ .bytes = [_]u8{0xd2} ** Oid.len },
+    .{ .bytes = [_]u8{0xd3} ** Oid.len },
+};
+
+fn sampleHello() Message {
+    return .{ .hello = .{
+        .version = 1,
+        .peer = "nico@studio",
+        .scope = "src/",
+        .writer = true,
+    } };
+}
+
+fn sampleInventory() Message {
+    return .{ .inventory = .{
+        .refs = &sample_refs,
+        .op_heads = sample_oids[0..1],
+        .objects = &sample_oids,
+    } };
 }
 
 test "a moment frame round trips exactly" {
@@ -739,7 +933,19 @@ test "a bye frame round trips and carries no payload" {
 
 test "truncating any frame at any length is an error, never a read past the end" {
     const alloc = testing.allocator;
-    const msgs = [_]Message{ sampleMoment(), sampleVerdict(), sampleNote(), sampleHandoff(), .bye };
+    const msgs = [_]Message{
+        sampleMoment(),
+        sampleVerdict(),
+        sampleNote(),
+        sampleHandoff(),
+        .bye,
+        sampleHello(),
+        sampleInventory(),
+        .{ .pack = .{ .count = 9 } },
+        .{ .object = .{ .raw = "raw object bytes" } },
+        .{ .want = .{ .ids = &sample_oids } },
+        .end,
+    };
     for (msgs) |msg| {
         const enc = try encode(alloc, msg);
         defer alloc.free(enc);
@@ -748,6 +954,102 @@ test "truncating any frame at any length is an error, never a read past the end"
             try testing.expectError(Error.Truncated, decode(alloc, enc[0..cut]));
         }
     }
+}
+
+test "a hello frame round trips" {
+    const alloc = testing.allocator;
+    for ([_]bool{ true, false }) |writer| {
+        const enc = try encode(alloc, .{ .hello = .{
+            .version = 7,
+            .peer = "nico@studio",
+            .scope = "",
+            .writer = writer,
+        } });
+        defer alloc.free(enc);
+        const dec = try decode(alloc, enc);
+        defer freeMessage(alloc, dec);
+        try testing.expectEqual(@as(u16, 7), dec.hello.version);
+        try testing.expectEqualStrings("nico@studio", dec.hello.peer);
+        try testing.expectEqualStrings("", dec.hello.scope);
+        try testing.expectEqual(writer, dec.hello.writer);
+    }
+}
+
+test "an inventory frame round trips refs, heads and object ids" {
+    const alloc = testing.allocator;
+    const enc = try encode(alloc, sampleInventory());
+    defer alloc.free(enc);
+    const dec = try decode(alloc, enc);
+    defer freeMessage(alloc, dec);
+
+    try testing.expectEqual(@as(usize, 2), dec.inventory.refs.len);
+    try testing.expectEqualStrings("main", dec.inventory.refs[0].name);
+    try testing.expect(dec.inventory.refs[1].tip.eql(sample_refs[1].tip));
+    try testing.expectEqual(@as(usize, 1), dec.inventory.op_heads.len);
+    try testing.expectEqual(@as(usize, 3), dec.inventory.objects.len);
+    try testing.expect(dec.inventory.objects[2].eql(sample_oids[2]));
+}
+
+test "an empty inventory round trips" {
+    const alloc = testing.allocator;
+    const enc = try encode(alloc, .{ .inventory = .{
+        .refs = &.{},
+        .op_heads = &.{},
+        .objects = &.{},
+    } });
+    defer alloc.free(enc);
+    const dec = try decode(alloc, enc);
+    defer freeMessage(alloc, dec);
+    try testing.expectEqual(@as(usize, 0), dec.inventory.refs.len);
+    try testing.expectEqual(@as(usize, 0), dec.inventory.objects.len);
+}
+
+test "pack, object, want and end frames round trip" {
+    const alloc = testing.allocator;
+
+    const pack = try encode(alloc, .{ .pack = .{ .count = 4096 } });
+    defer alloc.free(pack);
+    const pack_dec = try decode(alloc, pack);
+    defer freeMessage(alloc, pack_dec);
+    try testing.expectEqual(@as(u32, 4096), pack_dec.pack.count);
+
+    const obj = try encode(alloc, .{ .object = .{ .raw = "\x00\x01binary\xff" } });
+    defer alloc.free(obj);
+    const obj_dec = try decode(alloc, obj);
+    defer freeMessage(alloc, obj_dec);
+    try testing.expectEqualSlices(u8, "\x00\x01binary\xff", obj_dec.object.raw);
+
+    const want = try encode(alloc, .{ .want = .{ .ids = &sample_oids } });
+    defer alloc.free(want);
+    const want_dec = try decode(alloc, want);
+    defer freeMessage(alloc, want_dec);
+    try testing.expectEqual(@as(usize, 3), want_dec.want.ids.len);
+    try testing.expect(want_dec.want.ids[0].eql(sample_oids[0]));
+
+    const end = try encode(alloc, .end);
+    defer alloc.free(end);
+    try testing.expectEqual(@as(usize, 5), end.len);
+    const end_dec = try decode(alloc, end);
+    defer freeMessage(alloc, end_dec);
+    try testing.expectEqual(MessageKind.end, std.meta.activeTag(end_dec));
+}
+
+test "an absurd want or inventory count is truncation, not a huge allocation" {
+    const alloc = testing.allocator;
+
+    const want = try encode(alloc, .{ .want = .{ .ids = &sample_oids } });
+    defer alloc.free(want);
+    const bad_want = try alloc.dupe(u8, want);
+    defer alloc.free(bad_want);
+    std.mem.writeInt(u32, bad_want[1 + 4 ..][0..4], 0xffff_ffff, .big);
+    try testing.expectError(Error.Truncated, decode(alloc, bad_want));
+
+    const inv = try encode(alloc, sampleInventory());
+    defer alloc.free(inv);
+    const bad_inv = try alloc.dupe(u8, inv);
+    defer alloc.free(bad_inv);
+    std.mem.writeInt(u32, bad_inv[1 + 4 ..][0..4], 0xffff_ffff, .big);
+    try testing.expectError(Error.Truncated, decode(alloc, bad_inv));
 }
 
 test "an empty input is truncated, not a valid message" {

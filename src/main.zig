@@ -5,6 +5,7 @@ const object = @import("object.zig");
 const store = @import("store.zig");
 const workspace = @import("workspace.zig");
 const oplog = @import("oplog.zig");
+const opdag = @import("opdag.zig");
 const git = @import("git.zig");
 const diff = @import("diff.zig");
 const branches = @import("branches.zig");
@@ -64,24 +65,26 @@ const sections = [_]Section{
         .{ .name = "status", .alias = "st", .desc = "what changed since the last save" },
         .{ .name = "diff", .alias = "d", .desc = "line-level diff vs the last save" },
         .{ .name = "log", .alias = "l", .desc = "the change history" },
-        .{ .name = "describe", .alias = "desc", .args = "-m msg", .desc = "name or rename the current change" },
+        .{ .name = "describe", .alias = "desc", .args = "-m msg [--at]", .desc = "name or rename any change" },
     } },
     .{ .title = "moving around", .entries = &.{
         .{ .name = "new", .alias = "n", .args = "<name>", .desc = "branch off here and switch to it" },
         .{ .name = "switch", .alias = "sw", .args = "<name>", .desc = "move to another branch (auto-saves)" },
-        .{ .name = "branch", .alias = "b", .desc = "list branches" },
+        .{ .name = "branch", .alias = "b", .args = "[-d name]", .desc = "list branches, or delete one" },
         .{ .name = "work", .alias = "wt", .args = "<dir>", .desc = "instant copy-on-write worktree" },
         .{ .name = "restore", .alias = "rs", .args = "<file>", .desc = "discard local edits to one file" },
         .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
         .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
         .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
-        .{ .name = "absorb", .alias = "ab", .desc = "fold edits into the changes they belong to" },
+        .{ .name = "absorb", .alias = "ab", .args = "[-- <paths>]", .desc = "fold edits into the changes they belong to" },
     } },
     .{ .title = "reshaping history", .entries = &.{
         .{ .name = "point", .alias = "pt", .args = "<ref>", .desc = "move this branch's tip to any ref" },
         .{ .name = "rebase", .alias = "rb", .args = "<ref>", .desc = "replay this branch onto a new base" },
-        .{ .name = "squash", .alias = "sq", .args = "[n] [-m msg]", .desc = "collapse adjacent changes into one" },
+        .{ .name = "amend", .alias = "am", .args = "[--at ref]", .desc = "fold working edits into a named change" },
+        .{ .name = "squash", .alias = "sq", .args = "[n] [--at] [-m]", .desc = "collapse adjacent changes into one" },
         .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths> | --hunk p:n", .desc = "split one change in two, by path or hunk" },
+        .{ .name = "drop", .alias = "dr", .args = "[ref]", .desc = "remove a change, keep its edits in the tree" },
         .{ .name = "reorder", .alias = "ro", .args = "<order...>", .desc = "reorder the last changes, 1 = oldest" },
     } },
     .{ .title = "who wrote this", .entries = &.{
@@ -206,8 +209,10 @@ const aliases = [_]Alias{
     .{ .short = "ab", .full = "absorb" },
     .{ .short = "pt", .full = "point" },
     .{ .short = "rb", .full = "rebase" },
+    .{ .short = "am", .full = "amend" },
     .{ .short = "sq", .full = "squash" },
     .{ .short = "spl", .full = "split" },
+    .{ .short = "dr", .full = "drop" },
     .{ .short = "ro", .full = "reorder" },
     .{ .short = "bl", .full = "blame" },
     .{ .short = "prov", .full = "provenance" },
@@ -345,7 +350,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (eq(cmd, "log")) {
         try cmdLog(io, alloc, w, rest);
     } else if (eq(cmd, "branch")) {
-        try cmdBranch(io, alloc, w);
+        try cmdBranch(io, alloc, w, rest);
     } else if (eq(cmd, "new")) {
         try cmdNew(io, alloc, w, rest);
     } else if (eq(cmd, "switch")) {
@@ -413,7 +418,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (eq(cmd, "revert")) {
         try cmdRevert(io, alloc, w, rest);
     } else if (eq(cmd, "absorb")) {
-        try cmdAbsorb(io, alloc, w);
+        try cmdAbsorb(io, alloc, w, rest);
+    } else if (eq(cmd, "amend")) {
+        try cmdAmend(io, alloc, w, rest);
+    } else if (eq(cmd, "drop")) {
+        try cmdDrop(io, alloc, w, rest);
     } else if (eq(cmd, "point")) {
         try cmdPoint(io, alloc, w, rest);
     } else if (eq(cmd, "rebase")) {
@@ -565,7 +574,47 @@ fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         ui.on(.cyan),  db,             ui.off(),
     });
 
+    try excludeFromColocatedGit(io, alloc, w, std.Io.Dir.cwd());
     try startCapturing(io, alloc, w);
+}
+
+/// Keep the repo dir out of a colocated git repo's eyes.
+///
+/// Without this line `git status` in a colocated repo reports `.sdt/` as
+/// untracked forever, which is not a cosmetic problem: it makes every git-side
+/// check that expects a clean tree fail from the moment superdetermine is
+/// initialized. `.git/info/exclude` is the right home for it because it is
+/// local to the clone and is not itself a tracked file.
+fn excludeFromColocatedGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, root: std.Io.Dir) !void {
+    var git_dir = root.openDir(io, ".git", .{}) catch return;
+    defer git_dir.close(io);
+
+    const existing: ?[]u8 = git_dir.readFileAlloc(io, "info/exclude", alloc, .unlimited) catch null;
+    defer if (existing) |e| alloc.free(e);
+
+    if (existing) |e| {
+        var it = std.mem.splitScalar(u8, e, '\n');
+        while (it.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r/");
+            if (eq(t, store.dir_name)) return;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    if (existing) |e| {
+        try out.appendSlice(alloc, e);
+        if (e.len != 0 and e[e.len - 1] != '\n') try out.append(alloc, '\n');
+    }
+    try out.appendSlice(alloc, store.dir_name ++ "/\n");
+
+    git_dir.createDirPath(io, "info") catch {};
+    git_dir.writeFile(io, .{ .sub_path = "info/exclude", .data = out.items }) catch return;
+
+    try w.print("{s}{s}{s} told the colocated git repo to ignore {s}{s}/{s}\n", .{
+        ui.on(.green), ui.check,       ui.off(),
+        ui.on(.dim),   store.dir_name, ui.off(),
+    });
 }
 
 /// Turn on continuous capture for a new repo.
@@ -635,6 +684,7 @@ fn cmdBlame(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
 fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     var work = try openWork(io);
     defer work.close(io);
 
@@ -744,13 +794,175 @@ fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     try w.print("reverted. new change {s}\n", .{shortHex(change, &buf)});
 }
 
-fn cmdAbsorb(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+/// The shared surface of `absorb` and `amend`: an optional target, and an
+/// optional scope of paths or hunks within the working tree.
+const AmendArgs = struct {
+    at: []const u8 = "",
+    paths: std.ArrayList([]const u8) = .empty,
+    hunks: std.ArrayList(history.HunkSpec) = .empty,
+
+    fn deinit(self: *AmendArgs, alloc: std.mem.Allocator) void {
+        self.paths.deinit(alloc);
+        for (self.hunks.items) |h| alloc.free(h.indices);
+        self.hunks.deinit(alloc);
+    }
+
+    fn scope(self: *const AmendArgs) absorb.Scope {
+        if (self.hunks.items.len != 0) return .{ .hunks = self.hunks.items };
+        if (self.paths.items.len != 0) return .{ .paths = self.paths.items };
+        return .all;
+    }
+};
+
+fn parseAmendArgs(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    rest: []const []const u8,
+    args: *AmendArgs,
+) !bool {
+    var after_sep = false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--")) {
+            after_sep = true;
+        } else if (after_sep) {
+            try args.paths.append(alloc, a);
+        } else if (eq(a, "--at")) {
+            i += 1;
+            if (i >= rest.len) {
+                try amendUsage(w);
+                return false;
+            }
+            args.at = rest[i];
+        } else if (eq(a, "--hunk") or eq(a, "-H")) {
+            i += 1;
+            if (i >= rest.len) {
+                try amendUsage(w);
+                return false;
+            }
+            if (!try appendHunkSpec(alloc, w, rest[i], &args.hunks)) return false;
+        } else if (a.len != 0 and a[0] == '-') {
+            try w.print("unknown option '{s}'\n", .{a});
+            return false;
+        } else if (args.at.len == 0) {
+            args.at = a;
+        }
+    }
+    if (args.paths.items.len != 0 and args.hunks.items.len != 0) {
+        try w.writeAll("amend takes paths or --hunk selectors, not both at once\n");
+        return false;
+    }
+    return true;
+}
+
+fn amendUsage(w: *std.Io.Writer) !void {
+    try w.writeAll("usage: sdt amend [--at <ref>] [-- <paths>]\n");
+    try w.writeAll("       sdt amend --at <ref> --hunk <path>:<n[,n][,a-b]> ...\n");
+    try ui.hint(w, "folds working-tree edits into that change, then replays everything after it");
+    try ui.hint(w, "run it once per hunk to send different hunks of one file to different changes");
+}
+
+fn cmdAbsorb(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var args: AmendArgs = .{};
+    defer args.deinit(alloc);
+    if (!try parseAmendArgs(alloc, w, rest, &args)) return;
+
+    if (args.hunks.items.len != 0 and args.at.len == 0) {
+        try w.writeAll("--hunk needs a target change to absorb into\n");
+        try ui.hint(w, "`sdt absorb --at <ref> --hunk <path>:<n>` picks the change by hand");
+        return;
+    }
+    if (args.at.len != 0) return amendInto(io, alloc, w, &args, "absorbed");
+
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     captureBefore(io, alloc, &s);
     var work = try openWork(io);
     defer work.close(io);
-    try absorb.run(&s, alloc, work, w);
+    try absorb.run(&s, alloc, work, args.paths.items, w);
+}
+
+fn cmdAmend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var args: AmendArgs = .{};
+    defer args.deinit(alloc);
+    if (!try parseAmendArgs(alloc, w, rest, &args)) return;
+    try amendInto(io, alloc, w, &args, "amended");
+}
+
+fn amendInto(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    args: *const AmendArgs,
+    what: []const u8,
+) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const target = if (args.at.len != 0)
+        (try resolveChangeOrFail(io, alloc, w, &s, args.at)) orelse return
+    else
+        history.tipOf(&s, branch) catch {
+            try w.writeAll("nothing saved on this branch yet\n");
+            return;
+        };
+    const before_tree = branches.headTree(&s);
+
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const r = absorb.amend(&s, alloc, work, target, args.scope(), nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "amend")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+
+    // The working tree already holds the edit, and whatever was not selected is
+    // still an edit, so it is left alone. A conflicted fold is the exception:
+    // the marked-up merge is written out so it is in front of you rather than
+    // only in the change.
+    try reportRewrite(io, alloc, w, &s, before_tree, r, what, if (r.clean()) .keep else .checkout);
+    if (r.clean()) try ui.hint(w, "`sdt status` shows whatever you did not fold in");
+}
+
+fn cmdDrop(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "drop");
+
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const target = if (rest.len != 0 and rest[0].len != 0 and rest[0][0] != '-')
+        (try resolveChangeOrFail(io, alloc, w, &s, rest[0])) orelse return
+    else
+        history.tipOf(&s, branch) catch {
+            try w.writeAll("nothing saved on this branch yet\n");
+            return;
+        };
+    const before_tree = branches.headTree(&s);
+
+    const r = history.drop(&s, alloc, branch, target, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "drop")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+
+    if (r.new.isZero()) {
+        try w.print("{s}{s}{s} dropped the only change; {s}{s}{s} is unborn again\n", .{
+            ui.on(.green), ui.check, ui.off(), ui.on(.cyan), branch, ui.off(),
+        });
+        try ui.hint(w, "`sdt undo` puts the old history back");
+    } else {
+        // The whole point is that the content survives, so the working tree is
+        // never touched: what the change held comes back as an uncommitted edit.
+        try reportRewrite(io, alloc, w, &s, before_tree, r, "dropped", .keep);
+    }
+    try w.writeAll("its edits are still in the working tree\n");
 }
 
 /// Auto-save before a command that will overwrite the working tree, matching
@@ -805,6 +1017,10 @@ fn resolveChangeOrFail(
     };
 }
 
+/// Whether a rewrite's report puts the new tip's tree on disk, or leaves the
+/// working tree exactly as the command found it.
+const TreeAfter = enum { checkout, keep };
+
 fn reportRewrite(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -813,6 +1029,7 @@ fn reportRewrite(
     before_tree: ?Oid,
     r: history.Result,
     what: []const u8,
+    tree_after: TreeAfter,
 ) !void {
     const tip = s.readChange(r.new) catch {
         try w.print("{s} done\n", .{what});
@@ -820,7 +1037,7 @@ fn reportRewrite(
     };
     defer object.freeChange(alloc, tip);
 
-    {
+    if (tree_after == .checkout) {
         var work = try openWork(io);
         defer work.close(io);
         workspace.checkout(s, work, before_tree, tip.tree) catch {};
@@ -897,7 +1114,7 @@ fn cmdPoint(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         return e;
     };
     defer r.deinit(alloc);
-    try reportRewrite(io, alloc, w, &s, before_tree, r, "moved the tip");
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "moved the tip", .checkout);
 }
 
 fn cmdRebase(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -921,7 +1138,7 @@ fn cmdRebase(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         return e;
     };
     defer r.deinit(alloc);
-    try reportRewrite(io, alloc, w, &s, before_tree, r, "rebased");
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "rebased", .checkout);
 }
 
 fn cmdSquash(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -959,7 +1176,7 @@ fn cmdSquash(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         return e;
     };
     defer r.deinit(alloc);
-    try reportRewrite(io, alloc, w, &s, before_tree, r, "squashed");
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "squashed", .checkout);
 }
 
 /// Parse `1,3-5` into 1-based hunk numbers. Ranges are inclusive and a bare
@@ -988,6 +1205,33 @@ fn badHunkSelector(w: *std.Io.Writer, sel: []const u8) !void {
     try ui.hint(w, "the form is <path>:<n>, e.g. `--hunk src/a.zig:1,3-4`");
 }
 
+/// Parse one `<path>:<n[,n][,a-b]>` selector onto `out`. Returns false when the
+/// selector was malformed, having already said so.
+fn appendHunkSpec(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    sel: []const u8,
+    out: *std.ArrayList(history.HunkSpec),
+) !bool {
+    const colon = std.mem.lastIndexOfScalar(u8, sel, ':') orelse 0;
+    if (colon == 0 or colon + 1 == sel.len) {
+        try badHunkSelector(w, sel);
+        return false;
+    }
+    var numbers: std.ArrayList(usize) = .empty;
+    errdefer numbers.deinit(alloc);
+    parseHunkNumbers(alloc, sel[colon + 1 ..], &numbers) catch {
+        numbers.deinit(alloc);
+        try badHunkSelector(w, sel);
+        return false;
+    };
+    try out.append(alloc, .{
+        .path = sel[0..colon],
+        .indices = try numbers.toOwnedSlice(alloc),
+    });
+    return true;
+}
+
 fn splitUsage(w: *std.Io.Writer) !void {
     try w.writeAll("usage: sdt split [ref] [-m msg] -- <paths>\n");
     try w.writeAll("       sdt split [ref] [-m msg] --hunk <path>:<n[,n][,a-b]> ...\n");
@@ -1012,34 +1256,20 @@ fn cmdSplit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         const a = rest[i];
         if (eq(a, "--")) {
             after_sep = true;
-        } else if (after_sep) {
-            try paths.append(alloc, a);
         } else if (eq(a, "-m") or eq(a, "--message")) {
+            // Also after `--`: a message placed there used to be swallowed as a
+            // pathspec, which silently split on a path nobody named.
             i += 1;
             if (i < rest.len) message = rest[i];
+        } else if (after_sep) {
+            try paths.append(alloc, a);
         } else if (eq(a, "--hunk") or eq(a, "-H")) {
             i += 1;
             if (i >= rest.len) {
                 try splitUsage(w);
                 return;
             }
-            const sel = rest[i];
-            const colon = std.mem.lastIndexOfScalar(u8, sel, ':') orelse 0;
-            if (colon == 0 or colon + 1 == sel.len) {
-                try badHunkSelector(w, sel);
-                return;
-            }
-            var numbers: std.ArrayList(usize) = .empty;
-            errdefer numbers.deinit(alloc);
-            parseHunkNumbers(alloc, sel[colon + 1 ..], &numbers) catch {
-                numbers.deinit(alloc);
-                try badHunkSelector(w, sel);
-                return;
-            };
-            try hunks.append(alloc, .{
-                .path = sel[0..colon],
-                .indices = try numbers.toOwnedSlice(alloc),
-            });
+            if (!try appendHunkSpec(alloc, w, rest[i], &hunks)) return;
         } else if (spec.len == 0 and a.len != 0 and a[0] != '-') {
             spec = a;
         }
@@ -1081,7 +1311,7 @@ fn cmdSplit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         return e;
     };
     defer r.deinit(alloc);
-    try reportRewrite(io, alloc, w, &s, before_tree, r, "split");
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "split", .checkout);
 }
 
 fn cmdReorder(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1115,12 +1345,13 @@ fn cmdReorder(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
         return e;
     };
     defer r.deinit(alloc);
-    try reportRewrite(io, alloc, w, &s, before_tree, r, "reordered");
+    try reportRewrite(io, alloc, w, &s, before_tree, r, "reordered", .checkout);
 }
 
 fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     const dry_run = hasFlag(rest, "--dry-run") or hasFlag(rest, "-n");
     try gc.run(&s, alloc, w, dry_run);
 }
@@ -1228,6 +1459,7 @@ fn cmdConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
 fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     const change = try doSave(io, alloc, &s, messageFlag(rest));
     recordProvenance(io, alloc, &s, change, rest);
     const branch = try s.headBranch();
@@ -1286,11 +1518,16 @@ var sync_blocked: bool = false;
 fn cmdDescribe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     const message = messageFlag(rest);
     if (message.len == 0) {
-        try w.writeAll("usage: sdt desc -m \"message\"\n");
+        try w.writeAll("usage: sdt desc -m \"message\" [--at <ref>]\n");
+        try ui.hint(w, "--at renames a change further back, replaying everything after it");
         return;
     }
+    const at = flagValue(rest, "--at", "--at");
+    if (at.len != 0) return describeAt(io, alloc, w, &s, at, message);
+
     const branch = try s.headBranch();
     defer alloc.free(branch);
     const tip = s.readRef(branch) catch {
@@ -1316,6 +1553,32 @@ fn cmdDescribe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []
     try w.print("described {s}\n", .{shortHex(new_oid, &buf)});
 }
 
+/// Rename a change that is not the tip. Every descendant is replayed onto an
+/// identical tree, so nothing but the message and the parent links move.
+fn describeAt(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    at: []const u8,
+    message: []const u8,
+) !void {
+    captureBefore(io, alloc, s);
+    try autoSaveIfDirty(io, alloc, w, s, "describe");
+
+    const target = (try resolveChangeOrFail(io, alloc, w, s, at)) orelse return;
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const before_tree = branches.headTree(s);
+
+    const r = history.reword(s, alloc, branch, target, message, nowSeconds(io)) catch |e| {
+        if (try reportHistoryError(w, e, "describe")) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+    try reportRewrite(io, alloc, w, s, before_tree, r, "described", .checkout);
+}
+
 fn hasFlag(rest: []const []const u8, name: []const u8) bool {
     for (rest) |a| if (eq(a, name)) return true;
     return false;
@@ -1334,6 +1597,55 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// A file bigger than this is not scanned for conflict markers. Markers are a
+/// text-file problem, and reading a large asset on every `status` would cost
+/// more than it can ever find.
+const conflict_scan_limit = 4 * 1024 * 1024;
+
+/// Tracked files that currently hold conflict markers.
+///
+/// This looks at the files rather than at recorded state on purpose. A rebase
+/// saves its conflicted result as a change, so by the time anyone runs `status`
+/// there is no operation in progress to ask — and markers can also arrive from a
+/// split, an amend, a git import, or a bad paste. Bytes on disk are the one
+/// source that is true for all of them, and there is no state to go stale when
+/// the rewrite is undone.
+fn markedTrackedPaths(io: std.Io, alloc: std.mem.Allocator, s: *Store, work: std.Io.Dir) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| alloc.free(p);
+        out.deinit(alloc);
+    }
+
+    const branch = s.headBranch() catch return out.toOwnedSlice(alloc);
+    defer alloc.free(branch);
+    if (!s.refExists(branch)) return out.toOwnedSlice(alloc);
+    const tip = s.readRef(branch) catch return out.toOwnedSlice(alloc);
+    const change = s.readChange(tip) catch return out.toOwnedSlice(alloc);
+    defer object.freeChange(alloc, change);
+    const tree = s.readTree(change.tree) catch return out.toOwnedSlice(alloc);
+    defer object.freeTree(alloc, tree);
+
+    for (tree.entries) |e| {
+        if (e.mode == .symlink) continue;
+        const st = work.statFile(io, e.path, .{}) catch continue;
+        if (st.size > conflict_scan_limit) continue;
+        const data = readWorkFile(io, work, e.path, alloc) catch continue;
+        defer alloc.free(data);
+        if (isBinary(data)) continue;
+        if (!merge.hasConflictMarkers(data)) continue;
+        try out.append(alloc, try alloc.dupe(u8, e.path));
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn listed(paths: []const []const u8, p: []const u8) bool {
+    for (paths) |x| {
+        if (eq(x, p)) return true;
+    }
+    return false;
+}
+
 fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     const json = hasFlag(rest, "--json");
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -1350,10 +1662,20 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         for (conflicts) |p| alloc.free(p);
         alloc.free(conflicts);
     }
+    // Safety rule, same reasoning as superposition below: a conflict a merge no
+    // longer knows about is still a conflict, and shipping `<<<<<<< ours` is
+    // worse than any cost of looking.
+    const marked = try markedTrackedPaths(io, alloc, &s, work);
+    defer {
+        for (marked) |p| alloc.free(p);
+        alloc.free(marked);
+    }
     // Safety rule: a superposed path is never invisible. A file quietly holding
     // a second value is a real change to the mental model, so it is surfaced
     // here every single time rather than only when someone goes looking.
     const superposed = superpose.count(&s, alloc) catch 0;
+    const diverged = divergence(alloc, &s);
+    defer if (diverged) |v| v.deinit(alloc);
 
     if (json) {
         try w.writeAll("{\"changes\":[");
@@ -1373,11 +1695,38 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
             if (i != 0) try w.writeByte(',');
             try writeJsonString(w, p);
         }
+        try w.writeAll("],\"marked\":[");
+        for (marked, 0..) |p, i| {
+            if (i != 0) try w.writeByte(',');
+            try writeJsonString(w, p);
+        }
+        try w.writeAll("],\"diverged\":[");
+        if (diverged) |v| {
+            var n: usize = 0;
+            for (v.refs) |r| {
+                if (!r.diverged()) continue;
+                if (n != 0) try w.writeByte(',');
+                n += 1;
+                try w.writeAll("{\"branch\":");
+                try writeJsonString(w, r.name);
+                try w.print(",\"tips\":{d}}}", .{r.tips.len});
+            }
+        }
         try w.print("],\"superposed\":{d}}}\n", .{superposed});
         return;
     }
 
     if (superposed != 0) try superpose.statusLine(w, superposed);
+
+    if (diverged) |v| {
+        for (v.refs) |r| {
+            if (!r.diverged()) continue;
+            try w.print("{s}{s} branch {s} diverged: {d} tips{s}\n", .{
+                ui.on(.yellow), ui.warn, r.name, r.tips.len, ui.off(),
+            });
+        }
+        try ui.hint(w, "`sdt branch` lists every tip; `sdt point <ref>` keeps the one you want");
+    }
 
     if (conflicts.len != 0) {
         try w.print("{s}{s} merge in progress: {d} unresolved conflict(s){s}\n", .{
@@ -1386,8 +1735,26 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         for (conflicts) |p| try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.red), ui.warn, ui.off(), p });
         try ui.hint(w, "fix the markers then `sdt resolve <file>`, or `sdt resolve --abort`");
     }
+
+    var unresolved: usize = 0;
+    for (marked) |p| {
+        if (listed(conflicts, p)) continue;
+        unresolved += 1;
+    }
+    if (unresolved != 0) {
+        try w.print("{s}{s} unresolved conflict in {d} saved file(s){s}\n", .{
+            ui.on(.red), ui.warn, unresolved, ui.off(),
+        });
+        for (marked) |p| {
+            if (listed(conflicts, p)) continue;
+            try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.red), ui.warn, ui.off(), p });
+        }
+        try ui.hint(w, "the markers are already inside the last saved change: fix them and `sdt save`");
+        try ui.hint(w, "`sdt undo` puts the history back the way it was");
+    }
+
     if (entries.len == 0) {
-        if (conflicts.len == 0 and superposed == 0) {
+        if (conflicts.len == 0 and unresolved == 0 and superposed == 0 and diverged == null) {
             try w.print("{s}{s}{s} clean, nothing to save\n", .{ ui.on(.green), ui.check, ui.off() });
         }
         return;
@@ -1539,7 +1906,27 @@ fn cmdLog(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     if (json) try w.writeAll("]\n");
 }
 
-fn cmdBranch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+fn cmdBranch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var deleting = false;
+    var force = false;
+    var name: []const u8 = "";
+    for (rest) |a| {
+        if (eq(a, "-d") or eq(a, "--delete")) {
+            deleting = true;
+        } else if (eq(a, "-D")) {
+            deleting = true;
+            force = true;
+        } else if (eq(a, "-f") or eq(a, "--force")) {
+            force = true;
+        } else if (a.len != 0 and a[0] == '-') {
+            try w.print("unknown option '{s}'\n", .{a});
+            return;
+        } else if (name.len == 0) {
+            name = a;
+        }
+    }
+    if (deleting or name.len != 0) return branchDelete(io, alloc, w, name, force, deleting);
+
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     const cur = try s.headBranch();
@@ -1555,13 +1942,88 @@ fn cmdBranch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         });
         return;
     }
+    const diverged = divergence(alloc, &s);
+    defer if (diverged) |v| v.deinit(alloc);
+
+    var any_diverged = false;
     for (names) |n| {
         if (eq(n, cur)) {
             try w.print("{s}{s} {s}{s}\n", .{ ui.on(.cyan), ui.branch_mark, n, ui.off() });
         } else {
             try w.print("{s}{s}{s} {s}\n", .{ ui.on(.dim), ui.bullet, ui.off(), n });
         }
+        const state = if (diverged) |v| v.find(n) else null;
+        if (state) |r| {
+            if (!r.diverged()) continue;
+            any_diverged = true;
+            const tip: Oid = s.readRef(n) catch Oid.zero();
+            for (r.tips) |t| {
+                var buf: [Oid.len * 2]u8 = undefined;
+                const mark = if (t.eql(tip)) ui.arrow else " ";
+                try w.print("    {s}{s} {s}{s}\n", .{
+                    ui.on(.yellow), mark, shortHex(t, &buf), ui.off(),
+                });
+            }
+        }
     }
+    if (any_diverged) {
+        try ui.hint(w, "more than one tip: `sdt point <ref>` keeps the one you want");
+    }
+}
+
+/// Really delete a branch ref. `sdt export` publishes every branch it finds, so
+/// a scratch branch that cannot be deleted is a scratch branch that ends up in
+/// git forever; refusing to delete the current one, and refusing history no
+/// other branch reaches unless forced, keeps that from becoming a way to lose
+/// work instead.
+fn branchDelete(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    name: []const u8,
+    force: bool,
+    deleting: bool,
+) !void {
+    if (!deleting or name.len == 0) {
+        try w.writeAll("usage: sdt branch            (list)\n");
+        try w.writeAll("       sdt branch -d <name>  (delete; -D deletes unmerged history too)\n");
+        try ui.hint(w, "`sdt new <name>` is how you make one");
+        return;
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+
+    const tip = history.deleteBranch(&s, alloc, name, force, nowSeconds(io)) catch |e| switch (e) {
+        history.Error.CurrentBranch => {
+            try w.print("{s}{s}{s} {s} is the branch you are on\n", .{
+                ui.on(.red), ui.cross, ui.off(), name,
+            });
+            try ui.hint(w, "`sdt switch <other>` first, then delete it");
+            return;
+        },
+        history.Error.NoSuchBranch => {
+            try w.print("no such branch: {s}\n", .{name});
+            return;
+        },
+        history.Error.BranchNotMerged => {
+            try w.print("{s}{s}{s} {s} holds changes no other branch reaches\n", .{
+                ui.on(.red), ui.cross, ui.off(), name,
+            });
+            try ui.hint(w, "`sdt branch -D <name>` deletes it anyway; `sdt undo` puts it back");
+            return;
+        },
+        else => return e,
+    };
+
+    var buf: [Oid.len * 2]u8 = undefined;
+    try w.print("{s}{s}{s} deleted branch {s}{s}{s}, was at {s}{s}{s}\n", .{
+        ui.on(.green), ui.check,            ui.off(),
+        ui.on(.cyan),  name,                ui.off(),
+        ui.on(.dim),   shortHex(tip, &buf), ui.off(),
+    });
+    try ui.hint(w, "`sdt undo` puts the branch back");
 }
 
 fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1571,6 +2033,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     const name = rest[0];
 
     // `sdt new <name> @<moment>` turns a fork into a branch once you decide it
@@ -1595,6 +2058,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             },
             else => return e,
         };
+        try autoSaveIfDirty(io, alloc, w, &s, "new");
         var work2 = try openWork(io);
         defer work2.close(io);
         try branches.switchTo(&s, work2, name);
@@ -1602,6 +2066,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         return;
     }
 
+    try autoSaveIfDirty(io, alloc, w, &s, "new");
     branches.create(&s, name) catch |e| switch (e) {
         branches.Error.BranchExists => {
             try w.print("branch {s} already exists\n", .{name});
@@ -1792,6 +2257,7 @@ fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     const branch = try s.headBranch();
     defer alloc.free(branch);
     const prefix = if (rest.len >= 2) rest[1] else "";
@@ -2447,6 +2913,20 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         try w.print(", {s}{d} green but hollow{s}", .{ ui.on(.yellow), hollow, ui.off() });
     }
     try w.writeAll("\n");
+
+    const op_heads = opdag.heads(&s, alloc) catch try alloc.alloc(Oid, 0);
+    defer alloc.free(op_heads);
+    try w.print("  op-log       {d} head{s}\n", .{ op_heads.len, if (op_heads.len == 1) "" else "s" });
+    if (divergence(alloc, &s)) |v| {
+        defer v.deinit(alloc);
+        for (v.refs) |r| {
+            if (!r.diverged()) continue;
+            try w.print("               {s}{s} branch {s} diverged: {d} tips{s}\n", .{
+                ui.on(.yellow), ui.warn, r.name, r.tips.len, ui.off(),
+            });
+        }
+        try ui.hint(w, "               `sdt branch` lists every tip; `sdt point <ref>` keeps one");
+    }
 }
 
 fn cmdRecap(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -2629,6 +3109,24 @@ fn cmdNotes(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     }
 }
 
+fn resolveOps(alloc: std.mem.Allocator, s: *Store) void {
+    _ = opdag.resolve(s, alloc) catch {};
+}
+
+fn divergence(alloc: std.mem.Allocator, s: *Store) ?opdag.View {
+    const hs = opdag.heads(s, alloc) catch return null;
+    const n = hs.len;
+    alloc.free(hs);
+    if (n == 0) return null;
+
+    var view = opdag.currentView(s, alloc) catch return null;
+    if (!view.diverged()) {
+        view.deinit(alloc);
+        return null;
+    }
+    return view;
+}
+
 /// Capture the working tree before a command that will change it.
 ///
 /// Not used by `save`: a save already writes an addressable change, so
@@ -2640,6 +3138,7 @@ fn cmdNotes(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 /// own. Failure is deliberately silent — a capture that cannot happen must
 /// never stop the command the user actually asked for.
 fn captureBefore(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
+    resolveOps(alloc, s);
     var work = openWork(io) catch return;
     defer work.close(io);
     const r = moment.capture(s, work, .command, momentSettings(s, alloc)) catch return;
@@ -2649,6 +3148,7 @@ fn captureBefore(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
 fn cmdUndo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     var undo_work = openWork(io) catch null;
     defer if (undo_work) |*d| d.close(io);
     oplog.undo(&s, undo_work) catch |e| switch (e) {
@@ -2664,6 +3164,7 @@ fn cmdUndo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 fn cmdRedo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
     var redo_work = openWork(io) catch null;
     defer if (redo_work) |*d| d.close(io);
     oplog.redo(&s, redo_work) catch |e| switch (e) {
@@ -2701,6 +3202,7 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
 
     switch (op) {
         .import => {
@@ -2851,6 +3353,7 @@ fn reportNotFastForward(w: *std.Io.Writer, branch: []const u8) !void {
 fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
+    resolveOps(alloc, &s);
 
     // Positional args are remote then branch; -f/--force is a flag anywhere.
     var force = false;
@@ -3908,6 +4411,7 @@ test {
     _ = store;
     _ = workspace;
     _ = oplog;
+    _ = opdag;
     _ = git;
     _ = diff;
     _ = branches;
@@ -4015,4 +4519,556 @@ test "a checkout run from a nested subdirectory writes to the repo root" {
     try std.testing.expectEqualStrings("v1", got);
     try std.testing.expectError(error.FileNotFound, root.access(io, "native/native", .{}));
     try std.testing.expectError(error.FileNotFound, root.access(io, "native/repo", .{}));
+}
+
+fn singleTipView(alloc: std.mem.Allocator, name: []const u8, tip: Oid) !opdag.View {
+    const refs = try alloc.alloc(opdag.RefState, 1);
+    errdefer alloc.free(refs);
+    const tips = try alloc.alloc(Oid, 1);
+    errdefer alloc.free(tips);
+    tips[0] = tip;
+    refs[0] = .{ .name = try alloc.dupe(u8, name), .tips = tips };
+    return .{ .refs = refs, .head_branch = try alloc.dupe(u8, name) };
+}
+
+fn divergeMain(io: std.Io, alloc: std.mem.Allocator, s: *Store, root: std.Io.Dir) !void {
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "v1" });
+    const c1 = try workspace.snapshot(s, root, "Nico <n@x>", "main", 1_700_000_000);
+    _ = try opdag.commit(s, alloc, "snapshot", 1, "main");
+
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "v2" });
+    const c2 = try workspace.snapshot(s, root, "Nico <n@x>", "main", 1_700_000_001);
+
+    try s.updateRef("main", c1);
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "v3" });
+    const c3 = try workspace.snapshot(s, root, "Nico <n@x>", "main", 1_700_000_002);
+
+    const base = try opdag.heads(s, alloc);
+    defer alloc.free(base);
+
+    var left = try singleTipView(alloc, "main", c2);
+    defer left.deinit(alloc);
+    var right = try singleTipView(alloc, "main", c3);
+    defer right.deinit(alloc);
+
+    const lv = try opdag.writeView(s, left);
+    const rv = try opdag.writeView(s, right);
+    _ = try opdag.commitWith(s, alloc, base, lv, "snapshot", 2, "main");
+    _ = try opdag.commitWith(s, alloc, base, rv, "snapshot", 3, "main");
+}
+
+fn enterRepo(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) ![:0]u8 {
+    const before_path = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(before_path);
+    const before = try alloc.dupeZ(u8, before_path);
+    errdefer alloc.free(before);
+
+    const here_path = try dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(here_path);
+    const here = try alloc.dupeZ(u8, here_path);
+    defer alloc.free(here);
+
+    if (chdir(here.ptr) != 0) return error.ChdirFailed;
+    return before;
+}
+
+test "a single op head is left alone and never decoded" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = try Store.init(io, alloc, tmp.dir);
+    defer s.deinit();
+
+    const ghost = Oid.ofBytes("an operation whose object was never written");
+    try opdag.addHead(&s, ghost);
+    try s.updateRef("main", Oid.ofBytes("tip"));
+
+    resolveOps(alloc, &s);
+
+    const hs = try opdag.heads(&s, alloc);
+    defer alloc.free(hs);
+    try std.testing.expectEqual(@as(usize, 1), hs.len);
+    try std.testing.expect(hs[0].eql(ghost));
+    try std.testing.expect((try s.readRef("main")).eql(Oid.ofBytes("tip")));
+    try std.testing.expect(divergence(alloc, &s) == null);
+}
+
+test "a mutating command merges two op heads down to one" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var root = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer root.close(io);
+
+    var s = try Store.init(io, alloc, root);
+    defer s.deinit();
+    try divergeMain(io, alloc, &s, root);
+
+    {
+        const hs = try opdag.heads(&s, alloc);
+        defer alloc.free(hs);
+        try std.testing.expectEqual(@as(usize, 2), hs.len);
+    }
+
+    const before = try enterRepo(io, alloc, root);
+    defer alloc.free(before);
+    defer _ = chdir(before.ptr);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
+    defer out = aw.toArrayList();
+    try cmdSave(io, alloc, &aw.writer, &.{});
+
+    var after = try Store.discover(io, alloc, std.Io.Dir.cwd());
+    defer after.deinit();
+    const hs = try opdag.heads(&after, alloc);
+    defer alloc.free(hs);
+    try std.testing.expectEqual(@as(usize, 1), hs.len);
+
+    const head_op = try opdag.readOperation(&after, alloc, hs[0]);
+    defer opdag.freeOperation(alloc, head_op);
+    try std.testing.expectEqual(@as(usize, 1), head_op.parents.len);
+
+    const merged = try opdag.readOperation(&after, alloc, head_op.parents[0]);
+    defer opdag.freeOperation(alloc, merged);
+    try std.testing.expectEqualStrings("merge", merged.kind);
+    try std.testing.expectEqual(@as(usize, 2), merged.parents.len);
+
+    var view = try opdag.readView(&after, alloc, merged.view);
+    defer view.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), view.find("main").?.tips.len);
+}
+
+test "status names a branch that holds more than one tip" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var root = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer root.close(io);
+
+    var s = try Store.init(io, alloc, root);
+    defer s.deinit();
+    try divergeMain(io, alloc, &s, root);
+    resolveOps(alloc, &s);
+
+    const before = try enterRepo(io, alloc, root);
+    defer alloc.free(before);
+    defer _ = chdir(before.ptr);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
+    defer out = aw.toArrayList();
+
+    try cmdStatus(io, alloc, &aw.writer, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "branch main diverged: 2 tips") != null);
+
+    aw.clearRetainingCapacity();
+    try cmdStatus(io, alloc, &aw.writer, &.{"--json"});
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"diverged\":[{\"branch\":\"main\",\"tips\":2}]") != null);
+
+    aw.clearRetainingCapacity();
+    try cmdDoctor(io, alloc, &aw.writer);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "branch main diverged: 2 tips") != null);
+
+    aw.clearRetainingCapacity();
+    try cmdBranch(io, alloc, &aw.writer, &.{});
+    var buf: [Oid.len * 2]u8 = undefined;
+    var view = try opdag.currentView(&s, alloc);
+    defer view.deinit(alloc);
+    for (view.find("main").?.tips) |t| {
+        try std.testing.expect(std.mem.indexOf(u8, aw.written(), shortHex(t, &buf)) != null);
+    }
+}
+
+test "a damaged op-heads directory is silent and never fails a command" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = try Store.init(io, alloc, tmp.dir);
+    defer s.deinit();
+
+    try s.updateRef("main", Oid.ofBytes("tip"));
+    try s.root.writeFile(io, .{ .sub_path = opdag.heads_dir, .data = "not a directory" });
+
+    resolveOps(alloc, &s);
+    try std.testing.expect(divergence(alloc, &s) == null);
+    try std.testing.expect((try s.readRef("main")).eql(Oid.ofBytes("tip")));
+
+    oplog.record(&s, .{
+        .kind = .other,
+        .branch = "main",
+        .prev = Oid.zero(),
+        .new = Oid.ofBytes("tip"),
+        .timestamp = 1_700_000_000,
+    }) catch {};
+    resolveOps(alloc, &s);
+    try std.testing.expect((try s.readRef("main")).eql(Oid.ofBytes("tip")));
+}
+
+const CliFixture = struct {
+    tmp: std.testing.TmpDir,
+    root: std.Io.Dir,
+    store: Store,
+    back: [:0]u8,
+    out: std.ArrayList(u8),
+    aw: std.Io.Writer.Allocating,
+
+    fn init() !*CliFixture {
+        const io = std.testing.io;
+        const alloc = std.testing.allocator;
+        const self = try alloc.create(CliFixture);
+        errdefer alloc.destroy(self);
+
+        self.tmp = std.testing.tmpDir(.{});
+        try self.tmp.dir.createDirPath(io, "repo");
+        self.root = try self.tmp.dir.openDir(io, "repo", .{ .iterate = true });
+        self.store = try Store.init(io, alloc, self.root);
+        self.back = try enterRepo(io, alloc, self.root);
+        self.out = .empty;
+        self.aw = std.Io.Writer.Allocating.fromArrayList(alloc, &self.out);
+        return self;
+    }
+
+    fn deinit(self: *CliFixture) void {
+        const io = std.testing.io;
+        const alloc = std.testing.allocator;
+        self.out = self.aw.toArrayList();
+        self.out.deinit(alloc);
+        _ = chdir(self.back.ptr);
+        alloc.free(self.back);
+        self.store.deinit();
+        self.root.close(io);
+        self.tmp.cleanup();
+        alloc.destroy(self);
+    }
+
+    fn w(self: *CliFixture) *std.Io.Writer {
+        return &self.aw.writer;
+    }
+
+    fn said(self: *CliFixture) []const u8 {
+        return self.aw.written();
+    }
+
+    fn clear(self: *CliFixture) void {
+        self.aw.clearRetainingCapacity();
+    }
+
+    fn write(self: *CliFixture, path: []const u8, data: []const u8) !void {
+        try self.root.writeFile(std.testing.io, .{ .sub_path = path, .data = data });
+    }
+
+    fn read(self: *CliFixture, path: []const u8) ![]u8 {
+        return self.root.readFileAlloc(std.testing.io, path, std.testing.allocator, .unlimited);
+    }
+
+    fn save(self: *CliFixture, message: []const u8) !Oid {
+        return workspace.snapshot(&self.store, self.root, "T <t@e.com>", message, nowSeconds(std.testing.io));
+    }
+
+    fn tip(self: *CliFixture) !Oid {
+        const branch = try self.store.headBranch();
+        defer std.testing.allocator.free(branch);
+        return self.store.readRef(branch);
+    }
+
+    fn messageOf(self: *CliFixture, change: Oid) ![]u8 {
+        const c = try self.store.readChange(change);
+        defer object.freeChange(std.testing.allocator, c);
+        return std.testing.allocator.dupe(u8, c.message);
+    }
+
+    fn chain(self: *CliFixture) ![]Oid {
+        return history.chainOf(&self.store, std.testing.allocator, try self.tip());
+    }
+};
+
+test "status reports conflict markers a rewrite left inside a saved change" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "a\nb\nc\n");
+    _ = try f.save("root");
+
+    try branches.create(&f.store, "feature");
+    try branches.switchTo(&f.store, f.root, "feature");
+    try f.write("f.txt", "X\nb\nc\n");
+    _ = try f.save("mine");
+
+    try branches.switchTo(&f.store, f.root, "main");
+    try f.write("f.txt", "Y\nb\nc\n");
+    _ = try f.save("theirs");
+    try branches.switchTo(&f.store, f.root, "feature");
+
+    try cmdRebase(io, alloc, f.w(), &.{"main"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "came out conflicted") != null);
+
+    const on_disk = try f.read("f.txt");
+    defer alloc.free(on_disk);
+    try std.testing.expect(merge.hasConflictMarkers(on_disk));
+
+    f.clear();
+    try cmdStatus(io, alloc, f.w(), &.{});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "clean, nothing to save") == null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "unresolved conflict in 1 saved file(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "f.txt") != null);
+
+    f.clear();
+    try cmdStatus(io, alloc, f.w(), &.{"--json"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "\"marked\":[\"f.txt\"]") != null);
+
+    try f.write("f.txt", "X\nb\nc\n");
+    _ = try f.save("resolved");
+    f.clear();
+    try cmdStatus(io, alloc, f.w(), &.{});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "unresolved conflict") == null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "clean, nothing to save") != null);
+}
+
+test "split takes -m after the path separator instead of eating it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("keep.txt", "keep\n");
+    _ = try f.save("root");
+    try f.root.createDirPath(io, "docs");
+    try f.write("src.zig", "code\n");
+    try f.write("docs/readme.md", "docs\n");
+    _ = try f.save("code and docs");
+
+    try cmdSplit(io, alloc, f.w(), &.{ "--", "docs", "-m", "docs only" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "split") != null);
+
+    const chain = try f.chain();
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 3), chain.len);
+
+    const extracted = try f.messageOf(chain[1]);
+    defer alloc.free(extracted);
+    try std.testing.expectEqualStrings("docs only", extracted);
+
+    const remainder = try f.messageOf(chain[2]);
+    defer alloc.free(remainder);
+    try std.testing.expectEqualStrings("code and docs", remainder);
+}
+
+test "describe renames a change below the tip and keeps the rest" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    const root = try f.save("wip");
+    try f.write("b.txt", "b\n");
+    _ = try f.save("the tip");
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = root.toHex(&hex);
+    try cmdDescribe(io, alloc, f.w(), &.{ "-m", "add the a module", "--at", hex[0..12] });
+
+    const chain = try f.chain();
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+
+    const renamed = try f.messageOf(chain[0]);
+    defer alloc.free(renamed);
+    try std.testing.expectEqualStrings("add the a module", renamed);
+
+    const kept = try f.messageOf(chain[1]);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("the tip", kept);
+}
+
+test "drop removes a change and leaves its content in the working tree" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    _ = try f.save("root");
+    try f.write("debris.txt", "debris\n");
+    _ = try f.save("debris");
+
+    try cmdDrop(io, alloc, f.w(), &.{});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "still in the working tree") != null);
+
+    const chain = try f.chain();
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 1), chain.len);
+
+    const on_disk = try f.read("debris.txt");
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("debris\n", on_disk);
+
+    f.clear();
+    try cmdStatus(io, alloc, f.w(), &.{});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "debris.txt") != null);
+
+    f.clear();
+    try cmdUndo(io, alloc, f.w());
+    const back = try f.chain();
+    defer alloc.free(back);
+    try std.testing.expectEqual(@as(usize, 2), back.len);
+}
+
+test "branch -d refuses the current branch, refuses unmerged work, then deletes" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    _ = try f.save("root");
+    try branches.create(&f.store, "scratch");
+    try branches.switchTo(&f.store, f.root, "scratch");
+    try f.write("scratch.txt", "scratch\n");
+    _ = try f.save("scratch work");
+    try branches.switchTo(&f.store, f.root, "main");
+
+    try cmdBranch(io, alloc, f.w(), &.{ "-d", "main" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "is the branch you are on") != null);
+    try std.testing.expect(f.store.refExists("main"));
+
+    f.clear();
+    try cmdBranch(io, alloc, f.w(), &.{ "-d", "ghost" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "no such branch") != null);
+
+    f.clear();
+    try cmdBranch(io, alloc, f.w(), &.{ "-d", "scratch" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "no other branch reaches") != null);
+    try std.testing.expect(f.store.refExists("scratch"));
+
+    f.clear();
+    try cmdBranch(io, alloc, f.w(), &.{ "-D", "scratch" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "deleted branch") != null);
+    try std.testing.expect(!f.store.refExists("scratch"));
+
+    f.clear();
+    try cmdUndo(io, alloc, f.w());
+    try std.testing.expect(f.store.refExists("scratch"));
+}
+
+test "amend sends a hunk of the working tree back into a named change" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    const old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+    const new = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10a\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+    const first_only = "1a\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+
+    try f.write("app.zig", old);
+    const root = try f.save("root");
+    try f.write("later.txt", "later\n");
+    _ = try f.save("later work");
+    try f.write("app.zig", new);
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = root.toHex(&hex);
+    try cmdAmend(io, alloc, f.w(), &.{ "--at", hex[0..12], "--hunk", "app.zig:1" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "amended") != null);
+
+    const chain = try f.chain();
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+
+    const folded = try f.store.readChange(chain[0]);
+    defer object.freeChange(alloc, folded);
+    const tree = try f.store.readTree(folded.tree);
+    defer object.freeTree(alloc, tree);
+    var found: ?Oid = null;
+    for (tree.entries) |e| {
+        if (eq(e.path, "app.zig")) found = e.blob;
+    }
+    const text = try f.store.readFileContent(found.?);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(first_only, text);
+
+    const on_disk = try f.read("app.zig");
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings(new, on_disk);
+
+    f.clear();
+    try cmdStatus(io, alloc, f.w(), &.{});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "app.zig") != null);
+}
+
+test "init tells a colocated git repo to ignore the repo dir, once" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/.git/info");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/info/exclude", .data = "# git ls-files --others\nbuild/\n" });
+    var root = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer root.close(io);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
+    defer out = aw.toArrayList();
+
+    try excludeFromColocatedGit(io, alloc, &aw.writer, root);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "ignore") != null);
+
+    const first = try root.readFileAlloc(io, ".git/info/exclude", alloc, .unlimited);
+    defer alloc.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "build/\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, store.dir_name ++ "/\n") != null);
+
+    aw.clearRetainingCapacity();
+    try excludeFromColocatedGit(io, alloc, &aw.writer, root);
+    try std.testing.expectEqualStrings("", aw.written());
+
+    const again = try root.readFileAlloc(io, ".git/info/exclude", alloc, .unlimited);
+    defer alloc.free(again);
+    try std.testing.expectEqualStrings(first, again);
+}
+
+test "init writes the exclude file when git has none, and skips a repo without git" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "with/.git");
+    try tmp.dir.createDirPath(io, "without");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var aw = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
+    defer out = aw.toArrayList();
+
+    var with = try tmp.dir.openDir(io, "with", .{ .iterate = true });
+    defer with.close(io);
+    try excludeFromColocatedGit(io, alloc, &aw.writer, with);
+    const written = try with.readFileAlloc(io, ".git/info/exclude", alloc, .unlimited);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings(store.dir_name ++ "/\n", written);
+
+    aw.clearRetainingCapacity();
+    var without = try tmp.dir.openDir(io, "without", .{ .iterate = true });
+    defer without.close(io);
+    try excludeFromColocatedGit(io, alloc, &aw.writer, without);
+    try std.testing.expectEqualStrings("", aw.written());
 }

@@ -938,6 +938,47 @@ fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, 
     return last;
 }
 
+/// Pick the git branch that superdetermine branch `branch` mirrors onto, in the
+/// dest repo `repo`. Caller frees.
+///   - if `git_branch` is non-null, that branch is used verbatim;
+///   - else if the dest repo already has a branch of the same name, that one is
+///     used, so work on `feature` lands on git's `feature` and never on whatever
+///     git happens to have checked out;
+///   - else the dest repo's HEAD branch shorthand, unless that shorthand names
+///     some OTHER superdetermine branch, in which case it is that branch's
+///     mirror and must not be written to. This is what keeps the common
+///     colocated case (sdt on `main`, git on `master`, no sdt `master`) updating
+///     `master` as before;
+///   - else it falls back to the superdetermine branch name.
+fn resolveTargetBranch(
+    store: *Store,
+    repo: ?*c.git_repository,
+    git_branch: ?[]const u8,
+    branch: []const u8,
+) ![]u8 {
+    const alloc = store.alloc;
+    if (git_branch) |gb| return alloc.dupe(u8, gb);
+
+    var same_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrintZ(&same_buf, "refs/heads/{s}", .{branch})) |same_ref| {
+        var same_oid: c.git_oid = undefined;
+        if (c.git_reference_name_to_id(&same_oid, repo, same_ref.ptr) == 0) {
+            return alloc.dupe(u8, branch);
+        }
+    } else |_| {}
+
+    var head_ref: ?*c.git_reference = null;
+    if (c.git_repository_head_detached(repo) == 0 and c.git_repository_head(&head_ref, repo) == 0) {
+        defer c.git_reference_free(head_ref);
+        const short = c.git_reference_shorthand(head_ref);
+        if (short != null) {
+            const name = std.mem.span(short);
+            if (!store.refExists(name)) return alloc.dupe(u8, name);
+        }
+    }
+    return alloc.dupe(u8, branch);
+}
+
 /// Export the superdetermine store's HEAD branch (FULL history) into a git repo at
 /// `dest_git_repo_path`, creating (init) the repo if absent. Into a fresh repo
 /// this reproduces the whole branch history losslessly (git assigns new SHAs).
@@ -946,11 +987,8 @@ pub fn exportHead(store: *Store, dest_git_repo_path: []const u8) !void {
 }
 
 /// Branch-aware full-history export. Materializes the entire gr HEAD-branch
-/// history as commits in the dest git repo on a target git branch:
-///   - if `git_branch` is non-null, that branch is used verbatim;
-///   - else if the dest repo has a resolvable HEAD, its current branch shorthand
-///     is used (e.g. "master") so a colocated repo updates its own branch;
-///   - else it falls back to the superdetermine branch name.
+/// history as commits in the dest git repo on a target git branch chosen by
+/// `resolveTargetBranch`.
 /// If the target branch already exists, the gr root(s) are grafted onto its tip
 /// so the update fast-forwards rather than replacing existing history (unforced
 /// exports only; see `exportHeadToForced`).
@@ -980,21 +1018,7 @@ pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_bra
     }
     defer c.git_repository_free(repo);
 
-    var target: []u8 = undefined;
-    if (git_branch) |gb| {
-        target = try alloc.dupe(u8, gb);
-    } else blk: {
-        var head_ref: ?*c.git_reference = null;
-        if (c.git_repository_head(&head_ref, repo) == 0) {
-            defer c.git_reference_free(head_ref);
-            const short = c.git_reference_shorthand(head_ref);
-            if (short != null) {
-                target = try alloc.dupe(u8, std.mem.span(short));
-                break :blk;
-            }
-        }
-        target = try alloc.dupe(u8, branch);
-    }
+    const target = try resolveTargetBranch(store, repo, git_branch, branch);
     defer alloc.free(target);
 
     var ref_buf: [512]u8 = undefined;
@@ -1137,21 +1161,7 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
     }
     defer c.git_repository_free(repo);
 
-    var target: []u8 = undefined;
-    if (git_branch) |gb| {
-        target = try alloc.dupe(u8, gb);
-    } else blk: {
-        var head_ref: ?*c.git_reference = null;
-        if (c.git_repository_head(&head_ref, repo) == 0) {
-            defer c.git_reference_free(head_ref);
-            const short = c.git_reference_shorthand(head_ref);
-            if (short != null) {
-                target = try alloc.dupe(u8, std.mem.span(short));
-                break :blk;
-            }
-        }
-        target = try alloc.dupe(u8, branch);
-    }
+    const target = try resolveTargetBranch(store, repo, git_branch, branch);
     defer alloc.free(target);
 
     const git_tree = try buildGitTree(store, repo, tree, sess);
@@ -2102,6 +2112,160 @@ test "pushRemote fetch-first fast-forwards an existing master branch" {
     try testing.expectEqual(@as(c_uint, 1), c.git_commit_parentcount(commit));
     const parent_id = c.git_commit_parent_id(commit, 0);
     try testing.expect(c.git_oid_cmp(parent_id, &orig_tip) == 0);
+}
+
+fn buildStoreOnFeature(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
+    var store = try buildStoreWithChange(io, alloc, dir);
+    errdefer store.deinit();
+    const base = try store.readRef("main");
+    const tip = try writeChangeWith(&store, &[_]Oid{base}, "feature.txt", "feature\n", "feature work\n", 11, 1_700_000_200);
+    try store.updateRef("feature", tip);
+    try store.setHeadBranch("feature");
+    return store;
+}
+
+fn initGitOnMain(io: std.Io, alloc: std.mem.Allocator, tmp: *std.Io.Dir, name: []const u8) !struct { abs: [:0]u8, repo: ?*c.git_repository, tip: c.git_oid } {
+    try tmp.createDirPath(io, name);
+    const abs = try tmp.realPathFileAlloc(io, name, alloc);
+    errdefer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    errdefer c.git_repository_free(repo);
+    const tip = try commitOnto(repo, "refs/heads/main", "seed.txt", "seed\n", "seed main\n", null, 1_600_000_000);
+    try check(c.git_repository_set_head(repo, "refs/heads/main"));
+    return .{ .abs = abs, .repo = repo, .tip = tip };
+}
+
+test "the mirror follows the sdt branch, not git's checked-out branch" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    const feature_tip = try commitOnto(repo, "refs/heads/feature", "feature.txt", "git feature\n", "git feature\n", &main_tip, 1_600_000_100);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocated(&store, git_repo.abs);
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+
+    var feature_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&feature_after, repo, "refs/heads/feature"));
+    try testing.expect(c.git_oid_cmp(&feature_after, &feature_tip) != 0);
+    try testing.expect(c.git_graph_descendant_of(repo, &feature_after, &feature_tip) == 1);
+}
+
+test "the mirror creates the sdt branch rather than writing git's checked-out one" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocated(&store, git_repo.abs);
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+    try testing.expectEqual(@as(usize, 1), try countCommitsFrom(repo, "refs/heads/main"));
+
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/feature"));
+}
+
+test "an explicit branch beats both the sdt branch and git's HEAD" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    const feature_tip = try commitOnto(repo, "refs/heads/feature", "feature.txt", "git feature\n", "git feature\n", &main_tip, 1_600_000_100);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocatedTo(&store, git_repo.abs, "release");
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+    var feature_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&feature_after, repo, "refs/heads/feature"));
+    try testing.expect(c.git_oid_cmp(&feature_after, &feature_tip) == 0);
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/release"));
+}
+
+test "the resolved branch still repairs a grafted chain when forced" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    _ = try commitOnto(repo, "refs/heads/feature", "feature.txt", "git feature\n", "git feature\n", &main_tip, 1_600_000_100);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocated(&store, git_repo.abs);
+    try testing.expectEqual(@as(usize, 4), try countCommitsFrom(repo, "refs/heads/feature"));
+
+    try syncColocatedForced(&store, git_repo.abs, null, true);
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/feature"));
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
 }
 
 /// Commit `content` at `file_name` onto `branch_ref`, chaining onto `parent` if
