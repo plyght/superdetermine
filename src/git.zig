@@ -3,6 +3,7 @@ const oid = @import("oid.zig");
 const object = @import("object.zig");
 const proc = @import("proc.zig");
 const lfs = @import("lfs.zig");
+const ui = @import("ui.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -186,6 +187,129 @@ fn credentialsCb(
         return c.git_credential_ssh_key_from_agent(out, user);
     }
     return -1;
+}
+
+pub const Phase = enum {
+    receiving,
+    resolving,
+    checking_out,
+    importing,
+
+    fn live(self: Phase) []const u8 {
+        return switch (self) {
+            .receiving => "receiving objects",
+            .resolving => "resolving deltas",
+            .checking_out => "checking out",
+            .importing => "importing history",
+        };
+    }
+
+    fn past(self: Phase) []const u8 {
+        return switch (self) {
+            .receiving => "received",
+            .resolving => "resolved",
+            .checking_out => "checked out",
+            .importing => "imported",
+        };
+    }
+
+    fn noun(self: Phase) []const u8 {
+        return switch (self) {
+            .receiving => "objects",
+            .resolving => "deltas",
+            .checking_out => "files",
+            .importing => "changes",
+        };
+    }
+};
+
+/// Live clone progress: one terminal row that redraws in place, and a settled
+/// line left behind for each phase that finishes. Silent when stdout is not a
+/// terminal, so logs and pipes stay clean.
+pub const Progress = struct {
+    io: std.Io,
+    w: *std.Io.Writer,
+    phase: ?Phase = null,
+    tick: usize = 0,
+    last_ms: i64 = 0,
+    last_done: u64 = 0,
+    bytes: u64 = 0,
+    drawn: bool = false,
+
+    pub fn init(io: std.Io, w: *std.Io.Writer) Progress {
+        return .{ .io = io, .w = w };
+    }
+
+    fn nowMillis(self: *Progress) i64 {
+        return @intCast(@divTrunc(std.Io.Clock.now(.awake, self.io).nanoseconds, 1_000_000));
+    }
+
+    pub fn update(self: *Progress, phase: Phase, done: u64, total: ?u64) void {
+        if (!ui.isTty()) return;
+        const changed = self.phase == null or self.phase.? != phase;
+        if (changed) self.settle();
+        self.phase = phase;
+        self.last_done = done;
+
+        const now = self.nowMillis();
+        if (!changed and now - self.last_ms < ui.redraw_interval_ms) return;
+        self.last_ms = now;
+        self.tick +%= 1;
+        self.drawn = true;
+        ui.drawProgress(self.w, phase.live(), done, total, self.tick, .count);
+    }
+
+    /// Replace the live row with a permanent one-line record of the phase.
+    fn settle(self: *Progress) void {
+        const phase = self.phase orelse return;
+        self.phase = null;
+        if (!self.drawn) return;
+        self.drawn = false;
+        ui.clearProgress(self.w);
+        self.w.print("{s}{s}{s} {s} {d} {s}", .{
+            ui.on(.green), ui.check,       ui.off(),
+            phase.past(),  self.last_done, phase.noun(),
+        }) catch return;
+        if (phase == .receiving and self.bytes != 0) {
+            var buf: [32]u8 = undefined;
+            self.w.print(" {s}({s}){s}", .{
+                ui.on(.dim), ui.humanBytes(self.bytes, &buf), ui.off(),
+            }) catch return;
+        }
+        self.w.writeAll("\n") catch return;
+        self.w.flush() catch {};
+    }
+
+    /// Settle whatever phase is running and leave the cursor on a clean row.
+    pub fn finish(self: *Progress) void {
+        self.settle();
+        if (!ui.isTty()) return;
+        ui.clearProgress(self.w);
+    }
+};
+
+fn transferProgressCb(stats: [*c]const c.git_indexer_progress, payload: ?*anyopaque) callconv(.c) c_int {
+    const p: *Progress = @ptrCast(@alignCast(payload orelse return 0));
+    const s = stats.*;
+    p.bytes = s.received_bytes;
+    const total_objects: ?u64 = if (s.total_objects > 0) s.total_objects else null;
+    if (s.total_deltas > 0 and s.received_objects >= s.total_objects) {
+        p.update(.resolving, s.indexed_deltas, s.total_deltas);
+    } else {
+        p.update(.receiving, s.received_objects, total_objects);
+    }
+    return 0;
+}
+
+fn checkoutProgressCb(
+    path: [*c]const u8,
+    completed: usize,
+    total: usize,
+    payload: ?*anyopaque,
+) callconv(.c) void {
+    _ = path;
+    const p: *Progress = @ptrCast(@alignCast(payload orelse return));
+    p.update(.checking_out, completed, if (total > 0) total else null);
 }
 
 fn looksRemote(s: []const u8) bool {
@@ -579,48 +703,25 @@ pub fn importRefChange(store: *Store, git_repo_path: []const u8, git_ref: ?[]con
     return tip;
 }
 
-/// Import ALL local branches and ALL tags (each with full history) from the git
-/// repo into `store`. Shared ancestry is imported once (deduped via the gitmap).
-/// Creates gr `refs/heads/<name>` for each local branch and `refs/tags/<name>`
-/// for each tag (peeled to its commit). Points gr HEAD at the git repo's HEAD
-/// branch. Lossless in structure/content/metadata (git SHAs are not preserved;
-/// gr re-hashes with its own content-addressed store).
-pub fn importAll(store: *Store, git_repo_path: []const u8) !void {
-    ensureInit();
-    const alloc = store.alloc;
-
-    const path_z = try alloc.dupeZ(u8, git_repo_path);
-    defer alloc.free(path_z);
-
-    var repo: ?*c.git_repository = null;
-    try check(c.git_repository_open(&repo, path_z.ptr));
-    defer c.git_repository_free(repo);
-
-    var map = try Gitmap.load(store);
-    defer map.deinit();
-
-    var walk: ?*c.git_revwalk = null;
-    try check(c.git_revwalk_new(&walk, repo));
-    defer c.git_revwalk_free(walk);
-    _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL | c.GIT_SORT_REVERSE);
-
-    // Push every local branch tip.
+/// Push every local branch tip and every tag's target commit onto `walk`, so it
+/// covers exactly the history an import has to cover.
+fn pushImportTips(walk: ?*c.git_revwalk, repo: ?*c.git_repository) void {
     {
         var iter: ?*c.git_branch_iterator = null;
-        try check(c.git_branch_iterator_new(&iter, repo, c.GIT_BRANCH_LOCAL));
-        defer c.git_branch_iterator_free(iter);
-        var ref: ?*c.git_reference = null;
-        var btype: c.git_branch_t = undefined;
-        while (c.git_branch_next(&ref, &btype, iter) == 0) {
-            defer c.git_reference_free(ref);
-            var obj: ?*c.git_object = null;
-            if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) == 0) {
-                defer c.git_object_free(obj);
-                _ = c.git_revwalk_push(walk, c.git_object_id(obj));
+        if (c.git_branch_iterator_new(&iter, repo, c.GIT_BRANCH_LOCAL) == 0) {
+            defer c.git_branch_iterator_free(iter);
+            var ref: ?*c.git_reference = null;
+            var btype: c.git_branch_t = undefined;
+            while (c.git_branch_next(&ref, &btype, iter) == 0) {
+                defer c.git_reference_free(ref);
+                var obj: ?*c.git_object = null;
+                if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) == 0) {
+                    defer c.git_object_free(obj);
+                    _ = c.git_revwalk_push(walk, c.git_object_id(obj));
+                }
             }
         }
     }
-    // Push every tag's target commit.
     {
         var tagnames: c.git_strarray = undefined;
         if (c.git_tag_list(&tagnames, repo) == 0) {
@@ -640,6 +741,49 @@ pub fn importAll(store: *Store, git_repo_path: []const u8) !void {
             }
         }
     }
+}
+
+/// Import ALL local branches and ALL tags (each with full history) from the git
+/// repo into `store`. Shared ancestry is imported once (deduped via the gitmap).
+/// Creates gr `refs/heads/<name>` for each local branch and `refs/tags/<name>`
+/// for each tag (peeled to its commit). Points gr HEAD at the git repo's HEAD
+/// branch. Lossless in structure/content/metadata (git SHAs are not preserved;
+/// gr re-hashes with its own content-addressed store).
+pub fn importAll(store: *Store, git_repo_path: []const u8, progress: ?*Progress) !void {
+    ensureInit();
+    const alloc = store.alloc;
+
+    const path_z = try alloc.dupeZ(u8, git_repo_path);
+    defer alloc.free(path_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, path_z.ptr));
+    defer c.git_repository_free(repo);
+
+    var map = try Gitmap.load(store);
+    defer map.deinit();
+
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, repo));
+    defer c.git_revwalk_free(walk);
+    _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL | c.GIT_SORT_REVERSE);
+    pushImportTips(walk, repo);
+
+    // Count the walk up front so the import bar has a real denominator. Only
+    // worth the second pass when someone is watching it.
+    var total_commits: ?u64 = null;
+    if (progress != null and ui.isTty()) {
+        var counter: ?*c.git_revwalk = null;
+        if (c.git_revwalk_new(&counter, repo) == 0) {
+            defer c.git_revwalk_free(counter);
+            _ = c.git_revwalk_sorting(counter, c.GIT_SORT_TOPOLOGICAL);
+            pushImportTips(counter, repo);
+            var n: u64 = 0;
+            var coid: c.git_oid = undefined;
+            while (c.git_revwalk_next(&coid, counter) == 0) n += 1;
+            total_commits = n;
+        }
+    }
 
     lfs_unresolved = 0;
     var session = lfsSessionFor(store, repo, null);
@@ -650,8 +794,16 @@ pub fn importAll(store: *Store, git_repo_path: []const u8) !void {
 
     // Import the whole reachable DAG oldest-first.
     var woid: c.git_oid = undefined;
+    var imported: u64 = 0;
+    errdefer if (progress) |p| p.finish();
     while (c.git_revwalk_next(&woid, walk) == 0) {
         _ = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
+        imported += 1;
+        if (progress) |p| p.update(.importing, imported, total_commits);
+    }
+    if (progress) |p| {
+        if (total_commits) |t| p.update(.importing, t, t);
+        p.finish();
     }
 
     // Create sdt branch refs.
@@ -1210,11 +1362,16 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
 /// Clone a git repo (local path or file:// URL) into `into_dir`, then import its
 /// HEAD into `store` so the superdetermine ref is populated.
 pub fn cloneGit(store: *Store, url_or_path: []const u8, into_dir: []const u8) !void {
-    try cloneGitOnly(store.alloc, url_or_path, into_dir);
-    try importAll(store, into_dir);
+    try cloneGitOnly(store.alloc, url_or_path, into_dir, null);
+    try importAll(store, into_dir, null);
 }
 
-pub fn cloneGitOnly(alloc: std.mem.Allocator, url_or_path: []const u8, into_dir: []const u8) !void {
+pub fn cloneGitOnly(
+    alloc: std.mem.Allocator,
+    url_or_path: []const u8,
+    into_dir: []const u8,
+    progress: ?*Progress,
+) !void {
     ensureInit();
 
     const url_z = try alloc.dupeZ(u8, url_or_path);
@@ -1222,9 +1379,24 @@ pub fn cloneGitOnly(alloc: std.mem.Allocator, url_or_path: []const u8, into_dir:
     const into_z = try alloc.dupeZ(u8, into_dir);
     defer alloc.free(into_z);
 
+    resetCredCache();
+    g_cred.token = envToken();
+
+    var opts: c.git_clone_options = undefined;
+    try check(c.git_clone_options_init(&opts, c.GIT_CLONE_OPTIONS_VERSION));
+    opts.fetch_opts.callbacks.credentials = credentialsCb;
+    if (progress) |p| {
+        opts.fetch_opts.callbacks.transfer_progress = transferProgressCb;
+        opts.fetch_opts.callbacks.payload = @ptrCast(p);
+        opts.checkout_opts.progress_cb = checkoutProgressCb;
+        opts.checkout_opts.progress_payload = @ptrCast(p);
+    }
+
     var repo: ?*c.git_repository = null;
-    try check(c.git_clone(&repo, url_z.ptr, into_z.ptr, null));
+    errdefer if (progress) |p| p.finish();
+    try check(c.git_clone(&repo, url_z.ptr, into_z.ptr, &opts));
     c.git_repository_free(repo);
+    if (progress) |p| p.finish();
 }
 
 /// Ensure `.sdt/gitmirror` exists as a real git repo and return its absolute path.
@@ -2398,7 +2570,7 @@ test "importAll brings all branches and tags with history" {
     var store = try Store.init(io, alloc, gr_dir);
     defer store.deinit();
 
-    try importAll(&store, abs);
+    try importAll(&store, abs, null);
 
     try testing.expect(store.refExists("master"));
     try testing.expect(store.refExists("feature"));

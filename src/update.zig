@@ -4,10 +4,8 @@ const ui = @import("ui.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const bar_cells = 24;
-const redraw_interval_ms = 80;
-const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-const partial_cells = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
+const bar_cells = ui.bar_cells;
+const redraw_interval_ms = ui.redraw_interval_ms;
 
 pub fn assetName() ?[]const u8 {
     const os = switch (builtin.os.tag) {
@@ -80,69 +78,19 @@ fn nowMillis(io: std.Io) i64 {
 }
 
 fn humanBytes(bytes: u64, buf: []u8) []const u8 {
-    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
-    var v: f64 = @floatFromInt(bytes);
-    var i: usize = 0;
-    while (v >= 1024.0 and i + 1 < units.len) : (i += 1) v /= 1024.0;
-    if (i == 0) return std.fmt.bufPrint(buf, "{d} {s}", .{ bytes, units[i] }) catch unreachable;
-    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[i] }) catch unreachable;
+    return ui.humanBytes(bytes, buf);
 }
 
 fn renderProgress(buf: []u8, transferred: u64, total: ?u64, cells: usize, tick: usize) []const u8 {
-    var out = std.Io.Writer.fixed(buf);
-    const known = if (total) |t| (if (t == 0) null else t) else null;
-
-    if (known == null) {
-        var got_buf: [32]u8 = undefined;
-        out.print("{s}{s}{s} {s}{s}{s}", .{
-            ui.on(.cyan),
-            spinner_frames[tick % spinner_frames.len],
-            ui.off(),
-            ui.on(.dim),
-            humanBytes(transferred, &got_buf),
-            ui.off(),
-        }) catch unreachable;
-        return out.buffered();
-    }
-
-    const t = known.?;
-    const done = @min(transferred, t);
-    const pct = (done * 100) / t;
-    const eighths = (done * cells * 8) / t;
-    const full = @min(eighths / 8, cells);
-    const part = if (full == cells) 0 else eighths % 8;
-    const empty = cells - full - @intFromBool(part != 0);
-
-    var got_buf: [32]u8 = undefined;
-    var want_buf: [32]u8 = undefined;
-    out.print("{s}", .{ui.on(.green)}) catch unreachable;
-    out.splatBytesAll("█", @intCast(full)) catch unreachable;
-    if (part != 0) out.writeAll(partial_cells[@intCast(part)]) catch unreachable;
-    out.print("{s}{s}", .{ ui.off(), ui.on(.dim) }) catch unreachable;
-    out.splatBytesAll("░", @intCast(empty)) catch unreachable;
-    out.print("{s}  {s}{d:>3}%{s}  {s}{s} / {s}{s}", .{
-        ui.off(),
-        ui.on(.bold),
-        pct,
-        ui.off(),
-        ui.on(.dim),
-        humanBytes(done, &got_buf),
-        humanBytes(t, &want_buf),
-        ui.off(),
-    }) catch unreachable;
-    return out.buffered();
+    return ui.renderProgress(buf, transferred, total, cells, tick, .bytes);
 }
 
 fn drawProgress(w: *std.Io.Writer, transferred: u64, total: ?u64, tick: usize) void {
-    var buf: [512]u8 = undefined;
-    const line = renderProgress(&buf, transferred, total, bar_cells, tick);
-    w.print("\x1b[2K\r{s}downloading{s}  {s}", .{ ui.on(.dim), ui.off(), line }) catch return;
-    w.flush() catch {};
+    ui.drawProgress(w, "downloading", transferred, total, tick, .bytes);
 }
 
 fn clearProgress(w: *std.Io.Writer) void {
-    w.writeAll("\x1b[2K\r") catch return;
-    w.flush() catch {};
+    ui.clearProgress(w);
 }
 
 fn downloadToFile(io: std.Io, w: *std.Io.Writer, url: []const u8, path: []const u8, total: ?u64) !u64 {
@@ -499,7 +447,7 @@ test "renderProgress spins instead of inventing a denominator" {
     try std.testing.expectEqualStrings("⠋ 512 B", renderProgress(&buf, 512, 0, 8, 0));
     try std.testing.expectEqualStrings(
         "⠋ 512 B",
-        renderProgress(&buf, 512, null, 8, spinner_frames.len),
+        renderProgress(&buf, 512, null, 8, ui.spinner_frame_count),
     );
 }
 

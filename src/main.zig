@@ -3550,7 +3550,7 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
 
     switch (op) {
         .import => {
-            git.importAll(&s, target) catch {
+            git.importAll(&s, target, null) catch {
                 try w.writeAll("git import failed (is that a git repo with commits?)\n");
                 return;
             };
@@ -3929,12 +3929,23 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         try w.print("cannot tell what to name the directory for {s}. pass one: sdt clone <src> <dir>\n", .{rest[0]});
         return;
     };
+    try w.print("{s}cloning{s} {s}{s}{s}\n", .{
+        ui.on(.dim), ui.off(), ui.on(.cyan), rest[0], ui.off(),
+    });
+    try w.flush();
     if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
         return cloneShare(io, alloc, w, rest[0], into);
     }
     // Create the destination as a superdetermine repo, then clone git into it.
-    git.cloneGitOnly(alloc, rest[0], into) catch {
-        try w.print("clone failed. check the URL, your access, and that {s} is empty\n", .{into});
+    var progress = git.Progress.init(io, w);
+    git.cloneGitOnly(alloc, rest[0], into, &progress) catch {
+        const detail = git.lastError();
+        if (detail.len != 0) {
+            try w.print("{s}{s}{s} clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), detail });
+        } else {
+            try w.print("{s}{s}{s} clone failed\n", .{ ui.on(.red), ui.cross, ui.off() });
+        }
+        try w.print("check the URL, your access, and that {s} is empty\n", .{into});
         return;
     };
     var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
@@ -3944,11 +3955,24 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         else => return e,
     };
     defer s.deinit();
-    git.importAll(&s, into) catch {
-        try w.writeAll("cloned, but importing the git history failed\n");
+    git.importAll(&s, into, &progress) catch {
+        try w.print("{s}{s}{s} cloned, but importing the git history failed\n", .{
+            ui.on(.red), ui.cross, ui.off(),
+        });
         return;
     };
-    try w.print("cloned {s} into {s}\n", .{ rest[0], into });
+    try w.print("{s}{s}{s} cloned into {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+    });
+    const branch = s.headBranch() catch null;
+    defer if (branch) |b| alloc.free(b);
+    if (branch) |b| {
+        try w.print("  {s}on{s} {s}{s}{s}  {s}·{s}  {s}sdt log{s} to read it, {s}sdt grade{s} to see what works\n", .{
+            ui.on(.dim), ui.off(), ui.on(.magenta), b,        ui.off(),
+            ui.on(.dim), ui.off(), ui.on(.bold),    ui.off(), ui.on(.bold),
+            ui.off(),
+        });
+    }
 }
 
 fn shareBranches(alloc: std.mem.Allocator, rest: []const []const u8, from: usize) ![][]const u8 {

@@ -93,6 +93,114 @@ pub fn note(w: *std.Io.Writer, symbol: []const u8, color: Color, text: []const u
     try w.print("{s}{s}{s} {s}\n", .{ on(color), symbol, off(), text });
 }
 
+pub const bar_cells = 24;
+pub const redraw_interval_ms = 80;
+pub const label_width = 18;
+
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const partial_cells = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
+
+pub const Unit = enum { bytes, count };
+
+pub const spinner_frame_count = spinner_frames.len;
+
+pub fn spinner(tick: usize) []const u8 {
+    return spinner_frames[tick % spinner_frames.len];
+}
+
+pub fn humanBytes(bytes: u64, buf: []u8) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var v: f64 = @floatFromInt(bytes);
+    var i: usize = 0;
+    while (v >= 1024.0 and i + 1 < units.len) : (i += 1) v /= 1024.0;
+    if (i == 0) return std.fmt.bufPrint(buf, "{d} {s}", .{ bytes, units[i] }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[i] }) catch unreachable;
+}
+
+fn amount(v: u64, unit: Unit, buf: []u8) []const u8 {
+    return switch (unit) {
+        .bytes => humanBytes(v, buf),
+        .count => std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable,
+    };
+}
+
+/// A bar when the total is known, a spinner when it is not. Never a fake
+/// denominator: an unknown total shows what has actually arrived so far.
+pub fn renderProgress(
+    buf: []u8,
+    done_raw: u64,
+    total: ?u64,
+    cells: usize,
+    tick: usize,
+    unit: Unit,
+) []const u8 {
+    var out = std.Io.Writer.fixed(buf);
+    const known = if (total) |t| (if (t == 0) null else t) else null;
+
+    if (known == null) {
+        var got_buf: [32]u8 = undefined;
+        out.print("{s}{s}{s} {s}{s}{s}", .{
+            on(.cyan),
+            spinner(tick),
+            off(),
+            on(.dim),
+            amount(done_raw, unit, &got_buf),
+            off(),
+        }) catch unreachable;
+        return out.buffered();
+    }
+
+    const t = known.?;
+    const done = @min(done_raw, t);
+    const pct = (done * 100) / t;
+    const eighths = (done * cells * 8) / t;
+    const full = @min(eighths / 8, cells);
+    const part = if (full == cells) 0 else eighths % 8;
+    const empty = cells - full - @intFromBool(part != 0);
+
+    var got_buf: [32]u8 = undefined;
+    var want_buf: [32]u8 = undefined;
+    out.print("{s}", .{on(.green)}) catch unreachable;
+    out.splatBytesAll("█", @intCast(full)) catch unreachable;
+    if (part != 0) out.writeAll(partial_cells[@intCast(part)]) catch unreachable;
+    out.print("{s}{s}", .{ off(), on(.dim) }) catch unreachable;
+    out.splatBytesAll("░", @intCast(empty)) catch unreachable;
+    out.print("{s}  {s}{d:>3}%{s}  {s}{s} / {s}{s}", .{
+        off(),
+        on(.bold),
+        pct,
+        off(),
+        on(.dim),
+        amount(done, unit, &got_buf),
+        amount(t, unit, &want_buf),
+        off(),
+    }) catch unreachable;
+    return out.buffered();
+}
+
+/// Redraw the current terminal row with `label` and a bar. Labels are padded to
+/// a common width so the bars of successive phases line up.
+pub fn drawProgress(
+    w: *std.Io.Writer,
+    label: []const u8,
+    done: u64,
+    total: ?u64,
+    tick: usize,
+    unit: Unit,
+) void {
+    var buf: [512]u8 = undefined;
+    const line = renderProgress(&buf, done, total, bar_cells, tick, unit);
+    w.print("\x1b[2K\r{s}{s}{s}", .{ on(.dim), label, off() }) catch return;
+    pad(w, label, label_width) catch return;
+    w.print(" {s}", .{line}) catch return;
+    w.flush() catch {};
+}
+
+pub fn clearProgress(w: *std.Io.Writer) void {
+    w.writeAll("\x1b[2K\r") catch return;
+    w.flush() catch {};
+}
+
 pub const check = "✓";
 pub const cross = "✗";
 pub const warn = "!";
@@ -147,6 +255,39 @@ test "width ignores escapes and counts utf-8 runes once" {
     try testing.expectEqual(@as(usize, 1), width(check));
     try testing.expectEqual(@as(usize, 1), width(arrow));
     try testing.expectEqual(@as(usize, 5), width("a\x1b[1mb\x1b[0mcde"));
+}
+
+test "counts are rendered as counts, not byte sizes" {
+    const prev = enabled;
+    defer setEnabled(prev);
+    setEnabled(false);
+
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        "████░░░░   50%  512 / 1024",
+        renderProgress(&buf, 512, 1024, 8, 0, .count),
+    );
+    try testing.expectEqualStrings("⠋ 512", renderProgress(&buf, 512, null, 8, 0, .count));
+}
+
+test "a drawn line pads its label so successive bars line up" {
+    const prev_color = enabled;
+    const prev_tty = tty;
+    defer setEnabled(prev_color);
+    defer setTty(prev_tty);
+    setEnabled(false);
+    setTty(true);
+
+    const alloc = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var w = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
+    defer out = w.toArrayList();
+
+    drawProgress(&w.writer, "checking out", 1, 2, 0, .count);
+    const line = w.written();
+    const bar_at = std.mem.indexOf(u8, line, "█").?;
+    try testing.expectEqual(@as(usize, "\x1b[2K\r".len + label_width + 1), bar_at);
 }
 
 test "pad fills to the visible width" {
