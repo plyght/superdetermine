@@ -44,7 +44,7 @@ jobs:
 
           NOTES="Rolling nightly build from \`$SHORT\` — $(date -u '+%Y-%m-%d %H:%M UTC').
 
-          Prerelease built from the tip of master; may be unstable. Get it with \`gr update --nightly\`."
+          Prerelease built from the tip of master; may be unstable. Get it with \`sdt update --nightly\`."
 
           gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
           gh release create nightly \
@@ -63,19 +63,15 @@ jobs:
         include:
           - runner: macos-latest
             asset: sdt-macos-arm64
-            legacy: gr-macos-arm64
             zig: aarch64-macos
           - runner: macos-13
             asset: sdt-macos-x64
-            legacy: gr-macos-x64
             zig: x86_64-macos
           - runner: ubuntu-latest
             asset: sdt-linux-x64
-            legacy: gr-linux-x64
             zig: x86_64-linux
           - runner: ubuntu-24.04-arm
             asset: sdt-linux-arm64
-            legacy: gr-linux-arm64
             zig: aarch64-linux
     runs-on: ${{ matrix.runner }}
     steps:
@@ -95,19 +91,11 @@ jobs:
       - name: Package binary
         env:
           ASSET: ${{ matrix.asset }}
-          LEGACY_ASSET: ${{ matrix.legacy }}
         run: |
           set -euo pipefail
           cp zig-out/bin/sdt "${ASSET}"
           chmod +x "${ASSET}"
           shasum -a 256 "${ASSET}" | awk '{print $1}' > "${ASSET}.sha256"
-
-          # Publish the pre-rename asset name alongside, byte-identical. An
-          # already-installed `gr` looks for `gr-<platform>` and would otherwise
-          # find nothing to update to, stranding it on the old name forever.
-          LEGACY="${LEGACY_ASSET}"
-          cp "${ASSET}" "${LEGACY}"
-          cp "${ASSET}.sha256" "${LEGACY}.sha256"
 
       - name: Upload to nightly release
         uses: softprops/action-gh-release@v2
@@ -116,7 +104,5 @@ jobs:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
-            ${{ matrix.legacy }}
-            ${{ matrix.legacy }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -713,7 +713,7 @@ pub fn gradeEntries(
     defer alloc.free(src_abs);
 
     const parent = opts.scratch_parent orelse std.fs.path.dirname(src_abs) orelse "/tmp";
-    const dst_abs = try std.fmt.allocPrint(alloc, "{s}/.gr-grade-{s}-{s}", .{
+    const dst_abs = try std.fmt.allocPrint(alloc, "{s}/.sdt-grade-{s}-{s}", .{
         parent, label, opts.tier.label(),
     });
     defer alloc.free(dst_abs);
@@ -861,8 +861,8 @@ test "run passes env through to the child" {
     const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(abs);
 
-    const r = try run(alloc, io, abs, "test \"$GR_TEST_VAR\" = hello", .{
-        .env = &.{.{ "GR_TEST_VAR", "hello" }},
+    const r = try run(alloc, io, abs, "test \"$SDT_TEST_VAR\" = hello", .{
+        .env = &.{.{ "SDT_TEST_VAR", "hello" }},
     });
     try testing.expectEqual(@as(i32, 0), r.exit_code);
 }

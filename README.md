@@ -2,6 +2,8 @@
 
 A version control system that remembers which states of your code actually worked.
 
+![sdt grading a broken edit red and rewinding to the last state that passed](demo.gif)
+
 `sdt` grades your code. It runs the project's own check against a state, in a throwaway clone, and records the result. `sdt green` then returns the last state that passed.
 
 For that to be useful, the states have to exist. So `sdt` captures your working tree continuously from `sdt init`. There is no staging area and no stash. You never run `save` to keep your work safe.

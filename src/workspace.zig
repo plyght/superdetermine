@@ -413,7 +413,7 @@ test "ignored files are excluded from status and snapshot" {
     defer store.deinit();
 
     try tmp.dir.createDirPath(io, "work/target");
-    try tmp.dir.writeFile(io, .{ .sub_path = "work/.grignore", .data = "*.o\ntarget/\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/.sdtignore", .data = "*.o\ntarget/\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "work/a.txt", .data = "hello" });
     try tmp.dir.writeFile(io, .{ .sub_path = "work/junk.o", .data = "obj" });
     try tmp.dir.writeFile(io, .{ .sub_path = "work/target/big.bin", .data = "huge" });
@@ -473,7 +473,7 @@ test "a sealed source never enters the tree and its sealed form always does" {
     try manifest.putMember(io, seal.newRepoKey(io), "nico", id.publicId());
     try keyring.saveManifest(io, alloc, work, &manifest);
 
-    try work.writeFile(io, .{ .sub_path = ".grignore", .data = ".env\n" });
+    try work.writeFile(io, .{ .sub_path = ".sdtignore", .data = ".env\n" });
     try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=sk-live-1\n" });
 
     _ = try snapshot(&store, work, "Nico <n@x>", "init", 1_700_000_000);

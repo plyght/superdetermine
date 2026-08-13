@@ -246,7 +246,7 @@ pub fn protectPath(
     work_dir: std.Io.Dir,
     path: []const u8,
 ) !void {
-    try ensureIgnoreLine(io, alloc, work_dir, ".grignore", path);
+    try ensureIgnoreLine(io, alloc, work_dir, ".sdtignore", path);
     if (work_dir.access(io, ".git", .{})) |_| {
         try ensureIgnoreLine(io, alloc, work_dir, ".gitignore", path);
     } else |_| {}
@@ -383,9 +383,9 @@ test "protectPath adds ignore rules and re-running is idempotent" {
     try protectPath(io, alloc, tmp.dir, ".env");
     try protectPath(io, alloc, tmp.dir, ".env");
 
-    const gr = try tmp.dir.readFileAlloc(io, ".grignore", alloc, .unlimited);
-    defer alloc.free(gr);
-    try testing.expectEqualStrings(".env\n", gr);
+    const sdt = try tmp.dir.readFileAlloc(io, ".sdtignore", alloc, .unlimited);
+    defer alloc.free(sdt);
+    try testing.expectEqualStrings(".env\n", sdt);
 
     const gi = try tmp.dir.readFileAlloc(io, ".gitignore", alloc, .unlimited);
     defer alloc.free(gi);

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 var enabled: bool = false;
+var tty: bool = false;
 
 pub const Color = enum {
     dim,
@@ -28,6 +29,14 @@ pub const Color = enum {
 
 pub fn init(io: std.Io, file: std.Io.File) void {
     enabled = decide(io, file);
+    tty = decideTty(io, file);
+}
+
+fn decideTty(io: std.Io, file: std.Io.File) bool {
+    if (std.c.getenv("TERM")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "dumb")) return false;
+    }
+    return file.supportsAnsiEscapeCodes(io) catch false;
 }
 
 fn decide(io: std.Io, file: std.Io.File) bool {
@@ -50,6 +59,14 @@ pub fn isEnabled() bool {
 
 pub fn setEnabled(value: bool) void {
     enabled = value;
+}
+
+pub fn isTty() bool {
+    return tty;
+}
+
+pub fn setTty(value: bool) void {
+    tty = value;
 }
 
 pub fn on(color: Color) []const u8 {

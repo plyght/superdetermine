@@ -14,7 +14,7 @@ pub const Error = error{
 
 // --- local-store transport (filesystem) ---
 
-/// Open a store rooted directly at a `.gr` directory path. Caller deinits.
+/// Open a store rooted directly at a `.sdt` directory path. Caller deinits.
 fn openGrDir(io: std.Io, alloc: std.mem.Allocator, gr_dir: []const u8) !Store {
     const root = try std.Io.Dir.cwd().openDir(io, gr_dir, .{});
     return .{ .io = io, .alloc = alloc, .root = root };

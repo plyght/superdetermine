@@ -15,11 +15,11 @@ pub const Options = struct {
 };
 
 fn skipDir(name: []const u8) bool {
-    return std.mem.eql(u8, name, ".gr") or std.mem.eql(u8, name, ".git");
+    return std.mem.eql(u8, name, ".sdt") or std.mem.eql(u8, name, ".git");
 }
 
 /// Cheap state signature of the working tree: a BLAKE3 over (path, size,
-/// content hash) of every file, skipping `.gr` and `.git`. Content is folded
+/// content hash) of every file, skipping `.sdt` and `.git`. Content is folded
 /// in so a change is detected regardless of mtime resolution. A file that
 /// vanishes mid-walk is skipped rather than fatal.
 pub fn signature(store: *Store, work_dir: std.Io.Dir) !Oid {

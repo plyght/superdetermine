@@ -95,16 +95,6 @@ pub fn globalDir(alloc: std.mem.Allocator) !?[]u8 {
     return globalDirNamed(alloc, "sdt");
 }
 
-/// The pre-rename global config directory.
-///
-/// It is still read, and that is not cosmetic: a machine that used this tool
-/// before the rename keeps its identity, its default branch, and — the one that
-/// actually bit — `sync.git`, whose silent disappearance stopped every save
-/// from reaching the colocated git repo while still reporting success.
-pub fn legacyGlobalDir(alloc: std.mem.Allocator) !?[]u8 {
-    return globalDirNamed(alloc, "gr");
-}
-
 fn globalDirNamed(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const v = std.mem.span(xdg);
@@ -132,17 +122,7 @@ pub fn globalGet(io: std.Io, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
             if (try parseValue(data, key, alloc)) |v| return v;
         } else |_| {}
     }
-
-    // Fall through to the pre-rename location, per key rather than per file, so
-    // a setting written before the rename still applies even once the new file
-    // exists and holds other keys.
-    const legacy_dir = (try legacyGlobalDir(alloc)) orelse return null;
-    defer alloc.free(legacy_dir);
-    const legacy = try std.fmt.allocPrint(alloc, "{s}/config", .{legacy_dir});
-    defer alloc.free(legacy);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, legacy, alloc, .unlimited) catch return null;
-    defer alloc.free(data);
-    return parseValue(data, key, alloc);
+    return null;
 }
 
 /// Upsert a key in the global config, creating the directory if needed.
@@ -163,18 +143,14 @@ pub fn globalSet(io: std.Io, alloc: std.mem.Allocator, key: []const u8, value: [
 // --- resolved settings ---
 
 /// Resolve the change author. Precedence:
-///   1. env `SDT_AUTHOR` (or the older `GR_AUTHOR`),
+///   1. env `SDT_AUTHOR`,
 ///   2. `user.name`/`user.email` (local, then global) as "Name <email>",
 ///   3. fallback "you <you@localhost>".
 /// Caller frees.
 pub fn author(store: *Store, alloc: std.mem.Allocator) ![]u8 {
-    // The old `GR_` spelling still works, so an existing shell profile does not
-    // have to be edited the day this is installed.
-    for ([_][:0]const u8{ "SDT_AUTHOR", "GR_AUTHOR" }) |name| {
-        if (std.c.getenv(name)) |env| {
-            const v = std.mem.span(env);
-            if (v.len != 0) return alloc.dupe(u8, v);
-        }
+    if (std.c.getenv("SDT_AUTHOR")) |env| {
+        const v = std.mem.span(env);
+        if (v.len != 0) return alloc.dupe(u8, v);
     }
     const name = try get(store, alloc, "user.name");
     defer if (name) |n| alloc.free(n);
@@ -326,39 +302,4 @@ test "durations parse in the units people write them in" {
     try testing.expect(parseDurationMs("soon") == null);
     try testing.expect(parseDurationMs("m") == null);
     try testing.expect(parseDurationMs("30 minutes") == null);
-}
-
-test "a setting written before the rename is still honoured" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
-    defer alloc.free(abs);
-    const absz = try alloc.dupeZ(u8, abs);
-    defer alloc.free(absz);
-    _ = setenv("XDG_CONFIG_HOME", absz.ptr, 1);
-    defer _ = unsetenv("XDG_CONFIG_HOME");
-
-    // Only the pre-rename directory exists, as on a machine that used the tool
-    // before the rename and has not written a setting since.
-    try tmp.dir.createDirPath(io, "gr");
-    try tmp.dir.writeFile(io, .{ .sub_path = "gr/config", .data = "sync.git = true\nuser.name = Old\n" });
-
-    const sync = try globalGet(io, alloc, "sync.git");
-    defer if (sync) |v| alloc.free(v);
-    try testing.expectEqualStrings("true", sync.?);
-
-    // A new-location file must not hide keys that only the old one has.
-    try tmp.dir.createDirPath(io, "sdt");
-    try tmp.dir.writeFile(io, .{ .sub_path = "sdt/config", .data = "user.name = New\n" });
-
-    const name = try globalGet(io, alloc, "user.name");
-    defer if (name) |v| alloc.free(v);
-    try testing.expectEqualStrings("New", name.?);
-
-    const still = try globalGet(io, alloc, "sync.git");
-    defer if (still) |v| alloc.free(v);
-    try testing.expectEqualStrings("true", still.?);
 }

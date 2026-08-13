@@ -151,7 +151,6 @@ fn openWork(io: std.Io) !std.Io.Dir {
     var depth: usize = 0;
     while (depth < 64) : (depth += 1) {
         if (dir.access(io, store.dir_name, .{})) |_| return dir else |_| {}
-        if (dir.access(io, store.legacy_dir_name, .{})) |_| return dir else |_| {}
         const parent = dir.openDir(io, "..", .{ .iterate = true }) catch break;
         dir.close(io);
         dir = parent;

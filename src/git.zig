@@ -1376,7 +1376,7 @@ pub fn pushRemote(store: *Store, remote_url: []const u8, branch_opt: ?[]const u8
 }
 
 /// Push a COLOCATED git repo's branch directly to a remote. Used when a `.git`
-/// already exists next to `.gr`: dual-write commits live in that repo, so we
+/// already exists next to `.sdt`: dual-write commits live in that repo, so we
 /// push it as-is (keeping local `.git` and the remote identical) instead of
 /// synthesizing a divergent history in the mirror.
 pub fn pushColocated(store: *Store, work_dir_path: []const u8, remote_url: []const u8, branch: []const u8, force: bool) !void {

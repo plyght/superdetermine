@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// A parsed `.sdtignore` file (`.grignore` is still read). Rules are matched in order; the last matching
+/// A parsed `.sdtignore` file. Rules are matched in order; the last matching
 /// rule decides, so a later `!pattern` can re-include a path an earlier rule
 /// excluded. The repo dir and `.git` are always ignored regardless of ruleset.
 pub const IgnoreList = struct {
@@ -19,11 +19,10 @@ pub const IgnoreList = struct {
         self.alloc.free(self.rules);
     }
 
-    /// Read `.sdtignore` from `dir` if present, falling back to `.grignore`; an absent file yields an empty
+    /// Read `.sdtignore` from `dir` if present; an absent file yields an empty
     /// (but valid) list.
     pub fn load(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io) !IgnoreList {
-        const text = dir.readFileAlloc(io, ".sdtignore", alloc, .unlimited) catch
-            dir.readFileAlloc(io, ".grignore", alloc, .unlimited) catch {
+        const text = dir.readFileAlloc(io, ".sdtignore", alloc, .unlimited) catch {
             return .{ .alloc = alloc, .rules = try alloc.alloc(Rule, 0) };
         };
         defer alloc.free(text);
@@ -42,9 +41,9 @@ pub const IgnoreList = struct {
         }
         const colocated_git = if (dir.access(io, ".git", .{})) |_| true else |_| false;
         const names: []const []const u8 = if (colocated_git)
-            &[_][]const u8{ ".gitignore", ".sdtignore", ".grignore" }
+            &[_][]const u8{ ".gitignore", ".sdtignore" }
         else
-            &[_][]const u8{ ".sdtignore", ".grignore" };
+            &[_][]const u8{".sdtignore"};
         for (names) |name| {
             const text = dir.readFileAlloc(io, name, alloc, .unlimited) catch continue;
             defer alloc.free(text);
@@ -114,8 +113,7 @@ pub const IgnoreList = struct {
     /// `rel_path` is repo-root-relative and forward-slash separated.
     pub fn isIgnored(self: IgnoreList, rel_path: []const u8, is_dir: bool) bool {
         const base = basename(rel_path);
-        if (std.mem.eql(u8, base, ".sdt") or std.mem.eql(u8, base, ".gr") or
-            std.mem.eql(u8, base, ".git")) return true;
+        if (std.mem.eql(u8, base, ".sdt") or std.mem.eql(u8, base, ".git")) return true;
 
         var ignored = false;
         for (self.rules) |r| {
@@ -226,25 +224,25 @@ test "always ignore the repo dir and .git" {
     const alloc = testing.allocator;
     var list = try IgnoreList.loadFromText(alloc, "");
     defer list.deinit();
-    try testing.expect(list.isIgnored(".gr", true));
+    try testing.expect(list.isIgnored(".sdt", true));
     try testing.expect(list.isIgnored(".git", true));
     try testing.expect(list.isIgnored("a/.git", true));
     try testing.expect(!list.isIgnored("normal.txt", false));
 }
 
-test "loadMerged reads gitignore and grignore, grignore wins" {
+test "loadMerged reads gitignore and sdtignore, sdtignore wins" {
     const io = std.testing.io;
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, ".git"); // git interop marker
     try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\nbuild/\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = ".grignore", .data = "!keep.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".sdtignore", .data = "!keep.log\n" });
     var list = try IgnoreList.loadMerged(alloc, tmp.dir, io);
     defer list.deinit();
     try testing.expect(list.isIgnored("a.log", false)); // from .gitignore
     try testing.expect(list.isIgnored("build", true)); // from .gitignore
-    try testing.expect(!list.isIgnored("keep.log", false)); // .grignore re-includes
+    try testing.expect(!list.isIgnored("keep.log", false)); // .sdtignore re-includes
 }
 
 test "loadMerged ignores gitignore when no colocated .git" {

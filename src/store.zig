@@ -16,16 +16,8 @@ const Oid = oid.Oid;
 /// Objects and chunks share one namespace keyed by BLAKE3(content). Writes are
 /// idempotent: storing content that already exists is a no-op, which is the
 /// whole point of content addressing (dedup across versions/branches/workspaces).
-/// The repository directory name, and the one this project used to use.
-///
-/// A repo created today is `.sdt`. A repo created before the rename is `.gr`,
-/// and is opened in place: discovery prefers the new name and falls back to the
-/// old one, so an existing repository keeps working with no migration step and
-/// no flag. There is deliberately no converter, because renaming a directory
-/// out from under a user's tooling is a worse trade than reading both names
-/// forever.
+/// The repository directory name.
 pub const dir_name = ".sdt";
-pub const legacy_dir_name = ".gr";
 
 pub const chunk_key_file = "chunkkey";
 
@@ -46,7 +38,7 @@ fn tempName(io: std.Io, buf: []u8) ![]const u8 {
 pub const Store = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
-    root: std.Io.Dir, // handle to the `.gr` directory
+    root: std.Io.Dir, // handle to the `.sdt` directory
     gear: ?cdc.GearTable = null,
 
     pub const Error = error{
@@ -57,11 +49,10 @@ pub const Store = struct {
         InvalidRef,
     };
 
-    /// Create `.sdt/...` under `dir`. Errors `RepoExists` if a repo of either
-    /// name is already present.
+    /// Create `.sdt/...` under `dir`. Errors `RepoExists` if a repo is already
+    /// present.
     pub fn init(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
         if (dir.access(io, dir_name, .{})) |_| return Error.RepoExists else |_| {}
-        if (dir.access(io, legacy_dir_name, .{})) |_| return Error.RepoExists else |_| {}
         try dir.createDirPath(io, dir_name ++ "/objects");
         try dir.createDirPath(io, dir_name ++ "/refs/heads");
         try dir.writeFile(io, .{ .sub_path = dir_name ++ "/HEAD", .data = "ref: refs/heads/main\n" });
@@ -75,10 +66,9 @@ pub const Store = struct {
         return open(io, alloc, dir);
     }
 
-    /// Open an existing repo, preferring `.sdt` and accepting `.gr`.
+    /// Open an existing `.sdt` repo.
     pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
-        const root = dir.openDir(io, dir_name, .{}) catch
-            dir.openDir(io, legacy_dir_name, .{}) catch return Error.NotARepo;
+        const root = dir.openDir(io, dir_name, .{}) catch return Error.NotARepo;
         var s: Store = .{ .io = io, .alloc = alloc, .root = root };
         s.gear = loadGear(io, root);
         return s;
@@ -105,7 +95,6 @@ pub const Store = struct {
         var depth: usize = 0;
         while (depth < 64) : (depth += 1) {
             if (dir.access(io, dir_name, .{})) |_| return open(io, alloc, dir) else |_| {}
-            if (dir.access(io, legacy_dir_name, .{})) |_| return open(io, alloc, dir) else |_| {}
             const parent = dir.openDir(io, "..", .{}) catch return Error.NotARepo;
             dir = parent;
         }

@@ -14,7 +14,7 @@ pub const RepoKey = [key_len]u8;
 pub const token_prefix = "gr1:";
 pub const public_prefix = "gr1";
 pub const secret_prefix = "grsec1";
-pub const manifest_name = ".grsealed";
+pub const manifest_name = ".sdtsealed";
 pub const sealed_suffix = ".sealed";
 
 const seal_domain = "gr-seal-v1";

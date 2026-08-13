@@ -152,7 +152,7 @@ pub fn harvest(
 /// by writing a file, backdating it, reading it, and seeing whether the
 /// filesystem noticed.
 pub fn detect(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, dir_abs: []const u8) Availability {
-    const probe = ".gr-atime-probe";
+    const probe = ".sdt-atime-probe";
     defer dir.deleteFile(io, probe) catch {};
 
     dir.writeFile(io, .{ .sub_path = probe, .data = "probe" }) catch {
@@ -241,7 +241,7 @@ test "detect reports a usable mode with a reason either way" {
     // Whichever way it lands, the reason is always sayable in `sdt doctor`.
     try testing.expect(av.reason.len != 0);
     // The probe file must never survive detection.
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, ".gr-atime-probe", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, ".sdt-atime-probe", .{}));
 }
 
 test "arming backdates access times without disturbing modification times" {

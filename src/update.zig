@@ -1,7 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ui = @import("ui.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+
+const bar_cells = 24;
+const redraw_interval_ms = 80;
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const partial_cells = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
 
 pub fn assetName() ?[]const u8 {
     const os = switch (builtin.os.tag) {
@@ -18,22 +24,6 @@ pub fn assetName() ?[]const u8 {
         return if (std.mem.eql(u8, arch, "arm64")) "sdt-macos-arm64" else "sdt-macos-x64";
     }
     return if (std.mem.eql(u8, arch, "arm64")) "sdt-linux-arm64" else "sdt-linux-x64";
-}
-
-/// The pre-rename asset name for this platform.
-///
-/// Releases cut before the rename only carry `gr-<platform>`, so an update that
-/// reaches back to one of those still has something to download.
-pub fn legacyAssetName() ?[]const u8 {
-    const name = assetName() orelse return null;
-    return if (std.mem.eql(u8, name, "sdt-macos-arm64"))
-        "gr-macos-arm64"
-    else if (std.mem.eql(u8, name, "sdt-macos-x64"))
-        "gr-macos-x64"
-    else if (std.mem.eql(u8, name, "sdt-linux-arm64"))
-        "gr-linux-arm64"
-    else
-        "gr-linux-x64";
 }
 
 pub fn isUpToDate(current: []const u8, tag: []const u8) bool {
@@ -71,7 +61,7 @@ pub fn selfExePathAlloc(alloc: std.mem.Allocator) ![]u8 {
 fn curlCapture(io: std.Io, alloc: std.mem.Allocator, url: []const u8, api: bool) ![]u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(alloc);
-    try argv.appendSlice(alloc, &.{ "curl", "-fsSL", "-A", "gr-updater" });
+    try argv.appendSlice(alloc, &.{ "curl", "-fsSL", "-A", "sdt-updater" });
     if (api) try argv.appendSlice(alloc, &.{ "-H", "Accept: application/vnd.github+json" });
     try argv.append(alloc, url);
 
@@ -85,15 +75,120 @@ fn curlCapture(io: std.Io, alloc: std.mem.Allocator, url: []const u8, api: bool)
     return res.stdout;
 }
 
-fn curlToFile(io: std.Io, alloc: std.mem.Allocator, url: []const u8, path: []const u8) !void {
-    const argv = [_][]const u8{ "curl", "-fsSL", "-A", "gr-updater", "-o", path, url };
-    const res = try std.process.run(alloc, io, .{ .argv = &argv });
-    defer alloc.free(res.stdout);
-    defer alloc.free(res.stderr);
-    switch (res.term) {
+fn nowMillis(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.awake, io).nanoseconds, 1_000_000));
+}
+
+fn humanBytes(bytes: u64, buf: []u8) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var v: f64 = @floatFromInt(bytes);
+    var i: usize = 0;
+    while (v >= 1024.0 and i + 1 < units.len) : (i += 1) v /= 1024.0;
+    if (i == 0) return std.fmt.bufPrint(buf, "{d} {s}", .{ bytes, units[i] }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[i] }) catch unreachable;
+}
+
+fn renderProgress(buf: []u8, transferred: u64, total: ?u64, cells: usize, tick: usize) []const u8 {
+    var out = std.Io.Writer.fixed(buf);
+    const known = if (total) |t| (if (t == 0) null else t) else null;
+
+    if (known == null) {
+        var got_buf: [32]u8 = undefined;
+        out.print("{s}{s}{s} {s}{s}{s}", .{
+            ui.on(.cyan),
+            spinner_frames[tick % spinner_frames.len],
+            ui.off(),
+            ui.on(.dim),
+            humanBytes(transferred, &got_buf),
+            ui.off(),
+        }) catch unreachable;
+        return out.buffered();
+    }
+
+    const t = known.?;
+    const done = @min(transferred, t);
+    const pct = (done * 100) / t;
+    const eighths = (done * cells * 8) / t;
+    const full = @min(eighths / 8, cells);
+    const part = if (full == cells) 0 else eighths % 8;
+    const empty = cells - full - @intFromBool(part != 0);
+
+    var got_buf: [32]u8 = undefined;
+    var want_buf: [32]u8 = undefined;
+    out.print("{s}", .{ui.on(.green)}) catch unreachable;
+    out.splatBytesAll("█", @intCast(full)) catch unreachable;
+    if (part != 0) out.writeAll(partial_cells[@intCast(part)]) catch unreachable;
+    out.print("{s}{s}", .{ ui.off(), ui.on(.dim) }) catch unreachable;
+    out.splatBytesAll("░", @intCast(empty)) catch unreachable;
+    out.print("{s}  {s}{d:>3}%{s}  {s}{s} / {s}{s}", .{
+        ui.off(),
+        ui.on(.bold),
+        pct,
+        ui.off(),
+        ui.on(.dim),
+        humanBytes(done, &got_buf),
+        humanBytes(t, &want_buf),
+        ui.off(),
+    }) catch unreachable;
+    return out.buffered();
+}
+
+fn drawProgress(w: *std.Io.Writer, transferred: u64, total: ?u64, tick: usize) void {
+    var buf: [512]u8 = undefined;
+    const line = renderProgress(&buf, transferred, total, bar_cells, tick);
+    w.print("\x1b[2K\r{s}downloading{s}  {s}", .{ ui.on(.dim), ui.off(), line }) catch return;
+    w.flush() catch {};
+}
+
+fn clearProgress(w: *std.Io.Writer) void {
+    w.writeAll("\x1b[2K\r") catch return;
+    w.flush() catch {};
+}
+
+fn downloadToFile(io: std.Io, w: *std.Io.Writer, url: []const u8, path: []const u8, total: ?u64) !u64 {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "curl", "-fsSL", "-A", "sdt-updater", url },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return error.CurlFailed;
+    defer child.kill(io);
+
+    var file = std.Io.Dir.cwd().createFile(io, path, .{}) catch return error.CurlFailed;
+    defer file.close(io);
+
+    const animate = ui.isTty();
+    defer if (animate) clearProgress(w);
+
+    var buf: [32 * 1024]u8 = undefined;
+    var transferred: u64 = 0;
+    var tick: usize = 0;
+    var last_draw = nowMillis(io);
+    if (animate) drawProgress(w, 0, total, 0);
+
+    while (true) {
+        const n = child.stdout.?.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return error.CurlFailed,
+        };
+        if (n != 0) {
+            file.writeStreamingAll(io, buf[0..n]) catch return error.CurlFailed;
+            transferred += n;
+        }
+        if (!animate) continue;
+        const now = nowMillis(io);
+        if (now - last_draw < redraw_interval_ms) continue;
+        last_draw = now;
+        tick += 1;
+        drawProgress(w, transferred, total, tick);
+    }
+
+    const term = child.wait(io) catch return error.CurlFailed;
+    switch (term) {
         .exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
     }
+    return transferred;
 }
 
 fn findAssetUrl(assets: std.json.Array, name: []const u8) ?[]const u8 {
@@ -111,6 +206,26 @@ fn findAssetUrl(assets: std.json.Array, name: []const u8) ?[]const u8 {
         const url = obj.get("browser_download_url") orelse return null;
         return switch (url) {
             .string => |s| s,
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn findAssetSize(assets: std.json.Array, name: []const u8) ?u64 {
+    for (assets.items) |a| {
+        const obj = switch (a) {
+            .object => |o| o,
+            else => continue,
+        };
+        const nm = obj.get("name") orelse continue;
+        const nm_s = switch (nm) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, nm_s, name)) continue;
+        return switch (obj.get("size") orelse return null) {
+            .integer => |i| if (i > 0) @intCast(i) else null,
             else => null,
         };
     }
@@ -217,20 +332,11 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
         break :blk published;
     } else tag;
 
-    // Prefer the current asset name, then the pre-rename one, so this works
-    // against releases cut on either side of the rename.
-    const chosen = findAssetUrl(assets, asset) orelse blk: {
-        const legacy = legacyAssetName() orelse {
-            try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
-            return;
-        };
-        break :blk findAssetUrl(assets, legacy) orelse {
-            try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
-            return;
-        };
+    const bin_url = findAssetUrl(assets, asset) orelse {
+        try w.print("sdt update: no asset '{s}' in release {s}\n", .{ asset, tag });
+        return;
     };
-    const bin_url = chosen;
-    const effective = if (findAssetUrl(assets, asset) != null) asset else (legacyAssetName() orelse asset);
+    const effective = asset;
 
     var sha_name_buf: [128]u8 = undefined;
     const sha_name = try std.fmt.bufPrint(&sha_name_buf, "{s}.sha256", .{effective});
@@ -245,11 +351,20 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     const tmp = try std.fs.path.join(alloc, &.{ dir, "sdt.new" });
     defer alloc.free(tmp);
 
-    curlToFile(io, alloc, bin_url, tmp) catch {
+    const transferred = downloadToFile(io, w, bin_url, tmp, findAssetSize(assets, effective)) catch {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
         try w.writeAll("sdt update: download failed\n");
         return;
     };
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    var got_buf: [32]u8 = undefined;
+    try w.print("{s}{s}{s} downloaded {s}\n", .{
+        ui.on(.green),
+        ui.check,
+        ui.off(),
+        humanBytes(transferred, &got_buf),
+    });
 
     const expected_raw = curlCapture(io, alloc, sha_url, false) catch {
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
@@ -319,6 +434,146 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, current_vers
     }
 }
 
+test "humanBytes scales into the unit that fits" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0 B", humanBytes(0, &buf));
+    try std.testing.expectEqualStrings("512 B", humanBytes(512, &buf));
+    try std.testing.expectEqualStrings("1.0 KB", humanBytes(1024, &buf));
+    try std.testing.expectEqualStrings("1.5 KB", humanBytes(1536, &buf));
+    try std.testing.expectEqualStrings("8.0 MB", humanBytes(8 * 1024 * 1024, &buf));
+    try std.testing.expectEqualStrings("1.0 GB", humanBytes(1024 * 1024 * 1024, &buf));
+}
+
+test "renderProgress draws a bar against a known total" {
+    const prev = ui.isEnabled();
+    defer ui.setEnabled(prev);
+    ui.setEnabled(false);
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "░░░░░░░░    0%  0 B / 1.0 KB",
+        renderProgress(&buf, 0, 1024, 8, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "████░░░░   50%  512 B / 1.0 KB",
+        renderProgress(&buf, 512, 1024, 8, 0),
+    );
+    try std.testing.expectEqualStrings(
+        "████████  100%  1.0 KB / 1.0 KB",
+        renderProgress(&buf, 1024, 1024, 8, 0),
+    );
+}
+
+test "renderProgress fills a partial cell rather than jumping" {
+    const prev = ui.isEnabled();
+    defer ui.setEnabled(prev);
+    ui.setEnabled(false);
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "█▌░░░░░░   18%  192 B / 1.0 KB",
+        renderProgress(&buf, 192, 1024, 8, 0),
+    );
+}
+
+test "renderProgress never exceeds the bar or the total" {
+    const prev = ui.isEnabled();
+    defer ui.setEnabled(prev);
+    ui.setEnabled(false);
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "████████  100%  1.0 KB / 1.0 KB",
+        renderProgress(&buf, 4096, 1024, 8, 0),
+    );
+}
+
+test "renderProgress spins instead of inventing a denominator" {
+    const prev = ui.isEnabled();
+    defer ui.setEnabled(prev);
+    ui.setEnabled(false);
+
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("⠋ 512 B", renderProgress(&buf, 512, null, 8, 0));
+    try std.testing.expectEqualStrings("⠙ 1.0 KB", renderProgress(&buf, 1024, null, 8, 1));
+    try std.testing.expectEqualStrings("⠋ 512 B", renderProgress(&buf, 512, 0, 8, 0));
+    try std.testing.expectEqualStrings(
+        "⠋ 512 B",
+        renderProgress(&buf, 512, null, 8, spinner_frames.len),
+    );
+}
+
+test "the drawn line carries no escape codes when colour is off" {
+    const prev = ui.isEnabled();
+    defer ui.setEnabled(prev);
+    ui.setEnabled(false);
+
+    var buf: [512]u8 = undefined;
+    for ([_]?u64{ 1024, null }) |total| {
+        const line = renderProgress(&buf, 512, total, 8, 3);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, 0x1b) == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\r') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    }
+}
+
+test "the bar wears colour only when colour is on" {
+    const prev = ui.isEnabled();
+    defer ui.setEnabled(prev);
+    ui.setEnabled(true);
+
+    var buf: [512]u8 = undefined;
+    const line = renderProgress(&buf, 512, 1024, 8, 0);
+    try std.testing.expect(std.mem.indexOf(u8, line, ui.on(.green)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, ui.on(.dim)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "50%") != null);
+
+    const spun = renderProgress(&buf, 512, null, 8, 0);
+    try std.testing.expect(std.mem.indexOf(u8, spun, ui.on(.cyan)) != null);
+}
+
+test "nothing is painted when stdout is not a terminal" {
+    const prev_tty = ui.isTty();
+    const prev_color = ui.isEnabled();
+    defer ui.setTty(prev_tty);
+    defer ui.setEnabled(prev_color);
+    ui.setTty(false);
+    ui.setEnabled(false);
+
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var w = std.Io.Writer.Allocating.fromArrayList(alloc, &out);
+    defer out = w.toArrayList();
+
+    if (ui.isTty()) drawProgress(&w.writer, 512, 1024, 1);
+    var got_buf: [32]u8 = undefined;
+    try w.writer.print("{s}{s}{s} downloaded {s}\n", .{
+        ui.on(.green),
+        ui.check,
+        ui.off(),
+        humanBytes(1024, &got_buf),
+    });
+
+    try std.testing.expectEqualStrings("✓ downloaded 1.0 KB\n", w.written());
+}
+
+test "findAssetSize reads the size beside the download url" {
+    const body =
+        \\{"assets":[{"name":"sdt-macos-arm64","size":4194304,"browser_download_url":"https://x/bin"},
+        \\{"name":"sdt-linux-x64","size":0,"browser_download_url":"https://x/other"},
+        \\{"name":"sdt-macos-arm64.sha256","browser_download_url":"https://x/sum"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const assets = parsed.value.object.get("assets").?.array;
+
+    try std.testing.expectEqual(@as(?u64, 4 * 1024 * 1024), findAssetSize(assets, "sdt-macos-arm64"));
+    try std.testing.expectEqual(@as(?u64, null), findAssetSize(assets, "sdt-linux-x64"));
+    try std.testing.expectEqual(@as(?u64, null), findAssetSize(assets, "sdt-macos-arm64.sha256"));
+    try std.testing.expectEqual(@as(?u64, null), findAssetSize(assets, "nope"));
+}
+
 test "assetName matches current build target" {
     const got = assetName();
     switch (builtin.os.tag) {
@@ -338,10 +593,6 @@ test "assetName matches current build target" {
     var buf: [64]u8 = undefined;
     const want = try std.fmt.bufPrint(&buf, "sdt-{s}-{s}", .{ os, arch });
     try std.testing.expectEqualStrings(want, got.?);
-
-    var legacy_buf: [64]u8 = undefined;
-    const want_legacy = try std.fmt.bufPrint(&legacy_buf, "gr-{s}-{s}", .{ os, arch });
-    try std.testing.expectEqualStrings(want_legacy, legacyAssetName().?);
 }
 
 test "sha256Hex known vector" {
@@ -370,12 +621,7 @@ test "isUpToDate strips leading v" {
     try std.testing.expect(!isUpToDate("0.0.0", "v0.2.0"));
 }
 
-test "asset names follow the current binary, with a pre-rename fallback" {
+test "asset names follow the current binary" {
     const name = assetName() orelse return;
     try std.testing.expect(std.mem.startsWith(u8, name, "sdt-"));
-
-    const legacy = legacyAssetName() orelse return;
-    try std.testing.expect(std.mem.startsWith(u8, legacy, "gr-"));
-    // Same platform suffix on both, or an update would fetch the wrong binary.
-    try std.testing.expectEqualStrings(name["sdt-".len..], legacy["gr-".len..]);
 }

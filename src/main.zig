@@ -512,12 +512,11 @@ fn envOr(name: [:0]const u8, fallback: []const u8) []const u8 {
 }
 
 // Provenance is OFF by default: only recorded when a prompt/agent is explicitly
-// supplied (--prompt/--agent flag or SDT_PROMPT/SDT_AGENT env, or the older
-// GR_ spellings), and never when
+// supplied (--prompt/--agent flag or SDT_PROMPT/SDT_AGENT env), and never when
 // config `provenance` is a falsy kill-switch.
 fn recordProvenance(io: std.Io, alloc: std.mem.Allocator, s: *Store, change: Oid, rest: []const []const u8) void {
-    const prompt = envOr("SDT_PROMPT", envOr("GR_PROMPT", flagValue(rest, "--prompt", "--prompt")));
-    const agent = envOr("SDT_AGENT", envOr("GR_AGENT", flagValue(rest, "--agent", "--agent")));
+    const prompt = envOr("SDT_PROMPT", flagValue(rest, "--prompt", "--prompt"));
+    const agent = envOr("SDT_AGENT", flagValue(rest, "--agent", "--agent"));
     if (prompt.len == 0 and agent.len == 0) return;
     if (config.get(s, alloc, "provenance")) |maybe| {
         if (maybe) |v| {
@@ -552,7 +551,6 @@ fn openWorkFrom(io: std.Io, start: std.Io.Dir) !std.Io.Dir {
 
 fn isWorkRoot(io: std.Io, dir: std.Io.Dir) bool {
     if (dir.access(io, store.dir_name, .{})) |_| return true else |_| {}
-    if (dir.access(io, store.legacy_dir_name, .{})) |_| return true else |_| {}
     return false;
 }
 
@@ -2756,7 +2754,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     for (rest) |a| {
         if (eq(a, "--install") or eq(a, "--on")) {
             const exe = update.selfExePathAlloc(alloc) catch |e| {
-                try w.print("could not locate the gr binary: {s}\n", .{@errorName(e)});
+                try w.print("could not locate the sdt binary: {s}\n", .{@errorName(e)});
                 return 0;
             };
             defer alloc.free(exe);
@@ -2784,7 +2782,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             try w.print("{s}{s}{s} automatic grading is on for this repo\n", .{
                 ui.on(.green), ui.check, ui.off(),
             });
-            try ui.hint(w, "edits are captured and graded with no gr command and no resident process");
+            try ui.hint(w, "edits are captured and graded with no sdt command and no resident process");
             return 0;
         }
         if (eq(a, "--uninstall") or eq(a, "--off")) {
@@ -4158,7 +4156,7 @@ fn sendLink(
         ui.on(.bold),  url,      ui.off(),
     });
     try w.writeAll("upload that directory to any static host. it never receives the key:\n");
-    try ui.hint(w, "the key is after the '#', which browsers and gr never put in a request.");
+    try ui.hint(w, "the key is after the '#', which browsers and sdt never put in a request.");
 }
 
 fn sendViaRelay(
@@ -4260,7 +4258,7 @@ fn receiveCode(
     relay_port: u16,
 ) !void {
     const parsed = wormhole.Code.parse(code) catch {
-        try w.writeAll("that does not look like a gr code\n");
+        try w.writeAll("that does not look like an sdt code\n");
         return;
     };
 
@@ -4342,7 +4340,7 @@ fn reportHandshake(w: *std.Io.Writer, e: anyerror) !void {
         wormhole.Error.SlotBurned => {
             try w.writeAll("that code is used up. generate a fresh one with `sdt send`.\n");
         },
-        wormhole.Error.BadCode => try w.writeAll("that does not look like a gr code\n"),
+        wormhole.Error.BadCode => try w.writeAll("that does not look like an sdt code\n"),
         error.EndOfStream, error.ReadFailed, error.WriteFailed => {
             try w.writeAll("the peer hung up before the transfer, usually a mistyped code.\n");
             try ui.hint(w, "nothing was sent. run `sdt send` again for a fresh one.");
@@ -4391,11 +4389,11 @@ fn cloneShare(
         const decoder = std.base64.url_safe_no_pad.Decoder;
         const n = decoder.calcSizeForSlice(encoded) catch 0;
         if (n != share.key_len) {
-            try w.writeAll("that key does not look like a gr share key\n");
+            try w.writeAll("that key does not look like an sdt share key\n");
             return;
         }
         decoder.decode(&key, encoded) catch {
-            try w.writeAll("that key does not look like a gr share key\n");
+            try w.writeAll("that key does not look like an sdt share key\n");
             return;
         };
         share.readBundle(&s, alloc, io, key, source[0..cut]) catch |e| {
@@ -4419,7 +4417,7 @@ fn cloneShare(
 
 fn sealUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: sdt seal <path>       start sealing a file (creates .grsealed)
+        \\usage: sdt seal <path>       start sealing a file (creates .sdtsealed)
         \\       sdt seal             re-seal every tracked path now
         \\       sdt seal status      show sealed paths and who can read them
         \\       sdt unseal           write the plaintext files back out
@@ -4513,7 +4511,7 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         if (rest.len < 3) return keyUsage(w);
         const name = rest[1];
         const public = seal.PublicId.decode(rest[2]) catch {
-            try w.writeAll("that does not look like a gr public key\n");
+            try w.writeAll("that does not look like an sdt public key\n");
             return;
         };
         var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;

@@ -171,7 +171,7 @@ pub fn tick(
     const io = store.io;
 
     const lock = (try tryLock(store)) orelse
-        return .{ .skipped = "another gr process is already grading" };
+        return .{ .skipped = "another sdt process is already grading" };
     defer lock.release();
 
     // Stamp before the work, not after: a tick that takes two minutes must not
@@ -337,6 +337,18 @@ pub fn agentPlistPath(alloc: std.mem.Allocator, label: []const u8) !?[]u8 {
     return path;
 }
 
+/// launchd starts a job with a bare PATH, so a check that lives anywhere a
+/// developer actually installs tools is not found and the run reads exit 127.
+/// Capturing the installing shell's PATH is what makes the background grader
+/// agree with the foreground one.
+fn installPath() []const u8 {
+    if (std.c.getenv("PATH")) |p| {
+        const v = std.mem.span(p);
+        if (v.len != 0) return v;
+    }
+    return "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+}
+
 /// The agent. `WatchPaths` is the whole trick: launchd watches the worktree and
 /// starts this job when it changes, so superdetermine has no process between changes.
 /// `ThrottleInterval` is the debounce, and the job is not `KeepAlive`, so it
@@ -361,6 +373,8 @@ pub fn agentPlist(
         \\    <string>--once</string>
         \\  </array>
         \\  <key>WorkingDirectory</key><string>{s}</string>
+        \\  <key>EnvironmentVariables</key>
+        \\  <dict><key>PATH</key><string>{s}</string></dict>
         \\  <key>WatchPaths</key>
         \\  <array><string>{s}</string></array>
         \\  <key>ThrottleInterval</key><integer>{d}</integer>
@@ -371,7 +385,7 @@ pub fn agentPlist(
         \\</dict>
         \\</plist>
         \\
-    , .{ label, gr_abs, repo_abs, repo_abs, @divTrunc(set.min_interval_ms, 1000) });
+    , .{ label, gr_abs, repo_abs, installPath(), repo_abs, @divTrunc(set.min_interval_ms, 1000) });
 }
 
 pub const AgentStatus = enum { unsupported, not_installed, installed };
@@ -397,7 +411,7 @@ pub fn selfTest(io: std.Io, alloc: std.mem.Allocator, deadline_ms: u32) bool {
     if (builtin.os.tag != .macos) return false;
 
     const home = std.c.getenv("HOME") orelse return false;
-    const dir = std.fmt.allocPrint(alloc, "{s}/.gr-watchpath-selftest", .{std.mem.span(home)}) catch return false;
+    const dir = std.fmt.allocPrint(alloc, "{s}/.sdt-watchpath-selftest", .{std.mem.span(home)}) catch return false;
     defer alloc.free(dir);
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
@@ -604,10 +618,15 @@ test "agent labels are stable per repo and differ across repos" {
 
 test "the plist watches the worktree and does not stay resident" {
     const alloc = testing.allocator;
-    const body = try agentPlist(alloc, "dev.superdetermine.grade.abc", "/usr/local/bin/gr", "/Users/x/repo", .{});
+    const body = try agentPlist(alloc, "dev.superdetermine.grade.abc", "/usr/local/bin/sdt", "/Users/x/repo", .{});
     defer alloc.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "<key>WatchPaths</key>") != null);
+    // launchd hands a job a bare PATH, so a check outside /usr/bin would read
+    // exit 127 in the background and green in the foreground.
+    try testing.expect(std.mem.indexOf(u8, body, "<key>EnvironmentVariables</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "<key>PATH</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "/usr/bin") != null);
     try testing.expect(std.mem.indexOf(u8, body, "/Users/x/repo") != null);
     try testing.expect(std.mem.indexOf(u8, body, "--once") != null);
     // Not KeepAlive and not RunAtLoad: the job exists only to run and exit.

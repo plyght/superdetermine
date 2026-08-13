@@ -251,7 +251,7 @@ test "switching never removes an untracked file" {
 
     try wt.createDirPath(io, "scratch");
     try wt.writeFile(io, .{ .sub_path = "scratch/notes.txt", .data = "mine" });
-    try wt.writeFile(io, .{ .sub_path = ".grignore", .data = "scratch/\n" });
+    try wt.writeFile(io, .{ .sub_path = ".sdtignore", .data = "scratch/\n" });
     try wt.writeFile(io, .{ .sub_path = "untracked.txt", .data = "never saved" });
 
     try switchTo(&s, wt, "main");
