@@ -136,7 +136,7 @@ const sections = [_]Section{
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
         .{ .name = "export", .args = "<repo> [--force]", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
-        .{ .name = "push", .alias = "ps", .args = "[remote] [branch]", .desc = "uses your existing git credentials" },
+        .{ .name = "push", .alias = "ps", .args = "[remote] [branch] [--require-green]", .desc = "uses your existing git credentials" },
         .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
     } },
@@ -1501,13 +1501,73 @@ fn doSave(io: std.Io, alloc: std.mem.Allocator, s: *Store, message: []const u8) 
 }
 
 // Opt-in dual-write: only when the folder is ALREADY a git repo AND config
+fn configTruthy(s: *Store, alloc: std.mem.Allocator, key: []const u8) bool {
+    const v = (config.get(s, alloc, key) catch return false) orelse return false;
+    defer alloc.free(v);
+    return eq(v, "true") or eq(v, "1") or eq(v, "yes") or eq(v, "on");
+}
+
+/// The gate: a red or ungraded tree does not leave this machine. A hollow green
+/// passes and says so, because the warrant labels and never blocks.
+fn gateOnGreen(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s: *Store) !bool {
+    const set = checks.settings(s, alloc);
+    defer set.deinit(alloc);
+    if (!set.enabled or !(set.has(.full) or set.has(.fast))) {
+        try w.print("{s}{s}{s} no check configured, so nothing can be verified\n", .{
+            ui.on(.red), ui.cross, ui.off(),
+        });
+        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`, or pass `--no-require-green`");
+        return false;
+    }
+
+    const all = try moment.readAll(s, alloc);
+    defer moment.freeMoments(alloc, all);
+    if (all.len == 0) {
+        try w.print("{s}{s}{s} nothing has been captured, so nothing has been graded\n", .{
+            ui.on(.red), ui.cross, ui.off(),
+        });
+        try ui.hint(w, "`sdt grade` grades the tree you have now");
+        return false;
+    }
+
+    const head = all[all.len - 1];
+    var ix = try verdict.Index.load(s, alloc);
+    defer ix.deinit();
+    const v = ix.best(
+        head.full_tree,
+        verdict.commandHash(set.command(.fast)),
+        verdict.commandHash(set.command(.full)),
+    ) orelse {
+        try w.print("{s}{s}{s} this tree has never been graded\n", .{
+            ui.on(.red), ui.cross, ui.off(),
+        });
+        try ui.hint(w, "`sdt grade` grades it; `sdt green` rewinds to the last state that passed");
+        return false;
+    };
+
+    if (v.result != .green) {
+        var id_buf: [16]u8 = undefined;
+        try w.print("{s}{s}{s} this tree graded {s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), v.result.label(),
+        });
+        try warrant.render(w, head.shortId(&id_buf), v);
+        try ui.hint(w, "`sdt green` rewinds to the last state that passed");
+        return false;
+    }
+
+    var id_buf: [16]u8 = undefined;
+    try warrant.render(w, head.shortId(&id_buf), v);
+    if (v.isHollow()) {
+        try ui.hint(w, "green, but the warrant says this green proves little; pushing anyway");
+    }
+    _ = io;
+    return true;
+}
+
 // `sync.git` is enabled, mirror this save into the colocated `.git`. Best-effort.
 fn maybeSyncGit(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
     std.Io.Dir.cwd().access(io, ".git", .{}) catch return;
-    const v = (config.get(s, alloc, "sync.git") catch return) orelse return;
-    defer alloc.free(v);
-    const on = eq(v, "true") or eq(v, "1") or eq(v, "yes") or eq(v, "on");
-    if (!on) return;
+    if (!configTruthy(s, alloc, "sync.git")) return;
     sync_blocked = false;
     git.syncColocated(s, ".") catch |e| {
         if (e == git.Error.NotFastForward) sync_blocked = true;
@@ -3437,6 +3497,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     // Positional args are remote then branch; -f/--force is a flag anywhere.
     var force = false;
     var verbose = false;
+    var require_green = configTruthy(&s, alloc, "push.require_green");
     var pos: [2][]const u8 = undefined;
     var np: usize = 0;
     for (rest) |a| {
@@ -3444,6 +3505,10 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             force = true;
         } else if (eq(a, "-v") or eq(a, "--verbose")) {
             verbose = true;
+        } else if (eq(a, "--require-green")) {
+            require_green = true;
+        } else if (eq(a, "--no-require-green")) {
+            require_green = false;
         } else if (a.len != 0 and a[0] == '-') {
             try w.print("unknown option '{s}'\n", .{a});
             return;
@@ -3452,6 +3517,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             np += 1;
         }
     }
+    if (require_green and !(try gateOnGreen(io, alloc, w, &s))) return;
     const remote_name = if (np >= 1) pos[0] else "origin";
     const url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
         try w.print("unknown remote '{s}'. pass a URL, or set it in git or `sdt config remote.{s}.url`\n", .{ remote_name, remote_name });
