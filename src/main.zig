@@ -370,7 +370,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (eq(cmd, "moments")) {
         try cmdMoments(io, alloc, w, rest);
     } else if (eq(cmd, "grade")) {
-        try cmdGrade(io, alloc, w, rest);
+        const code = try cmdGrade(io, alloc, w, rest);
+        if (code != 0) {
+            try w.flush();
+            std.process.exit(code);
+        }
     } else if (eq(cmd, "doctor")) {
         try cmdDoctor(io, alloc, w);
     } else if (eq(cmd, "rewind")) {
@@ -1470,7 +1474,7 @@ fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         ui.on(.yellow), shortHex(change, &buf), ui.off(),
         ui.on(.cyan),   branch,                 ui.off(),
     });
-    if (sync_blocked) try reportNotFastForward(w, git.at_risk.branch());
+    if (sync_blocked) try reportNotFastForward(w, git.at_risk.branch(), "sdt sync . --force");
 }
 
 // Snapshot the working tree and log the op. Shared by save and auto-save.
@@ -2635,8 +2639,8 @@ fn cmdGreen(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     try rewindTo(io, alloc, w, "@green", false, null);
 }
 
-fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    var s = (try openRepo(io, alloc, w)) orelse return;
+fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !u8 {
+    var s = (try openRepo(io, alloc, w)) orelse return 0;
     defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);
@@ -2648,11 +2652,14 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     var git_repo: []const u8 = "";
     var ref_tier: verdict.Tier = .full;
     var ref_json = false;
+    var automated = false;
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
         const a = rest[i];
         if (eq(a, "--json")) {
             ref_json = true;
+        } else if (eq(a, "--once")) {
+            automated = true;
         } else if (eq(a, "--fast")) {
             ref_tier = .fast;
         } else if (eq(a, "--full")) {
@@ -2665,7 +2672,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         }
     }
     if (git_ref.len != 0 or git_repo.len != 0) {
-        try cmdGradeRef(
+        return cmdGradeRef(
             alloc,
             w,
             &s,
@@ -2675,14 +2682,13 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             ref_tier,
             ref_json,
         );
-        return;
     }
 
     for (rest) |a| {
         if (eq(a, "--install") or eq(a, "--on")) {
             const exe = update.selfExePathAlloc(alloc) catch |e| {
                 try w.print("could not locate the gr binary: {s}\n", .{@errorName(e)});
-                return;
+                return 0;
             };
             defer alloc.free(exe);
 
@@ -2695,7 +2701,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
                 try w.print("{s}no{s}\n", .{ ui.on(.yellow), ui.off() });
                 try w.writeAll("automatic grading is not available here\n");
                 try ui.hint(w, "run `sdt watch` in a terminal instead; it does the same work");
-                return;
+                return 0;
             }
             try w.print("{s}yes{s}\n", .{ ui.on(.green), ui.off() });
 
@@ -2704,18 +2710,18 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
                     ui.on(.red), ui.cross, ui.off(), @errorName(e),
                 });
                 try ui.hint(w, "`sdt watch` does the same work in the foreground");
-                return;
+                return 0;
             };
             try w.print("{s}{s}{s} automatic grading is on for this repo\n", .{
                 ui.on(.green), ui.check, ui.off(),
             });
             try ui.hint(w, "edits are captured and graded with no gr command and no resident process");
-            return;
+            return 0;
         }
         if (eq(a, "--uninstall") or eq(a, "--off")) {
             sched.uninstall(io, alloc, repo_abs) catch {};
             try w.writeAll("automatic grading off; `sdt grade` still works by hand\n");
-            return;
+            return 0;
         }
     }
 
@@ -2732,10 +2738,49 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     const ctx = gradeContext(alloc, &s, work, set, rules);
     const r = try sched.tick(&s, work, ctx, momentSettings(&s, alloc), sched.settings(&s, alloc));
 
+    const tier: verdict.Tier = if (set.has(.full)) .full else .fast;
+    const inputs = try grade.currentInputs(ctx);
+    defer inputs.deinit(alloc);
+    var report = grade.Report{
+        .status = .ungraded,
+        .tier = tier,
+        .ran = r.graded,
+        .captured = r.captured,
+        .cut = r.cut,
+        .boundary = r.boundary,
+        .skipped = r.skipped,
+    };
+    defer report.deinit(alloc);
+    if (!set.enabled or !set.has(tier)) {
+        report.status = .no_check;
+    } else if (r.skipped == null) {
+        const all = try moment.readAll(&s, alloc);
+        defer moment.freeMoments(alloc, all);
+        if (all.len != 0) {
+            const head = all[all.len - 1];
+            var ix = try verdict.Index.load(&s, alloc);
+            defer ix.deinit();
+            if (ix.get(.{
+                .tree = head.full_tree,
+                .tier = tier,
+                .command = verdict.commandHash(set.command(tier)),
+            })) |v| {
+                report.v = v;
+                report.status = grade.statusOf(v);
+            }
+            report.miss = grade.missReason(ctx, head.full_tree, tier, inputs) catch null;
+        }
+    }
+
+    if (ref_json) {
+        try report.writeJson(w);
+        return if (automated) 0 else report.exitCode();
+    }
+
     if (r.skipped) |why| {
         if (r.captured) try w.writeAll("captured a moment\n");
         try w.print("{s}skipped: {s}{s}\n", .{ ui.on(.dim), why, ui.off() });
-        return;
+        return if (automated) 0 else report.exitCode();
     }
     if (r.captured) try w.writeAll("captured a moment\n");
     if (!set.enabled) {
@@ -2743,7 +2788,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             try ui.hint(w, "no check configured, so nothing was graded");
             try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
         }
-        return;
+        return if (automated) 0 else report.exitCode();
     }
     if (r.cut) try w.print("{s}{s}{s} cut a verified change at the green boundary\n", .{
         ui.on(.green), ui.check, ui.off(),
@@ -2759,6 +2804,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         });
         try ui.hint(w, "`sdt green` rewinds to the last state that worked");
     }
+    return if (automated) 0 else report.exitCode();
 }
 
 fn cmdGradeRef(
@@ -2770,7 +2816,7 @@ fn cmdGradeRef(
     git_repo: []const u8,
     tier: verdict.Tier,
     as_json: bool,
-) !void {
+) !u8 {
     const shown = if (git_ref.len != 0) git_ref else "HEAD";
 
     const set = checks.settings(s, alloc);
@@ -2780,7 +2826,7 @@ fn cmdGradeRef(
             ui.on(.red), ui.cross, ui.off(), tier.label(),
         });
         try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
-        return;
+        return grade.exit_no_check;
     }
 
     const change_oid = git.importRefChange(
@@ -2794,7 +2840,7 @@ fn cmdGradeRef(
             git_repo,     @errorName(e),
         });
         try ui.hint(w, "pass `--repo <path>` for a git repo other than this one");
-        return;
+        return grade.exit_ungraded;
     };
 
     const rules = warrant.pathRules(s, alloc);
@@ -2822,10 +2868,13 @@ fn cmdGradeRef(
         try w.print(",\"independence\":\"{s}\",\"relevance_hit\":{d},\"relevance_total\":{d}", .{
             v.independence.label(), v.relevance_hit, v.relevance_total,
         });
-        try w.print(",\"discrimination\":\"{s}\",\"hollow\":{s}}}\n", .{
+        try w.print(",\"discrimination\":\"{s}\",\"hollow\":{s}", .{
             v.discrimination.label(), if (v.isHollow()) "true" else "false",
         });
-        return;
+        try w.print(",\"status\":\"{s}\",\"outcome\":\"{s}\"}}\n", .{
+            @tagName(grade.statusOf(v)), v.outcome.label(),
+        });
+        return (grade.Report{ .status = grade.statusOf(v), .v = v, .tier = tier, .ran = 1 }).exitCode();
     }
 
     const colour: ui.Color = if (v.result == .green) .green else .red;
@@ -2843,6 +2892,7 @@ fn cmdGradeRef(
     } else if (v.independence == .unknown and v.discrimination == .unknown) {
         try ui.hint(w, "no attribution for these commits, so the warrant is unknown rather than clean");
     }
+    return (grade.Report{ .status = grade.statusOf(v), .v = v, .tier = tier, .ran = 1 }).exitCode();
 }
 
 fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -3182,22 +3232,34 @@ const GitOp = enum { import, export_, sync };
 fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8, op: GitOp) !void {
     var force = false;
     var target_opt: ?[]const u8 = null;
-    for (rest) |a| {
+    var branch_opt: ?[]const u8 = null;
+    var gi: usize = 0;
+    while (gi < rest.len) : (gi += 1) {
+        const a = rest[gi];
         if (eq(a, "-f") or eq(a, "--force")) {
             force = true;
+        } else if (eq(a, "--branch")) {
+            gi += 1;
+            if (gi < rest.len) branch_opt = rest[gi];
         } else if (a.len != 0 and a[0] == '-') {
             try w.print("unknown option '{s}'\n", .{a});
             return;
         } else if (target_opt == null) {
             target_opt = a;
+        } else if (branch_opt == null) {
+            branch_opt = a;
         }
     }
     const target = target_opt orelse {
-        try w.writeAll("usage: sdt <import|export|sync> <path> [--force]\n");
+        try w.writeAll("usage: sdt <import|export|sync> <path> [branch] [--force]\n");
         return;
     };
     if (force and op == .import) {
         try w.writeAll("--force applies to export and sync, not import\n");
+        return;
+    }
+    if (branch_opt != null and op == .import) {
+        try w.writeAll("a branch argument applies to export and sync, not import\n");
         return;
     }
     var s = (try openRepo(io, alloc, w)) orelse return;
@@ -3230,25 +3292,42 @@ fn cmdGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
                 try ui.hint(w, "`sdt super` lists them; `sdt collapse <path> <A|B>` picks one");
                 return;
             }
-            git.exportAllForced(&s, target, force) catch |e| {
-                if (e == git.Error.NotFastForward) {
-                    try reportNotFastForward(w, git.at_risk.branch());
+            if (branch_opt) |b| {
+                git.exportHeadToForced(&s, target, b, force) catch |e| {
+                    if (e == git.Error.NotFastForward) {
+                        try reportNotFastForward(w, git.at_risk.branch(), "sdt export <path> --force");
+                        return;
+                    }
+                    try w.writeAll("git export failed\n");
+                    try reportGitError(w);
                     return;
+                };
+                if (force) {
+                    try w.print("exported superdetermine HEAD to git branch {s} at {s}, replacing what was there\n", .{ b, target });
+                } else {
+                    try w.print("exported superdetermine HEAD to git branch {s} at {s}\n", .{ b, target });
                 }
-                try w.writeAll("git export failed\n");
-                try reportGitError(w);
-                return;
-            };
-            if (force) {
-                try w.print("exported superdetermine (full history, all branches + tags) to git at {s}, replacing what was there\n", .{target});
             } else {
-                try w.print("exported superdetermine (full history, all branches + tags) to git at {s}\n", .{target});
+                git.exportAllForced(&s, target, force) catch |e| {
+                    if (e == git.Error.NotFastForward) {
+                        try reportNotFastForward(w, git.at_risk.branch(), "sdt export <path> --force");
+                        return;
+                    }
+                    try w.writeAll("git export failed\n");
+                    try reportGitError(w);
+                    return;
+                };
+                if (force) {
+                    try w.print("exported superdetermine (full history, all branches + tags) to git at {s}, replacing what was there\n", .{target});
+                } else {
+                    try w.print("exported superdetermine (full history, all branches + tags) to git at {s}\n", .{target});
+                }
             }
         },
         .sync => {
-            git.syncColocatedForced(&s, target, null, force) catch |e| {
+            git.syncColocatedForced(&s, target, branch_opt, force) catch |e| {
                 if (e == git.Error.NotFastForward) {
-                    try reportNotFastForward(w, git.at_risk.branch());
+                    try reportNotFastForward(w, git.at_risk.branch(), "sdt sync <path> --force");
                     return;
                 }
                 try w.writeAll("sync failed\n");
@@ -3334,7 +3413,7 @@ fn reportGitError(w: *std.Io.Writer) !void {
 }
 
 // Name the commits that would have been dropped. The branch is left untouched.
-fn reportNotFastForward(w: *std.Io.Writer, branch: []const u8) !void {
+fn reportNotFastForward(w: *std.Io.Writer, branch: []const u8, remedy: []const u8) !void {
     const r = &git.at_risk;
     try w.print("{s}{s}{s} refusing to move {s}{s}{s} in .git: {d} commit{s} there {s} not in superdetermine\n", .{
         ui.on(.red),  ui.cross,                      ui.off(),
@@ -3347,7 +3426,7 @@ fn reportNotFastForward(w: *std.Io.Writer, branch: []const u8) !void {
         try w.print("  {s}{s}{s}  {s}\n", .{ ui.on(.cyan), id[0..12], ui.off(), r.subject(i) });
     }
     if (r.total > r.shown) try w.print("  {s}... and {d} more{s}\n", .{ ui.on(.dim), r.total - r.shown, ui.off() });
-    try ui.hint(w, "`sdt pull` brings them in; `sdt push --force` drops them on purpose");
+    try w.print("  {s}hint:{s} `sdt pull` brings them in; `{s}` drops them on purpose\n", .{ ui.on(.dim), ui.off(), remedy });
 }
 
 fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -3392,7 +3471,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         const before = git.branchTipHex(&s, ".", branch);
         git.syncColocatedForced(&s, ".", branch, force) catch |e| {
             if (e == git.Error.NotFastForward) {
-                try reportNotFastForward(w, branch);
+                try reportNotFastForward(w, branch, "sdt push --force");
             } else {
                 try w.print("cannot mirror the saved states onto {s} in .git, so nothing was pushed\n", .{branch});
                 try reportGitError(w);
@@ -3412,7 +3491,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     } else {
         git.pushRemote(&s, url, branch) catch |e| {
             if (e == git.Error.NotFastForward) {
-                try reportNotFastForward(w, branch);
+                try reportNotFastForward(w, branch, "sdt push --force");
             } else {
                 try w.print("push to {s} failed (auth? or check the URL)\n", .{remote_name});
                 try reportGitError(w);
