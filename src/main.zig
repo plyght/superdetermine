@@ -3755,9 +3755,16 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     // succeeds and reports success while leaving every save behind. Otherwise
     // synthesize a history in the mirror and push that.
     const colocated = if (std.Io.Dir.cwd().access(io, ".git", .{})) |_| true else |_| false;
+    // A first push of a long history mirrors every file of every saved state and
+    // then packs and uploads all of it, which can run for minutes. Report it, so
+    // work in progress never reads as a hang.
+    var progress = git.Progress.init(io, w);
+    git.live_progress = &progress;
+    defer git.live_progress = null;
     if (colocated) {
         const before = git.branchTipHex(&s, ".", branch);
         git.syncColocatedForced(&s, ".", branch, force) catch |e| {
+            progress.finish();
             if (e == git.Error.NotFastForward) {
                 try reportNotFastForward(w, branch, "sdt push --force");
             } else {
@@ -3768,16 +3775,19 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         };
         const after = git.branchTipHex(&s, ".", branch);
         git.pushColocated(&s, ".", url, branch, force) catch {
+            progress.finish();
             try w.print("push to {s} failed (diverged? try `sdt push --force`; or auth/URL)\n", .{remote_name});
             try reportGitError(w);
             return;
         };
+        progress.finish();
         const moved = if (before) |b| if (after) |a| !eq(&b, &a) else false else after != null;
         if (moved) {
             if (after) |a| try w.print("mirrored {s} into .git at {s}\n", .{ branch, a[0..12] });
         }
     } else {
         git.pushRemote(&s, url, branch) catch |e| {
+            progress.finish();
             if (e == git.Error.NotFastForward) {
                 try reportNotFastForward(w, branch, "sdt push --force");
             } else {
@@ -3786,6 +3796,7 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             }
             return;
         };
+        progress.finish();
     }
     try w.print("pushed {s} → {s} ({s})\n", .{ branch, remote_name, url });
 }

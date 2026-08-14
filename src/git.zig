@@ -18,6 +18,19 @@ pub const Error = error{ GitError, NotFastForward };
 pub var lfs_unresolved: usize = 0;
 pub var lfs_uploaded: usize = 0;
 
+/// Live progress for the mirror-and-push path, set by a command that wants
+/// those steps to report themselves. Mirroring a long history walks every file
+/// of every saved state and the push that follows packs and uploads all of it,
+/// so without a row on screen a big first push is indistinguishable from a hang.
+pub var live_progress: ?*Progress = null;
+
+/// Tree entries walked, and blobs actually read and compressed, during the last
+/// export. They diverge exactly where the blob cache spared work: every saved
+/// state carries a full tree, so a file that never changed must cost one blob,
+/// not one per state.
+pub var exported_files: u64 = 0;
+pub var exported_blobs: u64 = 0;
+
 var init_done: bool = false;
 
 fn ensureInit() void {
@@ -194,6 +207,9 @@ pub const Phase = enum {
     resolving,
     checking_out,
     importing,
+    exporting,
+    packing,
+    sending,
 
     fn live(self: Phase) []const u8 {
         return switch (self) {
@@ -201,6 +217,9 @@ pub const Phase = enum {
             .resolving => "resolving deltas",
             .checking_out => "checking out",
             .importing => "importing history",
+            .exporting => "mirroring history",
+            .packing => "packing objects",
+            .sending => "sending objects",
         };
     }
 
@@ -210,6 +229,9 @@ pub const Phase = enum {
             .resolving => "resolved",
             .checking_out => "checked out",
             .importing => "imported",
+            .exporting => "mirrored",
+            .packing => "packed",
+            .sending => "sent",
         };
     }
 
@@ -219,6 +241,9 @@ pub const Phase = enum {
             .resolving => "deltas",
             .checking_out => "files",
             .importing => "changes",
+            .exporting => "files",
+            .packing => "objects",
+            .sending => "objects",
         };
     }
 };
@@ -298,6 +323,22 @@ fn transferProgressCb(stats: [*c]const c.git_indexer_progress, payload: ?*anyopa
     } else {
         p.update(.receiving, s.received_objects, total_objects);
     }
+    return 0;
+}
+
+/// Pack building during a push. Stage 0 is object counting, stage 1 is delta
+/// compression; both can run for minutes on a first push of a large history.
+fn packProgressCb(stage: c_int, current: u32, total: u32, payload: ?*anyopaque) callconv(.c) c_int {
+    _ = stage;
+    const p: *Progress = @ptrCast(@alignCast(payload orelse return 0));
+    p.update(.packing, current, if (total > 0) total else null);
+    return 0;
+}
+
+fn pushTransferProgressCb(current: c_uint, total: c_uint, bytes: usize, payload: ?*anyopaque) callconv(.c) c_int {
+    const p: *Progress = @ptrCast(@alignCast(payload orelse return 0));
+    p.bytes = bytes;
+    p.update(.sending, current, if (total > 0) total else null);
     return 0;
 }
 
@@ -930,9 +971,48 @@ fn splitAuthor(author: []const u8) struct { name: []const u8, email: []const u8 
     return .{ .name = if (author.len == 0) "superdetermine" else author, .email = "none@superdetermine" };
 }
 
+/// Git blobs already written during one export, keyed by the superdetermine blob
+/// they came from. Every saved state carries a FULL tree, so without this a file
+/// that never changed is re-read and re-compressed once per state: exporting a
+/// long history of a large tree turns quadratic and looks like a hang.
+const BlobCache = struct {
+    /// How the superdetermine blob was turned into git bytes. `plain` is the
+    /// content verbatim, `pointer` is content that already was an LFS pointer,
+    /// `cleaned` is content replaced by a pointer under the LFS rules of that
+    /// state. The last two are only reusable where the same rules still apply.
+    const Kind = enum { plain, pointer, cleaned };
+
+    const Entry = struct {
+        git_oid: c.git_oid,
+        kind: Kind,
+        lfs_oid_hex: [64]u8,
+        lfs_size: u64,
+    };
+
+    map: std.AutoHashMapUnmanaged([Oid.len]u8, Entry) = .{},
+
+    fn deinit(self: *BlobCache, alloc: std.mem.Allocator) void {
+        self.map.deinit(alloc);
+    }
+
+    fn get(self: *const BlobCache, blob: Oid) ?Entry {
+        return self.map.get(blob.bytes);
+    }
+
+    fn put(self: *BlobCache, alloc: std.mem.Allocator, blob: Oid, entry: Entry) !void {
+        try self.map.put(alloc, blob.bytes, entry);
+    }
+};
+
 /// Build a git tree object in `repo` from a superdetermine flat Tree, returning the
 /// looked-up git tree (caller frees). Reuses the nested ExportNode builder.
-fn buildGitTree(store: *Store, repo: ?*c.git_repository, tree: object.Tree, sess: ?*lfs.Session) !?*c.git_tree {
+fn buildGitTree(
+    store: *Store,
+    repo: ?*c.git_repository,
+    tree: object.Tree,
+    sess: ?*lfs.Session,
+    cache: ?*BlobCache,
+) !?*c.git_tree {
     const alloc = store.alloc;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -945,27 +1025,66 @@ fn buildGitTree(store: *Store, repo: ?*c.git_repository, tree: object.Tree, sess
     defer attrs.deinit();
 
     for (tree.entries) |e| {
-        const content = try store.readFileContent(e.blob);
-        defer alloc.free(content);
-
-        // Git LFS clean: a tracked path is committed to git as a pointer, with
-        // the real bytes landing in the destination repo's LFS cache (and queued
-        // for upload on push).
-        var pointer: ?[]u8 = null;
-        defer if (pointer) |p| alloc.free(p);
-        if (sess) |s| {
-            if (lfs.parsePointer(content)) |existing| {
-                s.markPending(&existing.oid_hex, existing.size) catch {};
-            } else if (attrs.isLfs(e.path)) {
-                const hex = try s.writeObject(content);
-                s.markPending(&hex, content.len) catch {};
-                pointer = try lfs.pointerForContent(alloc, content);
+        var blob_oid: c.git_oid = undefined;
+        var reused = false;
+        if (cache) |bc| {
+            if (bc.get(e.blob)) |hit| {
+                const usable = switch (hit.kind) {
+                    .plain => sess == null or !attrs.isLfs(e.path),
+                    .pointer => true,
+                    .cleaned => sess != null and attrs.isLfs(e.path),
+                };
+                if (usable) {
+                    if (sess) |s| {
+                        if (hit.kind != .plain) s.markPending(&hit.lfs_oid_hex, hit.lfs_size) catch {};
+                    }
+                    blob_oid = hit.git_oid;
+                    reused = true;
+                }
             }
         }
-        const payload: []const u8 = pointer orelse content;
 
-        var blob_oid: c.git_oid = undefined;
-        try check(c.git_blob_create_from_buffer(&blob_oid, repo, payload.ptr, payload.len));
+        if (!reused) {
+            const content = try store.readFileContent(e.blob);
+            defer alloc.free(content);
+
+            // Git LFS clean: a tracked path is committed to git as a pointer, with
+            // the real bytes landing in the destination repo's LFS cache (and queued
+            // for upload on push).
+            var pointer: ?[]u8 = null;
+            defer if (pointer) |p| alloc.free(p);
+            var kind: BlobCache.Kind = .plain;
+            var lfs_oid_hex: [64]u8 = [_]u8{0} ** 64;
+            var lfs_size: u64 = 0;
+            if (sess) |s| {
+                if (lfs.parsePointer(content)) |existing| {
+                    s.markPending(&existing.oid_hex, existing.size) catch {};
+                    kind = .pointer;
+                    lfs_oid_hex = existing.oid_hex;
+                    lfs_size = existing.size;
+                } else if (attrs.isLfs(e.path)) {
+                    const hex = try s.writeObject(content);
+                    s.markPending(&hex, content.len) catch {};
+                    pointer = try lfs.pointerForContent(alloc, content);
+                    kind = .cleaned;
+                    lfs_oid_hex = hex;
+                    lfs_size = content.len;
+                }
+            }
+            const payload: []const u8 = pointer orelse content;
+
+            try check(c.git_blob_create_from_buffer(&blob_oid, repo, payload.ptr, payload.len));
+            exported_blobs += 1;
+            if (cache) |bc| try bc.put(alloc, e.blob, .{
+                .git_oid = blob_oid,
+                .kind = kind,
+                .lfs_oid_hex = lfs_oid_hex,
+                .lfs_size = lfs_size,
+            });
+        }
+
+        exported_files += 1;
+        if (live_progress) |p| p.update(.exporting, exported_files, null);
 
         var cur = root;
         var comp_it = std.mem.splitScalar(u8, e.path, '/');
@@ -1009,7 +1128,7 @@ fn collectChain(store: *Store, o: Oid, out: *std.ArrayList(Oid), seen: *std.Stri
 /// Reuses the mapped git commit if it still exists in `repo`. Root changes (no
 /// gr parents) chain onto `graft` if provided (used to fast-forward onto an
 /// existing branch tip). Returns the git commit id and records it in the map.
-fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session, fresh: bool) !c.git_oid {
+fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session, cache: ?*BlobCache, fresh: bool) !c.git_oid {
     if (!fresh) {
         if (map.lookupGit(gr)) |existing| {
             var commit: ?*c.git_commit = null;
@@ -1026,7 +1145,7 @@ fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, 
     const tree = try store.readTree(change.tree);
     defer object.freeTree(alloc, tree);
 
-    const git_tree = try buildGitTree(store, repo, tree, sess);
+    const git_tree = try buildGitTree(store, repo, tree, sess, cache);
     defer c.git_tree_free(git_tree);
 
     const parsed = splitAuthor(change.author);
@@ -1085,8 +1204,10 @@ fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, 
         seen.deinit(alloc);
     }
     try collectChain(store, tip, &out, &seen, alloc);
+    var cache: BlobCache = .{};
+    defer cache.deinit(alloc);
     var last: c.git_oid = undefined;
-    for (out.items) |o| last = try exportChange(store, repo, map, o, graft, sess, fresh);
+    for (out.items) |o| last = try exportChange(store, repo, map, o, graft, sess, &cache, fresh);
     return last;
 }
 
@@ -1155,6 +1276,8 @@ pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?
 /// git-side commits I was just shown".
 pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
     ensureInit();
+    exported_files = 0;
+    exported_blobs = 0;
     const alloc = store.alloc;
 
     const branch = try store.headBranch();
@@ -1205,6 +1328,8 @@ pub fn exportAll(store: *Store, dest_git_repo_path: []const u8) !void {
 
 pub fn exportAllForced(store: *Store, dest_git_repo_path: []const u8, force: bool) !void {
     ensureInit();
+    exported_files = 0;
+    exported_blobs = 0;
     const alloc = store.alloc;
 
     const path_z = try alloc.dupeZ(u8, dest_git_repo_path);
@@ -1294,6 +1419,8 @@ pub fn exportAllForced(store: *Store, dest_git_repo_path: []const u8, force: boo
 /// existing remote does not rewrite or replay entire gr history there.
 fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, sess: ?*lfs.Session) !void {
     ensureInit();
+    exported_files = 0;
+    exported_blobs = 0;
     const alloc = store.alloc;
 
     const branch = try store.headBranch();
@@ -1316,7 +1443,7 @@ fn exportTipOnto(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]c
     const target = try resolveTargetBranch(store, repo, git_branch, branch);
     defer alloc.free(target);
 
-    const git_tree = try buildGitTree(store, repo, tree, sess);
+    const git_tree = try buildGitTree(store, repo, tree, sess, null);
     defer c.git_tree_free(git_tree);
 
     const parsed = splitAuthor(change.author);
@@ -1485,6 +1612,22 @@ fn uploadLfsForBranch(
     return session.uploadObjects(reqs.items) catch 0;
 }
 
+/// Push `refspec` from the git repo at `repo_path` with the git CLI.
+///
+/// libgit2 builds the whole pack with the connection to the remote already
+/// open, so a first push of a long history can spend minutes on delta
+/// compression without writing a byte; the remote gives up and the push dies
+/// with a bare transport error where `git push` of the very same refspec
+/// succeeds. git streams the pack as it builds it, and brings the user's
+/// credential helper with it, so it is the fallback for exactly that case.
+/// stderr is inherited, so git's own progress and any refusal from the remote
+/// reach the terminal.
+fn pushViaGitCli(alloc: std.mem.Allocator, repo_path: []const u8, remote_url: []const u8, refspec: []const u8) !void {
+    const out = proc.capture(alloc, &.{ "git", "-C", repo_path, "push", remote_url, refspec }, "") catch return Error.GitError;
+    defer out.deinit(alloc);
+    if (!out.ok()) return Error.GitError;
+}
+
 /// Push superdetermine HEAD to an actual git remote (https/ssh/file://) via libgit2's
 /// smart protocol. Exports HEAD into the managed `.sdt/gitmirror` repo, then
 /// pushes `refspec` (default `refs/heads/<branch>:refs/heads/<branch>`) to
@@ -1543,8 +1686,19 @@ pub fn pushRemote(store: *Store, remote_url: []const u8, branch_opt: ?[]const u8
     var opts: c.git_push_options = undefined;
     try check(c.git_push_options_init(&opts, c.GIT_PUSH_OPTIONS_VERSION));
     opts.callbacks.credentials = credentialsCb;
+    // Auto-detect the thread count instead of compressing on one core, so the
+    // remote is not left waiting through a single-threaded delta search.
+    opts.pb_parallelism = 0;
+    if (live_progress) |p| {
+        opts.callbacks.pack_progress = packProgressCb;
+        opts.callbacks.push_transfer_progress = pushTransferProgressCb;
+        opts.callbacks.payload = @ptrCast(p);
+    }
 
-    try check(c.git_remote_push(remote, &strarr, &opts));
+    check(c.git_remote_push(remote, &strarr, &opts)) catch |e| {
+        if (live_progress) |p| p.finish();
+        pushViaGitCli(alloc, mirror_abs, remote_url, rs) catch return e;
+    };
 }
 
 /// Push a COLOCATED git repo's branch directly to a remote. Used when a `.git`
@@ -1581,7 +1735,18 @@ pub fn pushColocated(store: *Store, work_dir_path: []const u8, remote_url: []con
     var opts: c.git_push_options = undefined;
     try check(c.git_push_options_init(&opts, c.GIT_PUSH_OPTIONS_VERSION));
     opts.callbacks.credentials = credentialsCb;
-    try check(c.git_remote_push(remote, &strarr, &opts));
+    // Auto-detect the thread count instead of compressing on one core, so the
+    // remote is not left waiting through a single-threaded delta search.
+    opts.pb_parallelism = 0;
+    if (live_progress) |p| {
+        opts.callbacks.pack_progress = packProgressCb;
+        opts.callbacks.push_transfer_progress = pushTransferProgressCb;
+        opts.callbacks.payload = @ptrCast(p);
+    }
+    check(c.git_remote_push(remote, &strarr, &opts)) catch |e| {
+        if (live_progress) |p| p.finish();
+        pushViaGitCli(alloc, work_dir_path, remote_url, rs) catch return e;
+    };
 }
 
 /// Pull from an actual git remote (https/ssh/file://) into superdetermine. Fetches
@@ -2114,6 +2279,119 @@ test "pushRemote/pullRemote over file:// to a bare repo" {
     const ptree = try store2.readTree(pulled.tree);
     defer object.freeTree(alloc, ptree);
     try testing.expectEqual(@as(usize, 2), ptree.entries.len);
+}
+
+/// A store whose HEAD branch carries `states` saved changes over `files` paths,
+/// each state rewriting exactly one of them. Every state still records the FULL
+/// tree, which is what a naive export re-reads and re-compresses per state.
+fn buildStoreWithHistory(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    dir: std.Io.Dir,
+    files: usize,
+    states: usize,
+) !Store {
+    var store = try Store.init(io, alloc, dir);
+    errdefer store.deinit();
+
+    const entries = try alloc.alloc(object.TreeEntry, files);
+    defer {
+        for (entries) |e| alloc.free(e.path);
+        alloc.free(entries);
+    }
+    for (entries, 0..) |*e, i| {
+        const path = try std.fmt.allocPrint(alloc, "f{d}.txt", .{i});
+        errdefer alloc.free(path);
+        const body = try std.fmt.allocPrint(alloc, "file {d} v0\n", .{i});
+        defer alloc.free(body);
+        e.* = .{ .mode = .regular, .path = path, .blob = try store.writeFileContent(body) };
+    }
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+
+    var parent: [1]Oid = undefined;
+    var have_parent = false;
+    var n: usize = 0;
+    while (n < states) : (n += 1) {
+        if (n != 0) {
+            const i = n % files;
+            const body = try std.fmt.allocPrint(alloc, "file {d} v{d}\n", .{ i, n });
+            defer alloc.free(body);
+            entries[i].blob = try store.writeFileContent(body);
+        }
+        const sorted = try alloc.dupe(object.TreeEntry, entries);
+        defer alloc.free(sorted);
+        std.mem.sort(object.TreeEntry, sorted, {}, object.Tree.lessThan);
+        const tree_oid = try store.writeTree(.{ .entries = sorted });
+        const change_oid = try store.writeChange(.{
+            .tree = tree_oid,
+            .parents = if (have_parent) parent[0..1] else &[_]Oid{},
+            .change_id = [_]u8{@intCast(n)} ** 16,
+            .timestamp = 1_700_000_000 + @as(i64, @intCast(n)),
+            .tz_offset_min = 0,
+            .author = "Historian <historian@example.com>",
+            .message = "saved state\n",
+        });
+        parent[0] = change_oid;
+        have_parent = true;
+        try store.updateRef(branch, change_oid);
+    }
+    return store;
+}
+
+test "a first push of a history compresses each file once, not once per state" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The remote exists but is empty, as a just-created GitHub repo is: no refs
+    // to negotiate against, so the whole history goes over in one push.
+    try tmp.dir.createDirPath(io, "bare");
+    const bare_abs = try tmp.dir.realPathFileAlloc(io, "bare", alloc);
+    defer alloc.free(bare_abs);
+    const bare_z = try alloc.dupeZ(u8, bare_abs);
+    defer alloc.free(bare_z);
+    var bare_repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&bare_repo, bare_z.ptr, 1));
+    defer c.git_repository_free(bare_repo);
+
+    const url = try std.fmt.allocPrint(alloc, "file://{s}", .{bare_abs});
+    defer alloc.free(url);
+
+    // A git repo colocated with the store, as `sdt push` finds in a repo that
+    // was a git repo first.
+    try tmp.dir.createDirPath(io, "work");
+    const work_abs = try tmp.dir.realPathFileAlloc(io, "work", alloc);
+    defer alloc.free(work_abs);
+    const work_z = try alloc.dupeZ(u8, work_abs);
+    defer alloc.free(work_z);
+    var work_repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&work_repo, work_z.ptr, 0));
+    c.git_repository_free(work_repo);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithHistory(io, alloc, gr_dir, 6, 5);
+    defer store.deinit();
+
+    try syncColocatedForced(&store, work_abs, "master", false);
+
+    // 5 states x 6 files are walked, but only the 6 originals and the one file
+    // each later state rewrites are ever read and compressed.
+    try testing.expectEqual(@as(u64, 30), exported_files);
+    try testing.expectEqual(@as(u64, 10), exported_blobs);
+
+    try pushColocated(&store, work_abs, url, "master", false);
+
+    var check_repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&check_repo, bare_z.ptr));
+    defer c.git_repository_free(check_repo);
+    try testing.expectEqual(@as(usize, 5), try countCommitsFrom(check_repo, "refs/heads/master"));
 }
 
 test "cloneGit populates the superdetermine ref" {
