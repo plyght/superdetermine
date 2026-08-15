@@ -36,21 +36,42 @@ pub const Stats = struct {
 /// True when `spec` names `path` itself, a directory containing it, or a glob
 /// that covers it. Directory specs are the common case: `zig-out` and
 /// `zig-out/` both take everything beneath.
+///
+/// Matching follows `.gitignore`, because that is where these specs get copied
+/// from: a spec with no slash names a path component at any depth, so
+/// `node_modules` reaches a nested `bindings/typescript/node_modules` too. A
+/// leading `/` anchors to the repo root instead.
 pub fn matches(spec: []const u8, path: []const u8) bool {
     var s = spec;
     while (s.len != 0 and s[s.len - 1] == '/') s = s[0 .. s.len - 1];
+
+    var anchored = false;
+    if (s.len != 0 and s[0] == '/') {
+        anchored = true;
+        s = s[1..];
+    }
     if (s.len == 0) return false;
-    if (std.mem.eql(u8, s, path)) return true;
-    if (path.len > s.len and path[s.len] == '/' and std.mem.startsWith(u8, path, s)) return true;
-    if (std.mem.indexOfScalar(u8, s, '*') != null or std.mem.indexOfScalar(u8, s, '?') != null) {
-        if (std.mem.indexOfScalar(u8, s, '/') != null) {
-            if (ignore.matchPath(s, path)) return true;
-        } else {
-            var it = std.mem.splitScalar(u8, path, '/');
-            while (it.next()) |seg| {
-                if (ignore.matchSegment(s, seg)) return true;
-            }
+
+    if (!anchored and std.mem.indexOfScalar(u8, s, '/') == null) {
+        var it = std.mem.splitScalar(u8, path, '/');
+        while (it.next()) |seg| {
+            if (ignore.matchSegment(s, seg)) return true;
         }
+        return false;
+    }
+
+    // A slash-bearing spec names a path or any directory above it, so test the
+    // full path and every ancestor prefix of it.
+    var end: usize = 0;
+    while (end <= path.len) {
+        const prefix = path[0..end];
+        if (prefix.len != 0) {
+            if (std.mem.eql(u8, s, prefix)) return true;
+            if (ignore.matchPath(s, prefix)) return true;
+        }
+        if (end == path.len) break;
+        const next = std.mem.indexOfScalarPos(u8, path, end + 1, '/') orelse path.len;
+        end = next;
     }
     return false;
 }
@@ -269,11 +290,21 @@ test "matches names a path, a directory above it, and a glob" {
     try testing.expect(matches("a/b.txt", "a/b.txt"));
     try testing.expect(matches("*.dylib", "zig-out/lib/libevanescent.dylib"));
     try testing.expect(matches("bindings/*/target", "bindings/rust/target"));
+    try testing.expect(matches("bindings/rust/target", "bindings/rust/target/debug/app"));
+    try testing.expect(matches("bindings/*/target", "bindings/rust/target/debug/app"));
 
     try testing.expect(!matches("zig-out", "zig-outer/bin"));
-    try testing.expect(!matches("zig-out", "src/zig-out"));
     try testing.expect(!matches("*.dylib", "src/main.zig"));
     try testing.expect(!matches("", "anything"));
+    try testing.expect(!matches("/", "anything"));
+
+    // A slash-free spec reaches any depth, the way a .gitignore line does.
+    try testing.expect(matches("node_modules", "bindings/typescript/node_modules/.bin/tsc"));
+    try testing.expect(matches("zig-out", "src/zig-out/bin/et"));
+
+    // A leading slash pins it to the root instead.
+    try testing.expect(matches("/node_modules", "node_modules/x/y"));
+    try testing.expect(!matches("/node_modules", "bindings/typescript/node_modules/.bin/tsc"));
 }
 
 fn writeBlob(store: *Store, data: []const u8) !Oid {
