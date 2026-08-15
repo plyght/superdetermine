@@ -5,10 +5,44 @@ const oplog = @import("oplog.zig");
 const moment = @import("moment.zig");
 const opdag = @import("opdag.zig");
 const branches = @import("branches.zig");
+const config = @import("config.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
 const Marked = std.AutoHashMap([32]u8, void);
+
+pub const Settings = struct {
+    /// How long an operation keeps pinning the content it referenced, in
+    /// seconds. Past this, `gc` stops rooting from it and whatever a rewrite
+    /// abandoned that long ago becomes collectable.
+    ///
+    /// This is what bounds the store. The op-log and the operation DAG are
+    /// append-only, so rooting `gc` in all of them meant nothing a rewrite
+    /// orphaned could ever be reclaimed: a repo that committed its build
+    /// output once carried it forever, and `gc` would report kilobytes of
+    /// garbage against gigabytes on disk.
+    ///
+    /// Bounding this never risks committed work. Branch refs are marked
+    /// unconditionally below, so everything reachable from any branch survives
+    /// regardless of age; only states abandoned by amend/rebase/drop/squash
+    /// past the horizon go.
+    retain_s: i64 = 30 * 24 * 60 * 60,
+};
+
+pub fn settings(store: *Store, alloc: std.mem.Allocator) Settings {
+    var out: Settings = .{};
+    if (config.get(store, alloc, "gc.retain")) |maybe| {
+        if (maybe) |v| {
+            defer alloc.free(v);
+            out.retain_s = moment.parseDuration(v, out.retain_s);
+        }
+    } else |_| {}
+    return out;
+}
+
+fn nowSeconds(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1_000_000_000));
+}
 
 pub const Stats = struct {
     swept: usize,
@@ -79,9 +113,21 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
         for (records) |r| alloc.free(r.branch);
         alloc.free(records);
     }
+    const set = settings(store, alloc);
+    const cutoff = nowSeconds(io) - set.retain_s;
+
     for (records) |r| {
+        if (r.timestamp < cutoff) continue;
         try markObject(store, &marked, r.prev);
         try markObject(store, &marked, r.new);
+    }
+
+    // Expired moments only ever dropped out of the log during a capture, so a
+    // repo that stopped capturing kept being pinned by moments long past their
+    // retention. Retire them here too, or `gc` reports nothing to do while the
+    // moment log quietly holds the whole store open.
+    if (!dry_run) {
+        moment.trim(store, alloc, moment.settings(store, alloc)) catch {};
     }
 
     const captured = moment.reachableObjects(store, alloc) catch &[_]Oid{};
@@ -104,10 +150,15 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
         if ((try marked.getOrPut(o.bytes)).found_existing) continue;
         const op = opdag.readOperation(store, alloc, o) catch continue;
         defer opdag.freeOperation(alloc, op);
+        // Keep walking the whole DAG and keep every operation and view object,
+        // so `sdt undo` still has an intact spine to read. Those records are
+        // metadata and cost nothing. It is only the *content* an old operation
+        // points at that stops being pinned.
         for (op.parents) |p| try op_stack.append(alloc, p);
         _ = try marked.getOrPut(op.view.bytes);
         const view = opdag.readView(store, alloc, op.view) catch continue;
         defer view.deinit(alloc);
+        if (op.timestamp < cutoff) continue;
         for (view.refs) |r| {
             for (r.tips) |t| try markObject(store, &marked, t);
         }
@@ -176,6 +227,115 @@ pub fn run(store: *Store, alloc: std.mem.Allocator, out: *std.Io.Writer, dry_run
 // --- tests ---
 
 const testing = std.testing;
+
+/// Build a change that no branch points at, as a rewrite would leave behind,
+/// and log an operation for it at `ts`. Returns the change and its blob.
+fn orphanedByRewrite(store: *Store, ts: i64) !struct { change: Oid, blob: Oid } {
+    const blob = try store.writeFileContent("what a rewrite left behind");
+    const entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "abandoned.txt", .blob = blob },
+    };
+    const tree = try store.writeTree(.{ .entries = &entries });
+    const change = try store.writeChange(.{
+        .tree = tree,
+        .parents = &.{},
+        .change_id = [_]u8{9} ** 16,
+        .timestamp = ts,
+        .tz_offset_min = 0,
+        .author = "t",
+        .message = "abandoned",
+    });
+    try oplog.record(store, .{
+        .kind = .other,
+        .branch = "main",
+        .prev = Oid.zero(),
+        .new = change,
+        .timestamp = ts,
+    });
+    return .{ .change = change, .blob = blob };
+}
+
+fn commitOnMain(store: *Store) !Oid {
+    const blob = try store.writeFileContent("committed work, kept forever");
+    const entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "keep.txt", .blob = blob },
+    };
+    const tree = try store.writeTree(.{ .entries = &entries });
+    const change = try store.writeChange(.{
+        .tree = tree,
+        .parents = &.{},
+        .change_id = [_]u8{1} ** 16,
+        // Deliberately ancient: age must never decide the fate of history that
+        // a branch still points at.
+        .timestamp = 1,
+        .tz_offset_min = 0,
+        .author = "t",
+        .message = "keep",
+    });
+    try store.updateRef("main", change);
+    return blob;
+}
+
+test "an operation past the horizon stops pinning what it abandoned" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const kept = try commitOnMain(&store);
+    const old = try orphanedByRewrite(&store, 1); // 1970, far outside any horizon
+
+    _ = try collect(&store, alloc, false);
+
+    // The abandoned state goes...
+    try testing.expect(!store.has(old.change));
+    try testing.expect(!store.has(old.blob));
+    // ...but committed history survives, however old it is.
+    try testing.expect(store.has(kept));
+}
+
+test "an operation inside the horizon still pins what it abandoned" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const kept = try commitOnMain(&store);
+    const recent = try orphanedByRewrite(&store, nowSeconds(io) - 60);
+
+    _ = try collect(&store, alloc, false);
+
+    // Undo has to be able to reach it, so it stays.
+    try testing.expect(store.has(recent.change));
+    try testing.expect(store.has(recent.blob));
+    try testing.expect(store.has(kept));
+}
+
+test "gc.retain shortens the horizon" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try config.set(&store, "gc.retain", "1s");
+    try testing.expectEqual(@as(i64, 1), settings(&store, alloc).retain_s);
+
+    const kept = try commitOnMain(&store);
+    const old = try orphanedByRewrite(&store, nowSeconds(io) - 600);
+
+    _ = try collect(&store, alloc, false);
+    try testing.expect(!store.has(old.blob));
+    try testing.expect(store.has(kept));
+}
 
 test "gc sweeps orphans and keeps reachable objects" {
     const io = std.testing.io;

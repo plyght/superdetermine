@@ -34,7 +34,7 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
 | Three-way merge + resolve | Conflict markers, then `sdt resolve <file>` / `sdt resolve --abort`. |
 | Absorb | `sdt absorb` folds working edits into the changes they belong to. |
-| Garbage collection | `sdt gc` reclaims space from unreachable objects (`--dry-run` to preview). |
+| Garbage collection | `sdt gc` reclaims space from unreachable objects (`--dry-run` to preview). What a rewrite abandoned stays recoverable for `gc.retain` (default 30d) and is collected after; anything a branch points at is kept regardless of age. |
 | Purge a path | `sdt purge <path...>` erases a path from every change, so `sdt gc` can reclaim what a mistakenly committed build directory holds. |
 | Prompt provenance (opt-in) | Record which agent or prompt produced a change, stored in the repo. |
 | Per-line blame | `sdt blame <file>` shows per-line authorship, including agent/prompt. |

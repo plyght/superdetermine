@@ -733,10 +733,23 @@ pub fn trim(store: *Store, alloc: std.mem.Allocator, set: Settings) !void {
     if (all.len - want > set.max) want = all.len - set.max;
     if (want == 0) return;
 
+    if (want >= all.len) {
+        try applog.rewrite(store, log_path, "");
+        return;
+    }
+
     // Advance to the first keyframe at or after the tentative cut.
     var cut = want;
     while (cut < all.len and all[cut].kind != .keyframe) cut += 1;
-    if (cut == 0 or cut >= all.len) return;
+    if (cut == 0) return;
+
+    // No keyframe survives the cut. Giving up here is what let a short moment
+    // log pin the whole store forever: with a keyframe interval of 200, a repo
+    // under 200 moments has exactly one keyframe, at the very start, so every
+    // trim bailed out and nothing was ever reclaimable. Re-anchor instead — a
+    // delta cannot outlive the keyframe its chain rests on, so rebuild the
+    // survivors on a fresh one.
+    if (cut >= all.len) return reanchor(store, alloc, all[want..]);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
@@ -745,6 +758,68 @@ pub fn trim(store: *Store, alloc: std.mem.Allocator, set: Settings) !void {
         defer alloc.free(line);
         try out.appendSlice(alloc, line);
     }
+    try applog.rewrite(store, log_path, out.items);
+}
+
+/// Rewrite `survivors` so the first is a keyframe and the rest are deltas along
+/// the rebuilt chain. Each moment keeps its id, timestamp, cause and full_tree;
+/// only the representation changes, so nothing observable about a moment moves.
+fn reanchor(store: *Store, alloc: std.mem.Allocator, survivors: []const Moment) !void {
+    if (survivors.len == 0) {
+        try applog.rewrite(store, log_path, "");
+        return;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var prev_entries: ?[]object.TreeEntry = null;
+    defer if (prev_entries) |e| workspace.freeTreeEntries(alloc, e);
+    var prev_repr: Oid = Oid.zero();
+
+    for (survivors, 0..) |src, i| {
+        const entries = try entriesOf(store, src);
+        errdefer workspace.freeTreeEntries(alloc, entries);
+
+        var m = src;
+        const enc = try object.Tree.encode(.{ .entries = entries }, alloc);
+        defer alloc.free(enc);
+
+        if (i == 0) {
+            m.repr = try store.writeRaw(enc);
+            m.kind = .keyframe;
+        } else {
+            var removed: std.ArrayList([]const u8) = .empty;
+            defer removed.deinit(alloc);
+            var upserted: std.ArrayList(object.TreeEntry) = .empty;
+            defer upserted.deinit(alloc);
+            try diffEntries(alloc, prev_entries.?, entries, &removed, &upserted);
+
+            const d = Delta{
+                .base = prev_repr,
+                .removed = removed.items,
+                .upserted = upserted.items,
+            };
+            const d_enc = try d.encode(alloc);
+            defer alloc.free(d_enc);
+            if (d_enc.len >= enc.len) {
+                m.repr = try store.writeRaw(enc);
+                m.kind = .keyframe;
+            } else {
+                m.repr = try store.writeRaw(d_enc);
+                m.kind = .delta;
+            }
+        }
+
+        const line = try formatLine(alloc, m);
+        defer alloc.free(line);
+        try out.appendSlice(alloc, line);
+
+        if (prev_entries) |e| workspace.freeTreeEntries(alloc, e);
+        prev_entries = entries;
+        prev_repr = m.repr;
+    }
+
     try applog.rewrite(store, log_path, out.items);
 }
 
@@ -1043,6 +1118,114 @@ test "retention cuts only at a keyframe" {
     for (all) |m| {
         const got = try entriesOf(&store, m);
         workspace.freeTreeEntries(alloc, got);
+    }
+}
+
+test "a log whose only keyframe expires is re-anchored, not left un-trimmable" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    // A keyframe interval wider than the run, which is the ordinary case: the
+    // default is 200 and most repos never get that far. Only moment 0 is a
+    // keyframe, so every later one is a delta chained back to it.
+    const set = Settings{ .enabled = true, .keyframe_interval = 10_000, .max = 10_000 };
+    for (0..40) |i| {
+        const name = try std.fmt.allocPrint(alloc, "f{d}.txt", .{i});
+        defer alloc.free(name);
+        try work.writeFile(io, .{ .sub_path = name, .data = "contents" });
+        const r = try capture(&store, work, .poll, set);
+        if (r == .captured) alloc.free(r.captured.branch);
+    }
+
+    const before = try readAll(&store, alloc);
+    defer freeMoments(alloc, before);
+    try testing.expect(before.len > 1);
+    try testing.expectEqual(ReprKind.keyframe, before[0].kind);
+    // The premise: nothing after the first is a keyframe, so the old cut-only-
+    // at-a-keyframe search finds nothing and used to bail out entirely.
+    for (before[1..]) |m| try testing.expectEqual(ReprKind.delta, m.kind);
+
+    const want_last = before[before.len - 1];
+
+    // Expire everything but keep the cap generous, so `max` is not what cuts.
+    try trim(&store, alloc, .{ .enabled = true, .retain_s = 0, .max = 10_000 });
+
+    const after = try readAll(&store, alloc);
+    defer freeMoments(alloc, after);
+    try testing.expect(after.len < before.len);
+
+    // Whatever survived has to reconstruct, which needs a keyframe at the head.
+    if (after.len != 0) {
+        try testing.expectEqual(ReprKind.keyframe, after[0].kind);
+        for (after) |m| {
+            const got = try entriesOf(&store, m);
+            workspace.freeTreeEntries(alloc, got);
+        }
+        // Identity is preserved across the rewrite: only the representation
+        // changes, never what the moment is.
+        const newest = after[after.len - 1];
+        try testing.expectEqual(want_last.ms, newest.ms);
+        try testing.expect(want_last.full_tree.eql(newest.full_tree));
+    }
+}
+
+test "re-anchored moments still reconstruct the exact trees they held" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const set = Settings{ .enabled = true, .keyframe_interval = 10_000, .max = 10_000 };
+    for (0..12) |i| {
+        const body = try std.fmt.allocPrint(alloc, "v{d}", .{i});
+        defer alloc.free(body);
+        try work.writeFile(io, .{ .sub_path = "a.txt", .data = body });
+        for (0..30) |k| {
+            const name = try std.fmt.allocPrint(alloc, "pad{d}.txt", .{k});
+            defer alloc.free(name);
+            try work.writeFile(io, .{ .sub_path = name, .data = "pad" });
+        }
+        const r = try capture(&store, work, .poll, set);
+        if (r == .captured) alloc.free(r.captured.branch);
+    }
+
+    const before = try readAll(&store, alloc);
+    defer freeMoments(alloc, before);
+    const survivors = before[before.len - 3 ..];
+
+    // What the last three moments held, read before any rewrite.
+    var want: [3]Oid = undefined;
+    for (survivors, 0..) |m, i| want[i] = m.full_tree;
+
+    try reanchor(&store, alloc, survivors);
+
+    const after = try readAll(&store, alloc);
+    defer freeMoments(alloc, after);
+    try testing.expectEqual(@as(usize, 3), after.len);
+    try testing.expectEqual(ReprKind.keyframe, after[0].kind);
+
+    for (after, 0..) |m, i| {
+        try testing.expect(want[i].eql(m.full_tree));
+        const got = try entriesOf(&store, m);
+        defer workspace.freeTreeEntries(alloc, got);
+        // The reconstructed tree must hash to exactly what the moment records.
+        const enc = try object.Tree.encode(.{ .entries = got }, alloc);
+        defer alloc.free(enc);
+        try testing.expect(Oid.ofBytes(enc).eql(m.full_tree));
     }
 }
 
