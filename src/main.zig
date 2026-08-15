@@ -1371,6 +1371,13 @@ fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const 
     try gc.run(&s, alloc, w, dry_run);
 }
 
+fn warnDiverge(w: *std.Io.Writer, unmapped: usize, dry_run: bool) !void {
+    try w.print("  {s}{s}{s} {d} changes {s} their git mapping; a later `sdt push` re-writes those\n", .{
+        ui.on(.yellow), ui.warn, ui.off(), unmapped, if (dry_run) "would lose" else "lost",
+    });
+    try w.writeAll("    commits, so a shared remote diverges and needs a force push\n");
+}
+
 fn cmdPurge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
@@ -1417,11 +1424,13 @@ fn cmdPurge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         try w.print("purge: would drop {d} paths from {d} changes across {d} branches, freeing up to {s}\n", .{
             stats.paths, stats.changes, stats.branches, human,
         });
+        if (stats.unmapped != 0) try warnDiverge(w, stats.unmapped, true);
         return;
     }
     try w.print("{s}{s}{s} purged {d} paths from {d} changes across {d} branches, up to {s}\n", .{
         ui.on(.green), ui.check, ui.off(), stats.paths, stats.changes, stats.branches, human,
     });
+    if (stats.unmapped != 0) try warnDiverge(w, stats.unmapped, false);
     try w.writeAll("  run `sdt gc` to reclaim the disk\n");
 }
 

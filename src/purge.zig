@@ -27,6 +27,10 @@ pub const Stats = struct {
     /// reclaim. Chunks shared with a surviving path are still counted here, so
     /// treat it as an upper bound on the win, not a promise.
     bytes: u64,
+    /// Gitmap entries dropped because the change they named no longer exists.
+    /// Non-zero means the next export re-writes those commits, so the git
+    /// remote will diverge.
+    unmapped: usize,
 };
 
 /// True when `spec` names `path` itself, a directory containing it, or a glob
@@ -122,7 +126,12 @@ pub fn purge(
         seen.deinit();
     }
 
-    var stats: Stats = .{ .branches = 0, .changes = 0, .paths = 0, .bytes = 0 };
+    var stats: Stats = .{ .branches = 0, .changes = 0, .paths = 0, .bytes = 0, .unmapped = 0 };
+
+    // Which changes stopped existing under their old Oid. The gitmap names
+    // changes by Oid, so every one of these leaves a dangling entry.
+    var replaced = std.AutoHashMap([32]u8, void).init(alloc);
+    defer replaced.deinit();
 
     const names = try branches.list(store, alloc);
     defer {
@@ -147,7 +156,10 @@ pub fn purge(
             if (!same_tree) stats.changes += 1;
 
             if (dry_run) {
+                // A change's Oid covers its parent, so everything after the
+                // first rewritten change is rewritten too.
                 if (!same_tree) moved = true;
+                if (moved) stats.unmapped += 1;
                 continue;
             }
 
@@ -166,7 +178,10 @@ pub fn purge(
                 .author = change.author,
                 .message = change.message,
             });
-            if (!written.eql(c)) moved = true;
+            if (!written.eql(c)) {
+                moved = true;
+                try replaced.put(c.bytes, {});
+            }
             parent = written;
         }
 
@@ -180,8 +195,47 @@ pub fn purge(
     if (stats.paths == 0) return Error.NothingMatched;
     if (dry_run) return stats;
 
+    stats.unmapped = try pruneGitmap(store, alloc, &replaced);
     try resetHistory(store, alloc, timestamp);
     return stats;
+}
+
+/// Drop every `.sdt/gitmap` line naming a change the purge replaced. Keeping
+/// them would be worse than dropping them: the git commit still holds the
+/// purged path, so treating it as already-exported would export nothing and
+/// leave the two histories quietly disagreeing.
+fn pruneGitmap(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    replaced: *const std.AutoHashMap([32]u8, void),
+) !usize {
+    const data = store.root.readFileAlloc(store.io, "gitmap", alloc, .unlimited) catch return 0;
+    defer alloc.free(data);
+
+    var kept: std.ArrayList(u8) = .empty;
+    defer kept.deinit(alloc);
+
+    var dropped: usize = 0;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        var parts = std.mem.splitScalar(u8, t, ' ');
+        _ = parts.next();
+        const rhex = parts.next() orelse continue;
+        if (Oid.fromHex(rhex)) |o| {
+            if (replaced.contains(o.bytes)) {
+                dropped += 1;
+                continue;
+            }
+        } else |_| {}
+        try kept.appendSlice(alloc, t);
+        try kept.append(alloc, '\n');
+    }
+
+    if (dropped == 0) return 0;
+    try store.root.writeFile(store.io, .{ .sub_path = "gitmap", .data = kept.items });
+    return dropped;
 }
 
 /// Drop every root that would otherwise keep the purged trees alive: the moment
@@ -357,6 +411,52 @@ test "purging a path no change holds is an error, not a silent rewrite" {
     const specs = [_][]const u8{"zig-out"};
     try testing.expectError(Error.NothingMatched, purge(&store, alloc, &specs, 2, false));
     try testing.expect((try store.readRef("main")).eql(c));
+}
+
+test "purge drops the gitmap lines whose change it replaced, and keeps the rest" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const src = try writeBlob(&store, "source");
+    const junk = try writeBlob(&store, "junk");
+    const entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = "keep.txt", .blob = src },
+        .{ .mode = .regular, .path = "zig-out/bin/et", .blob = junk },
+    };
+    const t = try store.writeTree(.{ .entries = &entries });
+    const c = try store.writeChange(.{
+        .tree = t,
+        .parents = &.{},
+        .change_id = [_]u8{4} ** 16,
+        .timestamp = 1,
+        .tz_offset_min = 0,
+        .author = "t",
+        .message = "m",
+    });
+    try store.updateRef("main", c);
+
+    var c_hex: [64]u8 = undefined;
+    _ = c.toHex(&c_hex);
+    const unrelated = "b" ** 64;
+    const map = try std.fmt.allocPrint(alloc, "{s} {s}\n{s} {s}\n", .{
+        "a" ** 40, c_hex, "c" ** 40, unrelated,
+    });
+    defer alloc.free(map);
+    try store.root.writeFile(io, .{ .sub_path = "gitmap", .data = map });
+
+    const specs = [_][]const u8{"zig-out"};
+    const stats = try purge(&store, alloc, &specs, 2, false);
+    try testing.expectEqual(@as(usize, 1), stats.unmapped);
+
+    const after = try store.root.readFileAlloc(io, "gitmap", alloc, .unlimited);
+    defer alloc.free(after);
+    try testing.expect(std.mem.indexOf(u8, after, &c_hex) == null);
+    try testing.expect(std.mem.indexOf(u8, after, unrelated) != null);
 }
 
 test "purge leaves nothing pinning the old trees" {
