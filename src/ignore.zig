@@ -29,21 +29,22 @@ pub const IgnoreList = struct {
         return loadFromText(alloc, text);
     }
 
-    /// Read the ignore file from `dir`, and — only when a colocated `.git` is
-    /// present (i.e. git interop is in play) — also read `.gitignore` first so
-    /// its rules apply but ours, being later, wins on conflict (last
-    /// matching rule decides). Any file may be absent.
+    /// Read `.gitignore` first and then the ignore file, so `.gitignore` rules
+    /// apply but ours, being later, wins on conflict (last matching rule
+    /// decides). Any file may be absent.
+    ///
+    /// `.gitignore` is honored whether or not a colocated `.git` is present. A
+    /// repo that is sdt-only today may still carry a `.gitignore` listing its
+    /// build output, and reading it only once git interop happens to be set up
+    /// means every save until then commits `zig-out/`, `target/` and the rest
+    /// into permanent history.
     pub fn loadMerged(alloc: std.mem.Allocator, dir: std.Io.Dir, io: std.Io) !IgnoreList {
         var rules: std.ArrayList(Rule) = .empty;
         errdefer {
             for (rules.items) |r| alloc.free(r.pattern);
             rules.deinit(alloc);
         }
-        const colocated_git = if (dir.access(io, ".git", .{})) |_| true else |_| false;
-        const names: []const []const u8 = if (colocated_git)
-            &[_][]const u8{ ".gitignore", ".sdtignore" }
-        else
-            &[_][]const u8{".sdtignore"};
+        const names: []const []const u8 = &[_][]const u8{ ".gitignore", ".sdtignore" };
         for (names) |name| {
             const text = dir.readFileAlloc(io, name, alloc, .unlimited) catch continue;
             defer alloc.free(text);
@@ -235,7 +236,6 @@ test "loadMerged reads gitignore and sdtignore, sdtignore wins" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, ".git"); // git interop marker
     try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\nbuild/\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = ".sdtignore", .data = "!keep.log\n" });
     var list = try IgnoreList.loadMerged(alloc, tmp.dir, io);
@@ -245,15 +245,16 @@ test "loadMerged reads gitignore and sdtignore, sdtignore wins" {
     try testing.expect(!list.isIgnored("keep.log", false)); // .sdtignore re-includes
 }
 
-test "loadMerged ignores gitignore when no colocated .git" {
+test "loadMerged honors gitignore with no colocated .git" {
     const io = std.testing.io;
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.log\nzig-out/\n" });
     var list = try IgnoreList.loadMerged(alloc, tmp.dir, io);
     defer list.deinit();
-    try testing.expect(!list.isIgnored("a.log", false)); // no git interop → .gitignore skipped
+    try testing.expect(list.isIgnored("a.log", false));
+    try testing.expect(list.isIgnored("zig-out", true));
 }
 
 test "loadMerged with neither file yields empty list" {

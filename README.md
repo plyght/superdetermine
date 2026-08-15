@@ -35,6 +35,7 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Three-way merge + resolve | Conflict markers, then `sdt resolve <file>` / `sdt resolve --abort`. |
 | Absorb | `sdt absorb` folds working edits into the changes they belong to. |
 | Garbage collection | `sdt gc` reclaims space from unreachable objects (`--dry-run` to preview). |
+| Purge a path | `sdt purge <path...>` erases a path from every change, so `sdt gc` can reclaim what a mistakenly committed build directory holds. |
 | Prompt provenance (opt-in) | Record which agent or prompt produced a change, stored in the repo. |
 | Per-line blame | `sdt blame <file>` shows per-line authorship, including agent/prompt. |
 | Scriptable output | `sdt status --json` and `sdt log --json`; `sdt completions <fish\|zsh\|bash>`. |
@@ -130,6 +131,7 @@ sdt undo   /   sdt redo     # u   /  r
 sdt blame file.txt         # per-line authorship + provenance
 sdt absorb                 # fold edits into the changes they belong to
 sdt gc                     # reclaim unreachable objects
+sdt purge zig-out          # erase a path from all history, then gc
 ```
 
 Editing history. Every one of these is reversible with `sdt undo`:

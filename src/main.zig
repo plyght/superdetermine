@@ -38,6 +38,7 @@ const attribution = @import("attribution.zig");
 const agentscan = @import("agentscan.zig");
 const update = @import("update.zig");
 const gc = @import("gc.zig");
+const purge = @import("purge.zig");
 const blame = @import("blame.zig");
 const completions = @import("completions.zig");
 const absorb = @import("absorb.zig");
@@ -145,6 +146,7 @@ const sections = [_]Section{
     .{ .title = "housekeeping", .entries = &.{
         .{ .name = "init", .desc = "create a superdetermine repo here" },
         .{ .name = "gc", .args = "[--dry-run]", .desc = "reclaim unreachable objects" },
+        .{ .name = "purge", .args = "<path...> [--dry-run] [--force]", .desc = "erase a path from all history, then gc" },
         .{ .name = "config", .alias = "cfg", .args = "<key> [val]", .desc = "identity and defaults" },
         .{ .name = "completions", .alias = "comp", .args = "<shell>", .desc = "fish | zsh | bash" },
         .{ .name = "update", .desc = "update sdt (--nightly for the latest build)" },
@@ -450,6 +452,8 @@ pub fn main(init: std.process.Init) !void {
         hook.run(io, alloc, w, rest);
     } else if (eq(cmd, "gc")) {
         try cmdGc(io, alloc, w, rest);
+    } else if (eq(cmd, "purge")) {
+        try cmdPurge(io, alloc, w, rest);
     } else if (eq(cmd, "lfs")) {
         try cmdLfs(io, alloc, w, rest);
     } else if (eq(cmd, "completions")) {
@@ -1365,6 +1369,60 @@ fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const 
     resolveOps(alloc, &s);
     const dry_run = hasFlag(rest, "--dry-run") or hasFlag(rest, "-n");
     try gc.run(&s, alloc, w, dry_run);
+}
+
+fn cmdPurge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    resolveOps(alloc, &s);
+
+    const dry_run = hasFlag(rest, "--dry-run") or hasFlag(rest, "-n");
+    const force = hasFlag(rest, "--force") or hasFlag(rest, "-f");
+
+    var specs: std.ArrayList([]const u8) = .empty;
+    defer specs.deinit(alloc);
+    for (rest) |a| {
+        if (a.len != 0 and a[0] == '-') continue;
+        try specs.append(alloc, a);
+    }
+    if (specs.items.len == 0) {
+        try w.writeAll("usage: sdt purge <path...> [--dry-run] [--force]\n");
+        return;
+    }
+
+    if (!dry_run and !force) {
+        try w.print("{s}{s}{s} purge rewrites every change and resets the moment and operation logs.\n", .{
+            ui.on(.yellow), ui.warn, ui.off(),
+        });
+        try w.writeAll("  `sdt undo` cannot bring the purged content back.\n");
+        try w.writeAll("  run `sdt purge --dry-run <path...>` first, then re-run with --force\n");
+        return;
+    }
+
+    const stats = purge.purge(&s, alloc, specs.items, nowSeconds(io), dry_run) catch |e| switch (e) {
+        purge.Error.NothingMatched => {
+            try w.writeAll("no change in this repo holds any of those paths\n");
+            return;
+        },
+        purge.Error.NoPathspec => {
+            try w.writeAll("usage: sdt purge <path...> [--dry-run] [--force]\n");
+            return;
+        },
+        else => return e,
+    };
+
+    var buf: [32]u8 = undefined;
+    const human = ui.humanBytes(stats.bytes, &buf);
+    if (dry_run) {
+        try w.print("purge: would drop {d} paths from {d} changes across {d} branches, freeing up to {s}\n", .{
+            stats.paths, stats.changes, stats.branches, human,
+        });
+        return;
+    }
+    try w.print("{s}{s}{s} purged {d} paths from {d} changes across {d} branches, up to {s}\n", .{
+        ui.on(.green), ui.check, ui.off(), stats.paths, stats.changes, stats.branches, human,
+    });
+    try w.writeAll("  run `sdt gc` to reclaim the disk\n");
 }
 
 fn cmdLfs(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
