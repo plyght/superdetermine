@@ -573,12 +573,26 @@ pub fn clearState(store: *Store) !void {
     };
 }
 
+/// A conflict marker is exactly seven of the marker character, alone on the
+/// line or followed by a space and a label. A longer run is a rule in the
+/// text: plain-text licences underline their headings with dozens of `=`, and
+/// treating one as an unresolved conflict wedges every later save in the repo.
+fn isMarkerLine(line: []const u8, ch: u8) bool {
+    var l = line;
+    if (l.len != 0 and l[l.len - 1] == '\r') l = l[0 .. l.len - 1];
+    if (l.len < 7) return false;
+    for (l[0..7]) |c| {
+        if (c != ch) return false;
+    }
+    return l.len == 7 or l[7] == ' ';
+}
+
 pub fn hasConflictMarkers(data: []const u8) bool {
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |l| {
-        if (std.mem.startsWith(u8, l, "<<<<<<<")) return true;
-        if (std.mem.startsWith(u8, l, ">>>>>>>")) return true;
-        if (std.mem.startsWith(u8, l, "=======")) return true;
+        if (isMarkerLine(l, '<')) return true;
+        if (isMarkerLine(l, '>')) return true;
+        if (isMarkerLine(l, '=')) return true;
     }
     return false;
 }
@@ -745,7 +759,22 @@ test "hasConflictMarkers detects markers" {
     try testing.expect(hasConflictMarkers("a\n<<<<<<< ours\nb\n"));
     try testing.expect(hasConflictMarkers("a\n=======\nb\n"));
     try testing.expect(hasConflictMarkers("a\n>>>>>>> theirs\n"));
+    try testing.expect(hasConflictMarkers("a\n=======\r\nb\n"));
     try testing.expect(!hasConflictMarkers("a\nb\nc\n"));
+}
+
+test "a plain-text rule is not a conflict marker" {
+    // CC BY 4.0 underlines its headings with 71 `=`; an earlier check used
+    // startsWith and rejected the file, which then blocked every later save.
+    const rule = "=" ** 71;
+    try testing.expect(!hasConflictMarkers("Creative Commons\n" ++ rule ++ "\ntext\n"));
+    try testing.expect(!hasConflictMarkers("title\n" ++ "-" ** 40 ++ "\n"));
+    try testing.expect(!hasConflictMarkers("<<<<<<<<\nnot a marker, eight of them\n"));
+    try testing.expect(!hasConflictMarkers(">>>>>>>>>>\n"));
+    try testing.expect(!hasConflictMarkers("======\nsix is too few\n"));
+
+    // The real thing still trips it.
+    try testing.expect(hasConflictMarkers("x\n<<<<<<< HEAD\ny\n"));
 }
 
 test "merge state roundtrip" {

@@ -154,6 +154,42 @@ const sections = [_]Section{
     } },
 };
 
+/// True when any argument asks for help. Checked before dispatch, so it holds
+/// for every subcommand rather than the three that remembered to look.
+fn wantsHelp(rest: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        // Everything after `--` is a pathspec, and a message is free text, so
+        // neither can ask for help. `sdt save -m -h` saves under that message.
+        if (eq(rest[i], "--")) return false;
+        if (eq(rest[i], "-m") or eq(rest[i], "--message")) {
+            i += 1;
+            continue;
+        }
+        if (eq(rest[i], "-h") or eq(rest[i], "--help")) return true;
+    }
+    return false;
+}
+
+/// Print one command's usage line. Falls back to the full listing for a name
+/// the table does not carry.
+fn printCommandHelp(w: *std.Io.Writer, cmd: []const u8) !void {
+    for (sections) |section| {
+        for (section.entries) |e| {
+            if (!eq(e.name, cmd)) continue;
+            try w.print("  {s}usage:{s} sdt {s}", .{ ui.on(.dim), ui.off(), e.name });
+            if (e.args.len != 0) try w.print(" {s}", .{e.args});
+            try w.writeAll("\n");
+            if (e.desc.len != 0) try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), e.desc, ui.off() });
+            if (e.alias.len != 0) {
+                try w.print("  {s}alias:{s} {s}\n", .{ ui.on(.dim), ui.off(), e.alias });
+            }
+            return;
+        }
+    }
+    try printUsage(w);
+}
+
 fn printUsage(w: *std.Io.Writer) !void {
     try w.print("{s}sdt{s} {s}superdetermine: a VCS that records what worked, not just what changed{s}\n\n", .{
         ui.on(.bold), ui.off(), ui.on(.dim), ui.off(),
@@ -331,6 +367,14 @@ pub fn main(init: std.process.Init) !void {
 
     const cmd = canonical(args[1]);
     const rest = args[2..];
+
+    // Asking for help must never be a mutation. Without this, `sdt save --help`
+    // fell through to the save path and checkpointed the tree under an empty
+    // message, sweeping in whatever else happened to be uncommitted.
+    if (wantsHelp(rest)) {
+        try printCommandHelp(w, cmd);
+        return;
+    }
 
     if (eq(cmd, "version")) {
         try w.print("sdt {s}\n", .{version});
