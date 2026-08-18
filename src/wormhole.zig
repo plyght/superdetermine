@@ -30,6 +30,7 @@ pub const element_len = Group.encoded_length;
 pub const confirm_len = 32;
 
 pub const max_code_len = 64;
+pub const max_password_len = 128;
 pub const max_frame_len = 1 << 20;
 pub const record_chunk_len = 32 * 1024;
 pub const max_slot_attempts: u32 = 5;
@@ -159,9 +160,9 @@ fn generatorN() Group {
     return hashToElement(generator_n_domain);
 }
 
-fn passwordScalar(code: *const Code) [32]u8 {
+fn passwordScalar(password: []const u8) [32]u8 {
     var wide: [64]u8 = undefined;
-    Hkdf.expand(&wide, password_info, Hkdf.extract(password_salt, code.text()));
+    Hkdf.expand(&wide, password_info, Hkdf.extract(password_salt, password));
     return scalar.reduce64(wide);
 }
 
@@ -173,7 +174,7 @@ fn hashField(h: *Blake3, bytes: []const u8) void {
 }
 
 fn transcriptHash(
-    code: *const Code,
+    password: []const u8,
     w: [32]u8,
     sender_msg: [element_len]u8,
     receiver_msg: [element_len]u8,
@@ -181,7 +182,7 @@ fn transcriptHash(
 ) [32]u8 {
     var h = Blake3.init(.{});
     hashField(&h, transcript_domain);
-    hashField(&h, code.text());
+    hashField(&h, password);
     hashField(&h, &sender_msg);
     hashField(&h, &receiver_msg);
     hashField(&h, &w);
@@ -363,13 +364,22 @@ const Half = struct {
     secret: [32]u8,
     w: [32]u8,
     message: [element_len]u8,
-    code: Code,
+    // The password is held by value rather than as a slice because a `Half`
+    // outlives the caller's buffer in every path that builds one from a parsed
+    // `Code`, and a transcript hashed over freed bytes would fail in a way that
+    // looks like a network problem.
+    password_buf: [max_password_len]u8,
+    password_len: usize,
     role: Role,
+
+    fn password(self: *const Half) []const u8 {
+        return self.password_buf[0..self.password_len];
+    }
 };
 
-fn begin(io: std.Io, raw_code: []const u8, role: Role) Error!Half {
-    const code = try Code.parse(raw_code);
-    const w = passwordScalar(&code);
+fn beginWith(io: std.Io, password: []const u8, role: Role) Error!Half {
+    if (password.len == 0 or password.len > max_password_len) return Error.BadCode;
+    const w = passwordScalar(password);
     const blind = switch (role) {
         .sender => generatorM(),
         .receiver => generatorN(),
@@ -377,13 +387,22 @@ fn begin(io: std.Io, raw_code: []const u8, role: Role) Error!Half {
     const mask = blind.mul(w) catch return Error.BadCode;
     const secret = scalar.random(io);
     const public = Group.basePoint.mul(secret) catch return Error.BadHandshake;
-    return .{
+
+    var half: Half = .{
         .secret = secret,
         .w = w,
         .message = public.add(mask).toBytes(),
-        .code = code,
+        .password_buf = undefined,
+        .password_len = password.len,
         .role = role,
     };
+    @memcpy(half.password_buf[0..password.len], password);
+    return half;
+}
+
+fn begin(io: std.Io, raw_code: []const u8, role: Role) Error!Half {
+    const code = try Code.parse(raw_code);
+    return beginWith(io, code.text(), role);
 }
 
 fn deriveSession(half: Half, peer_msg: [element_len]u8) Error!Derived {
@@ -406,7 +425,7 @@ fn deriveSession(half: Half, peer_msg: [element_len]u8) Error!Derived {
         .receiver => half.message,
     };
 
-    const transcript = transcriptHash(&half.code, half.w, sender_msg, receiver_msg, shared_bytes);
+    const transcript = transcriptHash(half.password(), half.w, sender_msg, receiver_msg, shared_bytes);
     return .{ .transcript = transcript, .session = sessionKey(transcript, shared_bytes) };
 }
 
@@ -456,6 +475,22 @@ pub fn senderHandshake(io: std.Io, alloc: std.mem.Allocator, ch: Channel, code: 
 pub fn receiverHandshake(io: std.Io, alloc: std.mem.Allocator, ch: Channel, code: []const u8) !Session {
     _ = alloc;
     return exchangeAndConfirm(ch, try begin(io, code, .receiver));
+}
+
+/// The same handshake keyed by an arbitrary password rather than a spoken code.
+///
+/// A transfer code is three words because a person reads it aloud once and then
+/// it burns. A room password is not that: it is held for as long as the room
+/// exists, it is pasted rather than spoken, and confining it to the wordlist
+/// would cap a long-lived secret at the entropy of a one-shot one. Everything
+/// below the password is unchanged, and passing a code's own text here derives
+/// exactly what `senderHandshake` would, so the two are the same protocol.
+pub fn senderHandshakeWith(io: std.Io, ch: Channel, password: []const u8) !Session {
+    return exchangeAndConfirm(ch, try beginWith(io, password, .sender));
+}
+
+pub fn receiverHandshakeWith(io: std.Io, ch: Channel, password: []const u8) !Session {
+    return exchangeAndConfirm(ch, try beginWith(io, password, .receiver));
 }
 
 pub const SlotTable = struct {

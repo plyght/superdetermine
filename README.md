@@ -43,6 +43,8 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
 | History you can edit | `rebase`, `squash`, `split` (by path or by hunk), `reorder`, `amend --at`, `drop`. Every one is reversible with `sdt undo`. |
 | Converges without a service | The operation log is a DAG with a merge that cannot fail, so two machines reconcile through `sdt sync`, or through any dumb transport that moves files. |
+| **Live multiplayer** | `sdt mesh` puts every peer in one room. Everyone is a writer, edits land on the others in milliseconds, and there is no server: peers find each other by broadcast and converge by merge. |
+| Shared verdicts | A green earned on one machine answers on every machine, because a verdict is keyed by content and not by who ran it. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
 | Sealed secrets | Commit your `.env` safely. Values are encrypted per-variable into one file; the plaintext is never an object. Team access is a wrapped key, not a service. |
 | Encrypted sharing | `sdt send` hands a repo to someone peer to peer, or as a link or file no host can read. |
@@ -119,6 +121,8 @@ DeltaDB records what happened. It captures every operation, links it to the conv
 
 The other difference is where your code lives. Delta stores your repository contents, your git history, and your uncommitted edits on Zed's servers, and needs an account. `sdt` has no account and no server. Sharing is peer to peer, and the optional relay is one you can run yourself and cannot read what passes through it.
 
+Replication is the part where the two look closest and are not. Both put your work in front of your team as it happens. Delta does it through its servers, which is what makes a thread a thing you can be in. `sdt mesh` does it between the machines themselves, and what replicates is not only the work but the verdict on it: a green earned on one machine answers on all of them. There is nothing to be logged into and nothing to be on.
+
 ## Quick start
 
 ```
@@ -132,6 +136,16 @@ sdt blame file.txt         # per-line authorship + provenance
 sdt absorb                 # fold edits into the changes they belong to
 sdt gc                     # reclaim unreachable objects
 sdt purge zig-out          # erase a path from all history, then gc
+```
+
+Multiplayer:
+
+```
+sdt mesh open              # start a room here, print its secret
+sdt mesh join <secret>     # join the room that secret names
+sdt mesh                   # mp   go live: everyone a writer, no server
+sdt mesh status            # what is configured, and what it means
+sdt mesh leave             # forget the secret
 ```
 
 Editing history. Every one of these is reversible with `sdt undo`:
@@ -245,6 +259,64 @@ The two layers compose the way you would want: share a repo and the recipient ge
 Git interop deliberately has no share layer: GitHub sees your code so review works, and only your values stay sealed.
 
 Every command has a short alias: `sdt st`, `sdt d`, `sdt sv`, `sdt sl`, `sdt rv`. Run `sdt help` for the full table. Output is colored when stdout is a terminal and respects `NO_COLOR`.
+
+## Multiplayer, with nobody in the middle
+
+Everything above is one repo on one machine. `sdt mesh` is the same repo on several, converging while you work.
+
+```sh
+sdt mesh open          -> gallery-cubic-flint-hammock-compass
+sdt mesh               # go live
+```
+
+Whoever is joining runs the other half:
+
+```sh
+sdt mesh join gallery-cubic-flint-hammock-compass
+sdt mesh
+```
+
+That is the whole setup. There is no account, no host, no invite, and no list to be on. Holding the secret *is* membership.
+
+```
+● in the room on port 63784, announcing every 250ms
+  room 9ddf9431, polling this tree every 25ms
+→ 2 peers · 0.9ms away · 41 objects in, 12 out · 3 verdicts adopted
+```
+
+**Everyone is a writer.** This is not a live session with one driver and a read-only passenger — that is `live.enabled`, and it is a different feature for a different situation. Here each peer edits its own tree and the trees converge. Nobody hands anybody a token, and nobody waits.
+
+**It converges without asking anyone.** The op-log is a DAG whose merge is total and deterministic down to the content hash, so two peers that have seen the same operations land on the same view without exchanging another byte. That property does not care whether there are two peers or ten, which is why the mesh needs no leader and no global order.
+
+**Same-path edits do not stop anyone.** Where two people genuinely changed the same file, the result is a superposition rather than conflict markers: both whole versions are kept, the worktree materialises one, and every peer's tree still compiles and still grades. `sdt super` shows what is holding more than one version and `sdt collapse` keeps one.
+
+**Greens travel.** A verdict is keyed by `(tree, tier, command, inputs)` and by nothing about the machine that produced it, so a check another peer already paid for answers here for the identical tree. On a team, or across a fleet of agents grinding the same tree, that is the compounding one. Turn it off with `sdt config mesh.verdicts false`.
+
+**Moments do not travel.** Capture is per-machine and arrives by the hundred; your teammates want your changes, not your keystrokes.
+
+Across networks broadcast does not reach, name a peer directly. Still no server — that is one machine's address, not a registry:
+
+```sh
+sdt mesh --peer 100.83.4.11:7788
+```
+
+### What the secret protects
+
+The secret is never transmitted, in any form. Both ends derive the channel key from it by PAKE, so a listener on the network gets nothing it can attack offline, and a wrong guess costs an online attempt. What is broadcast is a *blinded room tag*: peers recognise their own room, and anyone else learns only that some repo exists nearby.
+
+It lives in `.sdt/config`, which is local. It is not committed and does not travel with the repo.
+
+Adopting a peer's verdict means trusting a check you did not watch run. That trust is bounded by the same secret: the peers who can write into your verdict log are exactly the peers who could already push you a change.
+
+### Where the milliseconds go
+
+A link is opened once, authenticated once, and reconciled once in full. After that it stays up and carries deltas, so an edit does not pay for a handshake. On a LAN the wire is sub-millisecond; what you actually wait for is the poll that notices your tree moved, which is 25ms by default and is the number to turn down:
+
+```sh
+sdt config mesh.interval-ms 10
+```
+
+The reason this stays cheap as history grows is that a peer remembers which subtrees it has already seen whole, so working out what to send touches what changed rather than what exists. Gossip is O(new), not O(repo).
 
 ## Install
 

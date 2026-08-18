@@ -31,6 +31,7 @@ const flow = @import("flow.zig");
 const superpose = @import("superpose.zig");
 const hook = @import("hook.zig");
 const live = @import("live.zig");
+const mesh = @import("mesh.zig");
 const net = @import("net.zig");
 const ignore = @import("ignore.zig");
 const provenance = @import("provenance.zig");
@@ -127,6 +128,9 @@ const sections = [_]Section{
         .{ .name = "relay", .alias = "rv", .desc = "run a meeting point for internet transfers" },
     } },
     .{ .title = "distributed (no forced server)", .entries = &.{
+        .{ .name = "mesh", .alias = "mp", .desc = "live multiplayer: every peer a writer, no server" },
+        .{ .name = "mesh open", .desc = "start a room here and print its secret" },
+        .{ .name = "mesh join", .args = "<secret>", .desc = "join the room that secret names" },
         .{ .name = "serve", .alias = "srv", .args = "[port]", .desc = "share this repo's objects over TCP" },
         .{ .name = "serve --link", .args = "<dir>", .desc = "host a `send --link` export over HTTP" },
         .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
@@ -267,6 +271,8 @@ const aliases = [_]Alias{
     .{ .short = "rc", .full = "recap" },
     .{ .short = "sp", .full = "super" },
     .{ .short = "cp", .full = "collapse" },
+    .{ .short = "mp", .full = "mesh" },
+    .{ .short = "multiplayer", .full = "mesh" },
     .{ .short = "srv", .full = "serve" },
     .{ .short = "f", .full = "fetch" },
     .{ .short = "cl", .full = "clone" },
@@ -414,6 +420,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdServe(io, alloc, w, rest);
     } else if (eq(cmd, "fetch")) {
         try cmdFetch(io, alloc, w, rest);
+    } else if (eq(cmd, "mesh")) {
+        try cmdMesh(io, alloc, w, rest);
     } else if (eq(cmd, "watch")) {
         try cmdWatch(io, alloc, w);
     } else if (eq(cmd, "moments")) {
@@ -2453,6 +2461,246 @@ fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     } else {
         try w.print("sparse-fetched {s}: only paths under '{s}' ({s})\n", .{ shortHex(change, &buf), prefix, branch });
     }
+}
+
+fn meshUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\usage: sdt mesh [run] [--peer <host:port>] [--port <n>] [--quiet]
+        \\       sdt mesh open              start a room here and print its secret
+        \\       sdt mesh join <secret>     join the room that secret names
+        \\       sdt mesh status            what is configured, and what it means
+        \\       sdt mesh leave             forget the secret; stop being a member
+        \\
+    );
+}
+
+fn meshSettingsOrHint(
+    s: *Store,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+) !?mesh.Settings {
+    const set = mesh.settings(s, alloc);
+    if (set.secret == null) {
+        set.deinit(alloc);
+        try w.print("{s}{s}{s} no room here yet\n", .{ ui.on(.yellow), ui.warn, ui.off() });
+        try ui.hint(w, "`sdt mesh open` starts one, `sdt mesh join <secret>` joins one");
+        return null;
+    }
+    return set;
+}
+
+fn cmdMesh(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len != 0) {
+        const sub = rest[0];
+        if (eq(sub, "open")) return meshOpen(io, alloc, w);
+        if (eq(sub, "join")) return meshJoin(io, alloc, w, rest[1..]);
+        if (eq(sub, "status")) return meshStatus(io, alloc, w);
+        if (eq(sub, "leave")) return meshLeave(io, alloc, w);
+        if (eq(sub, "run")) return meshRun(io, alloc, w, rest[1..]);
+        if (std.mem.startsWith(u8, sub, "-")) return meshRun(io, alloc, w, rest);
+        return meshUsage(w);
+    }
+    return meshRun(io, alloc, w, rest);
+}
+
+fn meshOpen(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const existing = mesh.settings(&s, alloc);
+    defer existing.deinit(alloc);
+    if (existing.secret) |secret| {
+        try w.print("this repo is already in a room\n\n  {s}{s}{s}\n\n", .{
+            ui.on(.cyan), secret, ui.off(),
+        });
+        try ui.hint(w, "`sdt mesh leave` first if you want a different one");
+        return;
+    }
+
+    const secret = try mesh.newSecret(io, alloc);
+    defer alloc.free(secret);
+    try config.set(&s, "mesh.secret", secret);
+
+    try w.print("{s}{s}{s} room open\n\n  {s}{s}{s}\n\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), secret, ui.off(),
+    });
+    try w.writeAll("give that to whoever is joining. they run:\n\n");
+    try w.print("  sdt mesh join {s}\n  sdt mesh\n\n", .{secret});
+    try ui.hint(w, "the secret is never sent; both ends prove they know it without saying it");
+    try ui.hint(w, "it is in .sdt/config, which is local — it is not committed and does not travel");
+}
+
+fn meshJoin(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len == 0) {
+        try w.writeAll("usage: sdt mesh join <secret>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const secret = rest[0];
+    if (secret.len > wormhole.max_password_len) {
+        try w.print("that secret is longer than {d} characters\n", .{wormhole.max_password_len});
+        return;
+    }
+    try config.set(&s, "mesh.secret", secret);
+
+    var tag_hex: [mesh.room_tag_len * 2]u8 = undefined;
+    const tag = mesh.roomTag(secret);
+    _ = std.fmt.bufPrint(&tag_hex, "{x}", .{&tag}) catch {};
+    try w.print("{s}{s}{s} joined room {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.dim), tag_hex[0..8], ui.off(),
+    });
+    try ui.hint(w, "`sdt mesh` to go live");
+}
+
+fn meshLeave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    try config.set(&s, "mesh.secret", "");
+    try w.print("{s}{s}{s} left the room\n", .{ ui.on(.green), ui.check, ui.off() });
+    try ui.hint(w, "nothing was deleted; the history you synced is yours to keep");
+}
+
+fn meshStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const set = (try meshSettingsOrHint(&s, alloc, w)) orelse return;
+    defer set.deinit(alloc);
+
+    const tag = mesh.roomTag(set.secret.?);
+    try w.print("{s}room{s}      ", .{ ui.on(.bold), ui.off() });
+    for (tag[0..4]) |byte| try w.print("{x:0>2}", .{byte});
+    try w.writeAll("\n");
+    try w.print("{s}live{s}      {s}\n", .{
+        ui.on(.bold),
+        ui.off(),
+        if (set.enabled) "yes, when `sdt mesh` runs" else "no (mesh.enabled is off)",
+    });
+    try w.print("{s}poll{s}      every {d}ms\n", .{ ui.on(.bold), ui.off(), set.interval_ms });
+    try w.print("{s}verdicts{s}  {s}\n", .{
+        ui.on(.bold),
+        ui.off(),
+        if (set.share_verdicts) "shared with the room" else "kept local",
+    });
+    try ui.hint(w, "peers are whoever holds the secret; there is no list to be on");
+}
+
+fn parseSeed(arg: []const u8) ?mesh.Seed {
+    const colon = std.mem.lastIndexOfScalar(u8, arg, ':') orelse return null;
+    if (colon == 0 or colon + 1 >= arg.len) return null;
+    const port = std.fmt.parseInt(u16, arg[colon + 1 ..], 10) catch return null;
+    return .{ .host = arg[0..colon], .port = port };
+}
+
+fn meshRun(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+
+    const set = (try meshSettingsOrHint(&s, alloc, w)) orelse return;
+    defer set.deinit(alloc);
+
+    if (!set.enabled) {
+        try w.print("{s}{s}{s} mesh.enabled is off\n", .{ ui.on(.yellow), ui.warn, ui.off() });
+        try ui.hint(w, "`sdt config mesh.enabled true` to turn it back on");
+        return;
+    }
+
+    var seeds: std.ArrayList(mesh.Seed) = .empty;
+    defer seeds.deinit(alloc);
+    var listen_port: u16 = 0;
+    var quiet = false;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg = rest[i];
+        if (eq(arg, "--quiet")) {
+            quiet = true;
+        } else if (eq(arg, "--peer") and i + 1 < rest.len) {
+            i += 1;
+            const seed = parseSeed(rest[i]) orelse {
+                try w.print("cannot read `{s}` as host:port\n", .{rest[i]});
+                return;
+            };
+            try seeds.append(alloc, seed);
+        } else if (eq(arg, "--port") and i + 1 < rest.len) {
+            i += 1;
+            listen_port = std.fmt.parseInt(u16, rest[i], 10) catch 0;
+        } else {
+            try w.print("unknown option `{s}`\n", .{arg});
+            return meshUsage(w);
+        }
+    }
+
+    const m = mesh.Mesh.open(io, alloc, &s, .{
+        .secret = set.secret.?,
+        .listen_port = listen_port,
+        .interval_ms = set.interval_ms,
+        .share_verdicts = set.share_verdicts,
+        .seeds = seeds.items,
+    }) catch |e| {
+        try w.print("cannot open the mesh: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer m.close();
+    try m.start();
+
+    const tag = mesh.roomTag(set.secret.?);
+    try w.print("{s}{s}{s} in the room on port {d}, announcing every {d}ms\n", .{
+        ui.on(.green), ui.branch_mark, ui.off(), m.tcp_port, 250,
+    });
+    try w.writeAll("  room ");
+    for (tag[0..4]) |byte| try w.print("{x:0>2}", .{byte});
+    try w.print(", polling this tree every {d}ms\n", .{set.interval_ms});
+    try ui.hint(w, "ctrl-c to leave. nothing is uploaded anywhere, and no peer is a server");
+    try w.flush();
+
+    // A line per change rather than a repainting dashboard: the interesting
+    // events here are rare and worth keeping in the scrollback, and a spinner
+    // would imply the mesh is busy when the whole point is that it is not.
+    var last = m.status();
+    while (true) {
+        io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch break;
+        const now = m.status();
+        const moved = now.peers != last.peers or
+            now.objects_received != last.objects_received or
+            now.verdicts_adopted != last.verdicts_adopted;
+        if (!moved or quiet) {
+            last = now;
+            continue;
+        }
+        try meshLine(w, now);
+        last = now;
+    }
+}
+
+fn meshLine(w: *std.Io.Writer, st: mesh.Status) !void {
+    try w.print("{s}{s}{s} {d} peer{s}", .{
+        ui.on(.dim),
+        ui.arrow,
+        ui.off(),
+        st.peers,
+        if (st.peers == 1) "" else "s",
+    });
+    if (st.best_rtt_us != 0) {
+        const ms = @as(f64, @floatFromInt(st.best_rtt_us)) / 1000.0;
+        try w.print(" {s} {d:.1}ms away", .{ ui.bullet, ms });
+    }
+    try w.print(" {s} {d} objects in, {d} out", .{
+        ui.bullet,
+        st.objects_received,
+        st.objects_sent,
+    });
+    if (st.verdicts_adopted != 0) {
+        try w.print(" {s} {d} verdict{s} adopted", .{
+            ui.bullet,
+            st.verdicts_adopted,
+            if (st.verdicts_adopted == 1) "" else "s",
+        });
+    }
+    try w.writeAll("\n");
+    try w.flush();
 }
 
 fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -4960,6 +5208,7 @@ test {
     _ = flow;
     _ = superpose;
     _ = live;
+    _ = mesh;
     _ = @import("index.zig");
 }
 

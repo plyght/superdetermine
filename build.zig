@@ -36,7 +36,12 @@ pub fn build(b: *std.Build) void {
     });
     linkLibgit2(b, test_mod, target, .Debug);
     test_mod.addOptions("build_options", build_options);
-    const tests = b.addTest(.{ .root_module = test_mod });
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only run tests whose name contains this substring",
+    ) orelse &[0][]const u8{};
+    const tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

@@ -52,9 +52,14 @@ const iff_loopback: c_uint = 0x8;
 /// The all-ones address 255.255.255.255 is deliberately not used: macOS rejects
 /// it with `HostUnreachable` unless the socket is bound to a specific interface,
 /// so the per-interface address is the portable choice.
-fn broadcastTargets(out: *[16]net.IpAddress) usize {
+///
+/// `dest_port` is a parameter rather than the module constant because the mesh
+/// beacon shares this interface enumeration but not this protocol's port, and
+/// duplicating the `getifaddrs` walk to change one field would be two copies of
+/// the part that is actually hard to get right.
+pub fn broadcastTargetsOn(out: *[16]net.IpAddress, dest_port: u16) usize {
     var n: usize = 0;
-    out[n] = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    out[n] = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = dest_port } };
     n += 1;
 
     if (builtin.os.tag == .windows) return n;
@@ -77,10 +82,14 @@ fn broadcastTargets(out: *[16]net.IpAddress) usize {
         const sin: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
         const smask: *const posix.sockaddr.in = @ptrCast(@alignCast(mask));
         const bcast: u32 = sin.addr | ~smask.addr;
-        out[n] = .{ .ip4 = .{ .bytes = @bitCast(bcast), .port = port } };
+        out[n] = .{ .ip4 = .{ .bytes = @bitCast(bcast), .port = dest_port } };
         n += 1;
     }
     return n;
+}
+
+fn broadcastTargets(out: *[16]net.IpAddress) usize {
+    return broadcastTargetsOn(out, port);
 }
 
 /// Broadcast "slot N is listening on tcp_port" once. The caller repeats this
