@@ -5,6 +5,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Ship a fast binary by default; `zig build -Doptimize=Debug` opts back in.
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    const apricot_dep = b.dependency("apricot", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -13,6 +17,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     linkLibgit2(b, exe_mod, target, optimize);
+    exe_mod.addImport("apricot", apricot_dep.module("apricot"));
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", zon.version);
@@ -35,6 +40,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     linkLibgit2(b, test_mod, target, .Debug);
+    const apricot_test_dep = b.dependency("apricot", .{
+        .target = target,
+        .optimize = .Debug,
+    });
+    test_mod.addImport("apricot", apricot_test_dep.module("apricot"));
     test_mod.addOptions("build_options", build_options);
     const test_filters = b.option(
         []const []const u8,
@@ -54,6 +64,18 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_check_step = b.step("fmt-check", "Fail if the source tree is unformatted");
     fmt_check_step.dependOn(&fmt_check.step);
+
+    const typecheck_step = b.step("typecheck", "Type-check Superdetermine");
+    typecheck_step.dependOn(&exe.step);
+
+    const lint_step = b.step("lint", "Run static checks");
+    lint_step.dependOn(&fmt_check.step);
+    lint_step.dependOn(&exe.step);
+
+    const check_step = b.step("check", "Run all quality gates");
+    check_step.dependOn(&fmt_check.step);
+    check_step.dependOn(&exe.step);
+    check_step.dependOn(&run_tests.step);
 }
 
 fn linkLibgit2(

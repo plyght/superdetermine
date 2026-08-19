@@ -32,6 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .apricot = .{
+            .path = "../apricot",
+        },
         .libgit2 = .{
             .url = "git+https://github.com/allyourcodebase/libgit2#ee14d04543ce7a1c152e071e29cdafb8fc4125f1",
             .hash = "libgit2-1.9.0-uizqTX3cAAB_rhZNbFWFd0M4vTjD-NBtssjdi6Vt_00R",

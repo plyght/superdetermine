@@ -52,6 +52,7 @@ const share = @import("share.zig");
 const wormhole = @import("wormhole.zig");
 const ui = @import("ui.zig");
 const discovery = @import("discovery.zig");
+const apricot_bridge = @import("apricot_bridge.zig");
 const ipnet = std.Io.net;
 
 const Oid = oid.Oid;
@@ -3990,6 +3991,10 @@ fn isUrl(s: []const u8) bool {
         std.mem.startsWith(u8, s, "ssh://");
 }
 
+fn isApricotRemote(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "https://") or std.mem.startsWith(u8, s, "http://");
+}
+
 // Resolve a remote NAME (e.g. "origin") to a URL: a literal URL passes through;
 // otherwise look it up in the colocated .git/config, then gr's own config
 // (`remote.<name>.url`). Caller frees. null if it can't be resolved.
@@ -4108,6 +4113,24 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const branch = try targetBranch(io, alloc, &s, if (np >= 2) pos[1] else null);
     defer alloc.free(branch);
 
+    if (isApricotRemote(url)) {
+        const repository_path = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(repository_path);
+        const published = apricot_bridge.publish(alloc, io, url, branch, repository_path, nowSeconds(io)) catch |e| {
+            try w.print("push to {s} failed: {s}\n", .{ remote_name, @errorName(e) });
+            return;
+        };
+        var commit_hex: [40]u8 = undefined;
+        try w.print("pushed {s} → {s} ({s}) with native carrier {x} at {s}\n", .{
+            branch,
+            remote_name,
+            url,
+            published.carrier_root.bytes,
+            published.commit.format(&commit_hex),
+        });
+        return;
+    }
+
     // If a git repo is colocated here, push IT directly so local .git and the
     // remote stay identical. Mirror the saved states onto the target branch
     // first: dual-write is opt-in, so without this a push of an unmoved ref
@@ -4200,7 +4223,14 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const had_local = s.refExists(local);
     const before = if (had_local) try s.readRef(local) else Oid.zero();
 
-    var fetched = git.fetchRemote(&s, url, want_branch, pull_ref) catch |e| {
+    var fetched: git.Fetched = if (isApricotRemote(url)) blk: {
+        const branch = want_branch orelse local;
+        const tip = apricot_bridge.fetchInto(alloc, io, url, branch, &s, pull_ref) catch |e| {
+            try w.print("pull from {s} failed: {s}\n", .{ remote_name, @errorName(e) });
+            return;
+        };
+        break :blk .{ .tip = tip, .branch = try alloc.dupe(u8, branch) };
+    } else git.fetchRemote(&s, url, want_branch, pull_ref) catch |e| {
         try w.print("pull from {s} failed: {s}\n", .{ remote_name, @errorName(e) });
         try reportGitError(w);
         return;
@@ -4292,7 +4322,7 @@ fn defaultCloneDir(src: []const u8) ?[]const u8 {
 
 fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: sdt clone <git-src|share-url|bundle#k=...> [dir]\n");
+        try w.writeAll("usage: sdt clone <forge-src|share-url|bundle#k=...> [dir]\n");
         return;
     }
     const into = if (rest.len >= 2) rest[1] else defaultCloneDir(rest[0]) orelse {
@@ -4305,6 +4335,30 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     try w.flush();
     if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
         return cloneShare(io, alloc, w, rest[0], into);
+    }
+    if (isApricotRemote(rest[0])) {
+        const cwd = try std.process.currentPathAlloc(io, alloc);
+        defer alloc.free(cwd);
+        const destination = try std.fs.path.resolve(alloc, &.{ cwd, into });
+        defer alloc.free(destination);
+        const fetched = apricot_bridge.fetchDefault(alloc, io, rest[0]) catch |e| switch (e) {
+            error.MissingCarrierRef, error.MissingBranch => null,
+            else => {
+                try w.print("{s}{s}{s} native clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), @errorName(e) });
+                return;
+            },
+        };
+        if (fetched) |native| {
+            defer native.deinit(alloc);
+            apricot_bridge.restore(alloc, io, destination, native) catch |e| {
+                try w.print("{s}{s}{s} native clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), @errorName(e) });
+                return;
+            };
+            try w.print("{s}{s}{s} cloned exact native repository into {s}{s}{s}\n", .{
+                ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+            });
+            return;
+        }
     }
     // Create the destination as a superdetermine repo, then clone git into it.
     var progress = git.Progress.init(io, w);
