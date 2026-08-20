@@ -114,6 +114,30 @@ pub fn envToken() ?[*:0]const u8 {
     return null;
 }
 
+pub fn isGitHubRemote(remote: []const u8) bool {
+    const scheme = std.mem.indexOf(u8, remote, "://") orelse return false;
+    if (!std.ascii.eqlIgnoreCase(remote[0..scheme], "https")) return false;
+    const authority_start = scheme + 3;
+    const authority_end = std.mem.indexOfScalarPos(u8, remote, authority_start, '/') orelse remote.len;
+    var authority = remote[authority_start..authority_end];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    const host = if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| blk: {
+        if (!std.mem.eql(u8, authority[colon + 1 ..], "443")) return false;
+        break :blk authority[0..colon];
+    } else authority;
+    return std.ascii.eqlIgnoreCase(host, "github.com");
+}
+
+pub fn githubAuthToken(alloc: std.mem.Allocator, remote: []const u8) ?[]u8 {
+    if (!isGitHubRemote(remote)) return null;
+    const out = capture(alloc, &.{ "gh", "auth", "token", "--hostname", "github.com" }, "") catch return null;
+    defer out.deinit(alloc);
+    if (!out.ok()) return null;
+    const token = std.mem.trim(u8, out.stdout, " \t\r\n");
+    if (token.len == 0 or std.mem.indexOfAny(u8, token, " \t\r\n") != null) return null;
+    return alloc.dupe(u8, token) catch null;
+}
+
 /// Parse `git credential fill` stdout (lines like `username=..`, `password=..`,
 /// blank-line terminated) into user/pass spans of `data`. Returns null unless
 /// BOTH username and password are present.
@@ -173,6 +197,16 @@ test "parseCredentialOutput parses username and password" {
 test "parseCredentialOutput returns null when password missing" {
     const blob = "protocol=https\nhost=github.com\nusername=x-access-token\n\n";
     try testing.expect(parseCredentialOutput(blob) == null);
+}
+
+test "GitHub token fallback is restricted to the exact GitHub host" {
+    try testing.expect(isGitHubRemote("https://github.com/owner/repository"));
+    try testing.expect(isGitHubRemote("HTTPS://GITHUB.COM/owner/repository"));
+    try testing.expect(isGitHubRemote("https://user@github.com/owner/repository"));
+    try testing.expect(!isGitHubRemote("https://github.com.evil.example/owner/repository"));
+    try testing.expect(!isGitHubRemote("https://example.com/github.com/owner/repository"));
+    try testing.expect(!isGitHubRemote("ssh://git@github.com/owner/repository"));
+    try testing.expect(!isGitHubRemote("git@github.com:owner/repository"));
 }
 
 test "capture round-trips stdin through a child process" {

@@ -12,19 +12,52 @@ pub const ForgeDrivers = apricot.forge_drivers;
 pub const Oid = oid.Oid;
 pub const Store = store.Store;
 
-const Session = struct {
-    client: apricot.git_http.Client,
+pub fn signature(author: []const u8) apricot.git_forge.Signature {
+    const value = std.mem.trim(u8, author, " \t");
+    if (std.mem.lastIndexOfScalar(u8, value, '<')) |left| {
+        if (std.mem.lastIndexOfScalar(u8, value, '>')) |right| {
+            if (right == value.len - 1 and right > left + 1) {
+                const name = std.mem.trim(u8, value[0..left], " \t");
+                return .{
+                    .name = if (name.len == 0) "superdetermine" else name,
+                    .email = value[left + 1 .. right],
+                };
+            }
+        }
+    }
+    return .{
+        .name = if (value.len == 0) "superdetermine" else value,
+        .email = "none@superdetermine",
+    };
+}
 
-    fn init(allocator: std.mem.Allocator, io: std.Io) Session {
+const Session = struct {
+    allocator: std.mem.Allocator,
+    client: apricot.git_http.Client,
+    owned_token: ?[]u8,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, remote: []const u8) Session {
+        var owned_token: ?[]u8 = null;
         const credentials: ?apricot.http_client.Credentials = if (proc.envToken()) |token| .{
             .username = "apricot",
             .password = std.mem.span(token),
+        } else if (proc.githubAuthToken(allocator, remote)) |token| blk: {
+            owned_token = token;
+            break :blk .{ .username = "x-access-token", .password = token };
         } else null;
-        return .{ .client = .{ .allocator = allocator, .io = io, .credentials = credentials } };
+        return .{
+            .allocator = allocator,
+            .client = .{ .allocator = allocator, .io = io, .credentials = credentials },
+            .owned_token = owned_token,
+        };
     }
 
     fn deinit(self: *Session) void {
         self.client.deinit();
+        if (self.owned_token) |token| {
+            @memset(token, 0);
+            self.allocator.free(token);
+        }
     }
 
     fn smart(self: *Session, allocator: std.mem.Allocator, remote: []const u8) apricot.git_transport.SmartHttp {
@@ -38,11 +71,12 @@ pub fn publish(
     remote: []const u8,
     branch: []const u8,
     repository_path: []const u8,
+    commit_signature: apricot.git_forge.Signature,
     timestamp: i64,
 ) !Published {
     var captured = try apricot.sdt_codec.capture(allocator, io, repository_path, remote);
     defer captured.deinit(allocator);
-    var session = Session.init(allocator, io);
+    var session = Session.init(allocator, io, remote);
     defer session.deinit();
     return apricot.git_forge.publish(
         allocator,
@@ -51,18 +85,19 @@ pub fn publish(
         captured.encoded.bytes,
         captured.encoded.root,
         captured.projection,
+        commit_signature,
         timestamp,
     );
 }
 
 pub fn fetch(allocator: std.mem.Allocator, io: std.Io, remote: []const u8, branch: []const u8) !Fetched {
-    var session = Session.init(allocator, io);
+    var session = Session.init(allocator, io, remote);
     defer session.deinit();
     return apricot.git_forge.fetch(allocator, session.smart(allocator, remote), branch);
 }
 
 pub fn fetchDefault(allocator: std.mem.Allocator, io: std.Io, remote: []const u8) !Fetched {
-    var session = Session.init(allocator, io);
+    var session = Session.init(allocator, io, remote);
     defer session.deinit();
     const branch = try apricot.git_forge.defaultBranch(allocator, session.smart(allocator, remote));
     defer allocator.free(branch);
@@ -116,4 +151,16 @@ test "bridge exposes embedded Apricot transport" {
     try std.testing.expect(@sizeOf(Fetched) > 0);
     try std.testing.expect(@sizeOf(Collaboration.Resource) > 0);
     try std.testing.expect(@sizeOf(ForgeDrivers.Driver) > 0);
+}
+
+test "bridge maps configured authors to projection signatures" {
+    const complete = signature("Plyght User <plyght@example.com>");
+    try std.testing.expectEqualStrings("Plyght User", complete.name);
+    try std.testing.expectEqualStrings("plyght@example.com", complete.email);
+    const email_only = signature("<plyght@example.com>");
+    try std.testing.expectEqualStrings("superdetermine", email_only.name);
+    try std.testing.expectEqualStrings("plyght@example.com", email_only.email);
+    const name_only = signature("Plyght User");
+    try std.testing.expectEqualStrings("Plyght User", name_only.name);
+    try std.testing.expectEqualStrings("none@superdetermine", name_only.email);
 }

@@ -4075,6 +4075,14 @@ fn reportNotFastForward(w: *std.Io.Writer, branch: []const u8, remedy: []const u
     try w.print("  {s}hint:{s} `sdt pull` brings them in; `{s}` drops them on purpose\n", .{ ui.on(.dim), ui.off(), remedy });
 }
 
+fn reportApricotFailure(w: *std.Io.Writer, operation: []const u8, remote: []const u8, err: anyerror) !void {
+    switch (err) {
+        error.AuthenticationRequired => try w.print("{s} {s} requires authentication. for GitHub, run `gh auth login`; for another forge, set GIT_TOKEN or GITHUB_TOKEN\n", .{ operation, remote }),
+        error.PermissionDenied => try w.print("{s} {s} was denied. check that your account and token have access to this repository\n", .{ operation, remote }),
+        else => try w.print("{s} {s} failed: {s}\n", .{ operation, remote, @errorName(err) }),
+    }
+}
+
 fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
@@ -4116,8 +4124,10 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     if (isApricotRemote(url)) {
         const repository_path = try std.process.currentPathAlloc(io, alloc);
         defer alloc.free(repository_path);
-        const published = apricot_bridge.publish(alloc, io, url, branch, repository_path, nowSeconds(io)) catch |e| {
-            try w.print("push to {s} failed: {s}\n", .{ remote_name, @errorName(e) });
+        const author = try config.author(&s, alloc);
+        defer alloc.free(author);
+        const published = apricot_bridge.publish(alloc, io, url, branch, repository_path, apricot_bridge.signature(author), nowSeconds(io)) catch |e| {
+            try reportApricotFailure(w, "push to", remote_name, e);
             return;
         };
         var commit_hex: [40]u8 = undefined;
@@ -4226,7 +4236,7 @@ fn cmdPull(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     var fetched: git.Fetched = if (isApricotRemote(url)) blk: {
         const branch = want_branch orelse local;
         const tip = apricot_bridge.fetchInto(alloc, io, url, branch, &s, pull_ref) catch |e| {
-            try w.print("pull from {s} failed: {s}\n", .{ remote_name, @errorName(e) });
+            try reportApricotFailure(w, "pull from", remote_name, e);
             return;
         };
         break :blk .{ .tip = tip, .branch = try alloc.dupe(u8, branch) };
@@ -4344,7 +4354,7 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         const fetched = apricot_bridge.fetchDefault(alloc, io, rest[0]) catch |e| switch (e) {
             error.MissingCarrierRef, error.MissingBranch => null,
             else => {
-                try w.print("{s}{s}{s} native clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), @errorName(e) });
+                try reportApricotFailure(w, "native clone from", rest[0], e);
                 return;
             },
         };
