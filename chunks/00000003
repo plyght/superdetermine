@@ -1,4 +1,24 @@
-       return;
+Work(io);
+        defer work.close(io);
+        workspace.checkout(s, work, before_tree, tip.tree) catch {};
+    }
+
+    var buf: [Oid.len * 2]u8 = undefined;
+    if (r.rewritten == 0) {
+        try w.print("{s}{s}{s} {s}, now at {s}{s}{s}\n", .{
+            ui.on(.green), ui.check, ui.off(), what, ui.on(.cyan), shortHex(r.new, &buf), ui.off(),
+        });
+    } else {
+        try w.print("{s}{s}{s} {s}: {d} change(s) rewritten, now at {s}{s}{s}\n", .{
+            ui.on(.green), ui.check,     ui.off(),              what,
+            r.rewritten,   ui.on(.cyan), shortHex(r.new, &buf), ui.off(),
+        });
+    }
+    if (!r.clean()) {
+        try w.print("{d} path(s) came out conflicted, with both sides marked:\n", .{r.conflicts.len});
+        for (r.conflicts) |p| try w.print("  ! {s}\n", .{p});
+        try ui.hint(w, "fix the markers and `sdt save`, or `sdt undo` to put history back");
+        return;
     }
     try ui.hint(w, "`sdt undo` puts the old history back");
 }
@@ -64795,7 +64815,14 @@ index 76186b6fb..f7ce73ac8 100644
                  git_patch_free(patch);
          }
          return 0;
-N   ¤  -       .sdt/objects/75/2ad47b3300af80d07dddcbd6bd2953db775ecada0baf322855b729b918d350B       &   Èv0âkE„tõr	•,2Bëù»¼Ù"Rû<ˆXN   ¤  -       .sdt/objects/75/32ba24f029244fa3614aafba5b5d79e172ffa04b0fdaaf04d7fd881ee3650dB       Ù   V2ÙÉØÀ çÖ>	Yã"ED#ÏñşÛoUÍğG3N   ¤  -       .sdt/objects/75/340a96196d971cc6f991d12cf476d1864bf58f9a41599a3aa503351a73aa21B       {    ‡[~Ê¬îs‘4+8K×¨#Ì.ùµ$½eŠ	áêN   ¤        .sdt/objects/75/4aff79cde274b68b9cb4e529673127386be0a44703c293a339329ddcef06cd#include "clar_libgit2.h"
+N   ¤  -       .sdt/objects/75/2ad47b3300af80d07dddcbd6bd2953db775ecada0baf322855b729b918d350B       &   Èv0âkE„tõr	•,2Bëù»¼Ù"Rû<ˆXN   ¤  D      .sdt/objects/75/303334e3631a05404af5aac8aef296c4102461b773f671312d5f57dbd0c886T   K  ¤W ˜–4ó(aöó#ıûÊ\\ND§Pl·fç0¥^ .github/workflows/nightly.yml  ¤IÌã¹}Şn$l-Œ½ÇG¼vKùú7YQœ²6 .github/workflows/release.yml  ¤oE¹6¯vø5ù]*ù¬Óæ¾<öAşÌnò5rxXF 
+.gitignore  ¤#ñÏ²wX)¢»ë…şaÄ%Ş,şjIëÊÊß‚ 	.grignore  ¤áªúi’‹Ğø®'/¬2¸ƒcvÄÈìg)c{JÁÿpš LICENSE  ¤ÍDxMtTà<øâè§×ˆ÷7E¨”V¦&yUÂ: 	README.md  ¤“N{Üş½ÆIÔ*¦€“uñşÈÂkªˆu SKILL.md  ¤WÆ¥1N?óKI™ˆ±Ó4”M`"ø]7¨cšq¨±9ì‡¤ brand/icon.svg  ¤”¤¾«<ÓeP]Óÿ2óPèPx§—Ÿõ×²L	~˜2 brand/logo-track.svg  ¤û~H}{V#é- ó­»	¥Üài~÷(œ	™~I— brand/logo-wordmark.svg  ¤Şö›–kgËca¦:H<ÂQ4xù(ÿÔCeáô‹l±Ş brand/logo.svg  ¤7+ı;	€å$<²„uêJŠ,%€.¤G˜×Ì¡ó 	build.zig  ¤Óì"ù7û	^Õeà*}Ô­1“„:¿ŞÚŒg³šH³ build.zig.zon  ¤éŸøü¸r¦t±x¥Ç‰~ÃF§¥d²¥kúep÷Ÿ; demo.gif  ¤sç_w–›r*ĞGøtWïC4›'a­¬n[ÑB 	demo.tape  ¤gQJ}·¬ŸT’‘?~«’ë&‹(£âä°ŸBğ3é docs/zig-0.16-notes.md  ¤ZÙê?´c›¡w”ÈÃ?ÕÀæI³·ÅÒÁóY+¨óR«f src/absorb.zig  ¤—Ö`K»u…û5áŸ¼×å!!x FLšòFÿ‹×ê src/agentscan.zig  ¤×`ÙœŠŸ`ÉéFD±™Õp<ÈPş‰ôt÷İúÛ¨_ñ src/applog.zig  ¤ÃÍ„ÌŒïQ–£Ê›!aqXÒ>hã¶üã• ã÷­_,õ src/apricot_bridge.zig  ¤…E•$jÉ"í¬=ÈÍ†ÀMäÌU§Ö$Aİ src/attest.zig  ¤ÚÓñG~ƒ5‡]YçÂ(„é÷°SŸ¼>°Ì¦¡l—~İô src/attribution.zig  ¤Îé’@• YÚƒ¢×n«IwäĞMÄ(ÄÑs‹ÃTú src/blame.zig  ¤ø dMŞ”ÓÖ:y?Ic±o£ÇÛ{Ä•æ®£@ì¬Pœ src/branches.zig  ¤¶zÖuÆoC¾÷¶=i2WÌÛŞbMÚYÓ@+Wn{a src/cdc.zig  ¤œh/Gq¯û¾õÎyK“] Ñ'±?‰ğ8t½ÇÛb src/checks.zig  ¤¥rPò¹ÁÛÔÎ:ÆlÖ¨5•1{Xä¯4ƒÓÄ£b«b src/completions.zig  ¤ØHâK6Tò®XïRŠÏÙ"b3=Ã^aP°¬|ÜaTì src/config.zig  ¤¢À Ÿ0¯êŠÌ7Q Û|Ÿâç;v%ey¡3­K src/diff.zig  ¤S…Ìm„Ÿ•Ú*ÄÖgŞpMeAÒ’şœ¯1èî'-èËáb src/discovery.zig  ¤N'ió
+b¡²5›†=Ğùr‹vÕ3g¬¡ïÒèÂ src/flow.zig  ¤w·ÆfõÊ´#8¡ì7ƒŒNŠ ütEc)ÏSxŞœ>g‘ src/fork.zig  ¤çÓ€óÓ4äóøä„Š‚1Ÿ#µ'Ìºçï¾6‘šc] src/freshness.zig  ¤÷ëÁKjvu]äP™[%ªæ!r#@„B\Î"£*= 
+src/gc.zig  ¤ÌWÁ
+£ìœV9ªğ´'/²3æhNa ç¼\ src/git.zig  ¤'ß‚p§HD¡€‹Ö\Kn ¦!SJRç°†¿á src/grade.zig  ¤Eïò¿?Æhî²~BÃ6ô~½"¨ùĞoV÷óê— src/history.zig  ¤ZW|›¿e,óù=5†Bkîó*ç†w¸&L'ë¼£{ src/hook.zig  ¤Âù`Ú^†B9Ñ_±ùºmƒYoâ =UœFH\«Á
+Ş“ñ src/ignore.zig  ¤¸ÃØÅ·haÅELE(aa€¡6áà¨É@º‹Aché†È src/index.zig  ¤l÷J™ÈÈ·É«ÕìpxI–#Üd­ÓÄ÷$	üË@p src/keyring.zig  ¤Âƒ/*µê…oÏı‰ù[%jWŒôiÖ¸ÏíZC?·Û src/lfs.zig  ¤ÖÏqVË¯—”6˜ı©)’.±è ¬0´‰.àq­ src/live.zig  ¤ì ¿4äîG‘l/å6ÃônGí:á`N3<ĞsÄô@˜ src/main.zig  ¤ÄÔ£kÜg¤W®}«°—÷hŒãù!è&M¨)&±ê src/merge.zig  ¤Õmä°3½<Xg	ê•ªBÚôø[íËÓ3r src/mesh.zig  ¤âµóæóH@’T¶|š'©6…ãÀ:‚¡ ½Ğ!ùo src/moment.zig  ¤5”sAdÑEóÂÚÙJãÌdıl%zEi‰-bëHn«ˆ• src/net.zig  ¤ˆùKeoÈ¼{»85);q¥eKÍİvS,c¶Ë¥ŒG src/object.zig  ¤6¹«x8°oòÜ‚Á›Ø¼r¯m2¯‚Ì` ğ) src/oid.zig  ¤ôÉ–*g©µ„µøm‚ (û0ÚE0‡ôéôpõ¯* src/opdag.zig  ¤¾şŠ¸,SKØuævßS<›Ë˜ô¸½Ph\{q¡t src/oplog.zig  ¤Cˆ†èVYæ¯™c‚±e+üàIèÖ½•w!ŞwÀä(¡ src/proc.zig  ¤ı]1šÙšvÛ¡S†Öü­]uz÷gÄ1<íFıîÂ src/provenance.zig  ¤oÛû‹RÛ3§sOUÙ„Æeªóf+ÜÿÜÙÛI src/purge.zig  ¤œ+í¾À»@÷?­rc492ë£LssøçjÅw(xë src/readset.zig  ¤¡^Ä²ÄÌz¤¯<Ë´'Ùú`E¬÷zNÍé;çİ#V° src/recap.zig  ¤­§)?	È`„Š’<áï2hÇZyV´lãkê‘¥ src/replay.zig  ¤á—Ö¨ãP?ñ7ı\òK:ë·…é©UÙ]nTƒ¾qìY src/revspec.zig  ¤x¢!ï)t¥*‰Å"X3È˜/ŒÓñ
+Öš8NöÚE+mj src/rewind.zig  ¤èÕïz>ªÂ²~Åz=÷Ö~Jè/œ·[EïIÙ^Õ src/sched.zig  ¤‹ël¦òÙµ*ş×ùş'>+Nº®Ñ¾i8h²ø src/seal.zig  ¤_¹YZó	Ò&—Pƒà>W(63íï‚…”@ÍÒI®WŞµÂ src/settings.zig  ¤7Ú5'Oƒ`¾m‰Á[	'Ò°‰æ¹Cƒ>T÷| src/share.zig  ¤-ì½İ4â*ÄŒ3’¨)K2Ü˜±WòWc- åxé0” src/store.zig  ¤Ó ­wi“ë‹;“t:ä3$ßtÖĞÔæ¾²Ëín4+'t src/superpose.zig  ¤–c”/€®/ÈZˆ÷©	p>¾üøïÜ²t.Yƒ¼B src/sync.zig  ¤«ŞFˆ2ˆçß[›eëU:­( —Ó¦®<ªCëI9m src/tracer.zig  ¤·uoá.A<æŒ·–º”ªél©QT8©ûØV( 
+src/ui.zig  ¤è©Á›0Åî‰hs®\PÊìX4Ê7É|í³5n&^]è src/update.zig  ¤¼ÖIÖYX¬½µ|j±gÿiå)¶İâÍ>ÏÚ×yü src/verdict.zig  ¤üÅ{Hè„d]\ŠÃ7­ÕèéÍ1¸Í:Mhs2 src/warrant.zig  ¤4ÛÚL"¯:rÖıVÙÓ£h–İ÷O'SŒª@N)f src/watch.zig  ¤½Ûy´şğ%&Y¥°œyp”h;¦ÑÚªVÍìÚ»ı src/workspace.zig  ¤ó+|sÉR·úUe2,‡Öã¾áE8åHOÿßY‹ src/wormhole.zigN   ¤  -       .sdt/objects/75/32ba24f029244fa3614aafba5b5d79e172ffa04b0fdaaf04d7fd881ee3650dB       Ù   V2ÙÉØÀ çÖ>	Yã"ED#ÏñşÛoUÍğG3N   ¤  -       .sdt/objects/75/340a96196d971cc6f991d12cf476d1864bf58f9a41599a3aa503351a73aa21B       {    ‡[~Ê¬îs‘4+8K×¨#Ì.ùµ$½eŠ	áêN   ¤        .sdt/objects/75/4aff79cde274b68b9cb4e529673127386be0a44703c293a339329ddcef06cd#include "clar_libgit2.h"
 #include "tree.h"
 
 static git_repository *_repo;
@@ -100840,141 +100867,4 @@ fn openWork(io: std.Io) !std.Io.Dir {
 }
 
 fn openRepo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?Store {
-    return Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
-        try w.print("{s}{s}{s} not a guardrail repo\n", .{ ui.on(.red), ui.cross, ui.off() });
-        try ui.hint(w, "run `gr init` here, or cd into a repo");
-        return null;
-    };
-}
-
-fn shortHex(o: Oid, buf: []u8) []const u8 {
-    _ = o.toHex(buf);
-    return buf[0..12];
-}
-
-fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
-    var s = Store.init(io, alloc, std.Io.Dir.cwd()) catch |e| switch (e) {
-        Store.Error.RepoExists => {
-            try w.writeAll("guardrail repo already exists here\n");
-            return;
-        },
-        else => return e,
-    };
-    const db = config.defaultBranch(io, alloc) catch try alloc.dupe(u8, "main");
-    defer alloc.free(db);
-    s.setHeadBranch(db) catch {};
-    s.deinit();
-    try w.print("{s}{s}{s} initialized empty guardrail repo in {s}.gr{s} on {s}{s}{s}\n", .{
-        ui.on(.green), ui.check, ui.off(), ui.on(.dim), ui.off(), ui.on(.cyan), db, ui.off(),
-    });
-}
-
-fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-    const records = try provenance.all(&s, alloc);
-    defer provenance.freeAll(alloc, records);
-    if (records.len == 0) {
-        try w.writeAll("no provenance recorded (set GR_PROMPT/GR_AGENT or use `gr save --prompt`)\n");
-        return;
-    }
-    var buf: [Oid.len * 2]u8 = undefined;
-    for (records) |r| {
-        try w.print("{s}", .{shortHex(r.change, &buf)});
-        if (r.entry.agent.len != 0) try w.print("  [{s}]", .{r.entry.agent});
-        try w.print("\n    {s}\n", .{r.entry.prompt});
-    }
-}
-
-fn cmdBlame(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    if (rest.len < 1) {
-        try w.writeAll("usage: gr blame <file>\n");
-        return;
-    }
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-    try blame.run(&s, alloc, w, rest[0]);
-}
-
-fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-    var work = try openWork(io);
-    defer work.close(io);
-
-    if (hasFlag(rest, "--abort")) {
-        merge.abort(&s, alloc, work) catch |e| switch (e) {
-            error.NoMergeInProgress => {
-                try w.writeAll("no merge in progress\n");
-                return;
-            },
-            else => return e,
-        };
-        try w.writeAll("merge aborted. working tree restored\n");
-        return;
-    }
-    if (rest.len < 1) {
-        const rem = try merge.remainingConflicts(&s, alloc);
-        defer {
-            for (rem) |p| alloc.free(p);
-            alloc.free(rem);
-        }
-        if (rem.len == 0) {
-            try w.writeAll("no merge in progress\n");
-            return;
-        }
-        try w.writeAll("usage: gr resolve <file>   (or --abort)\nunresolved:\n");
-        for (rem) |p| try w.print("  ! {s}\n", .{p});
-        return;
-    }
-    merge.markResolved(&s, alloc, work, rest[0]) catch |e| switch (e) {
-        error.StillConflicted => {
-            try w.print("{s} still has conflict markers. fix them first\n", .{rest[0]});
-            return;
-        },
-        error.NoMergeInProgress => {
-            try w.writeAll("no merge in progress\n");
-            return;
-        },
-        else => return e,
-    };
-    const rem = try merge.remainingConflicts(&s, alloc);
-    defer {
-        for (rem) |p| alloc.free(p);
-        alloc.free(rem);
-    }
-    if (rem.len == 0) {
-        try w.print("resolved {s}. all conflicts cleared, now `gr save`\n", .{rest[0]});
-    } else {
-        try w.print("resolved {s}. {d} conflict(s) left\n", .{ rest[0], rem.len });
-    }
-}
-
-fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-    captureBefore(io, alloc, &s);
-    const branch = try s.headBranch();
-    defer alloc.free(branch);
-    const tip = s.readRef(branch) catch {
-        try w.writeAll("nothing to revert. no changes yet\n");
-        return;
-    };
-    const head_change = try s.readChange(tip);
-    defer object.freeChange(alloc, head_change);
-
-    // Target tree: an explicit change hex, else the parent of HEAD (undo last).
-    var target_tree: Oid = undefined;
-    var target_desc: []const u8 = "";
-    if (rest.len >= 1 and !std.mem.startsWith(u8, rest[0], "-")) {
-        const target_oid = Oid.fromHex(rest[0]) catch {
-            try w.print("not a change id: {s}\n", .{rest[0]});
-            return;
-        };
-        const tc = s.readChange(target_oid) catch {
-            try w.print("no such change: {s}\n", .{rest[0]});
-            return;
-        };
-        defer object.freeChange(alloc, tc);
-        target_tree = tc.tree;
-        target_desc
+    return Store.discover(io, alloc

@@ -1,4 +1,141 @@
- = rest[0];
+, std.Io.Dir.cwd()) catch {
+        try w.print("{s}{s}{s} not a guardrail repo\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "run `gr init` here, or cd into a repo");
+        return null;
+    };
+}
+
+fn shortHex(o: Oid, buf: []u8) []const u8 {
+    _ = o.toHex(buf);
+    return buf[0..12];
+}
+
+fn cmdInit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = Store.init(io, alloc, std.Io.Dir.cwd()) catch |e| switch (e) {
+        Store.Error.RepoExists => {
+            try w.writeAll("guardrail repo already exists here\n");
+            return;
+        },
+        else => return e,
+    };
+    const db = config.defaultBranch(io, alloc) catch try alloc.dupe(u8, "main");
+    defer alloc.free(db);
+    s.setHeadBranch(db) catch {};
+    s.deinit();
+    try w.print("{s}{s}{s} initialized empty guardrail repo in {s}.gr{s} on {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.dim), ui.off(), ui.on(.cyan), db, ui.off(),
+    });
+}
+
+fn cmdProvenance(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const records = try provenance.all(&s, alloc);
+    defer provenance.freeAll(alloc, records);
+    if (records.len == 0) {
+        try w.writeAll("no provenance recorded (set GR_PROMPT/GR_AGENT or use `gr save --prompt`)\n");
+        return;
+    }
+    var buf: [Oid.len * 2]u8 = undefined;
+    for (records) |r| {
+        try w.print("{s}", .{shortHex(r.change, &buf)});
+        if (r.entry.agent.len != 0) try w.print("  [{s}]", .{r.entry.agent});
+        try w.print("\n    {s}\n", .{r.entry.prompt});
+    }
+}
+
+fn cmdBlame(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: gr blame <file>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    try blame.run(&s, alloc, w, rest[0]);
+}
+
+fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    if (hasFlag(rest, "--abort")) {
+        merge.abort(&s, alloc, work) catch |e| switch (e) {
+            error.NoMergeInProgress => {
+                try w.writeAll("no merge in progress\n");
+                return;
+            },
+            else => return e,
+        };
+        try w.writeAll("merge aborted. working tree restored\n");
+        return;
+    }
+    if (rest.len < 1) {
+        const rem = try merge.remainingConflicts(&s, alloc);
+        defer {
+            for (rem) |p| alloc.free(p);
+            alloc.free(rem);
+        }
+        if (rem.len == 0) {
+            try w.writeAll("no merge in progress\n");
+            return;
+        }
+        try w.writeAll("usage: gr resolve <file>   (or --abort)\nunresolved:\n");
+        for (rem) |p| try w.print("  ! {s}\n", .{p});
+        return;
+    }
+    merge.markResolved(&s, alloc, work, rest[0]) catch |e| switch (e) {
+        error.StillConflicted => {
+            try w.print("{s} still has conflict markers. fix them first\n", .{rest[0]});
+            return;
+        },
+        error.NoMergeInProgress => {
+            try w.writeAll("no merge in progress\n");
+            return;
+        },
+        else => return e,
+    };
+    const rem = try merge.remainingConflicts(&s, alloc);
+    defer {
+        for (rem) |p| alloc.free(p);
+        alloc.free(rem);
+    }
+    if (rem.len == 0) {
+        try w.print("resolved {s}. all conflicts cleared, now `gr save`\n", .{rest[0]});
+    } else {
+        try w.print("resolved {s}. {d} conflict(s) left\n", .{ rest[0], rem.len });
+    }
+}
+
+fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    const tip = s.readRef(branch) catch {
+        try w.writeAll("nothing to revert. no changes yet\n");
+        return;
+    };
+    const head_change = try s.readChange(tip);
+    defer object.freeChange(alloc, head_change);
+
+    // Target tree: an explicit change hex, else the parent of HEAD (undo last).
+    var target_tree: Oid = undefined;
+    var target_desc: []const u8 = "";
+    if (rest.len >= 1 and !std.mem.startsWith(u8, rest[0], "-")) {
+        const target_oid = Oid.fromHex(rest[0]) catch {
+            try w.print("not a change id: {s}\n", .{rest[0]});
+            return;
+        };
+        const tc = s.readChange(target_oid) catch {
+            try w.print("no such change: {s}\n", .{rest[0]});
+            return;
+        };
+        defer object.freeChange(alloc, tc);
+        target_tree = tc.tree;
+        target_desc = rest[0];
     } else if (head_change.parents.len != 0) {
         const parent = try s.readChange(head_change.parents[0]);
         defer object.freeChange(alloc, parent);
@@ -112225,106 +112362,4 @@ done:
 #define MORE_CRLF_TEXT_AS_LF	"crlf\ncrlf\nlf\ncrlf\ncrlf\n"
 #define MORE_LF_TEXT_AS_LF		"lf\nlf\ncrlf\nlf\nlf\n"
 
-#define FEW_UTF8_CRLF_RAW		"\xe2\x9a\xbdThe rest is ASCII01.\r\nThe rest is ASCII02.\r\nThe rest is ASCII03.\r\nThe rest is ASCII04.\r\nThe rest is ASCII05.\r\nThe rest is ASCII06.\r\nThe rest is ASCII07.\r\nThe rest is ASCII08.\r\nThe rest is ASCII09.\r\nThe rest is ASCII10.\r\nThe rest is ASCII11.\r\nThe rest is ASCII12.\r\nThe rest is ASCII13.\r\nThe rest is ASCII14.\r\nThe rest is ASCII15.\r\nThe rest is ASCII16.\r\nThe rest is ASCII17.\r\nThe rest is ASCII18.\r\nThe rest is ASCII19.\r\nThe rest is ASCII20.\r\nThe rest is ASCII21.\r\nThe rest is ASCII22.\r\n"
-#define FEW_UTF8_LF_RAW			"\xe2\x9a\xbdThe rest is ASCII01.\nThe rest is ASCII02.\nThe rest is ASCII03.\nThe rest is ASCII04.\nThe rest is ASCII05.\nThe rest is ASCII06.\nThe rest is ASCII07.\nThe rest is ASCII08.\nThe rest is ASCII09.\nThe rest is ASCII10.\nThe rest is ASCII11.\nThe rest is ASCII12.\nThe rest is ASCII13.\nThe rest is ASCII14.\nThe rest is ASCII15.\nThe rest is ASCII16.\nThe rest is ASCII17.\nThe rest is ASCII18.\nThe rest is ASCII19.\nThe rest is ASCII20.\nThe rest is ASCII21.\nThe rest is ASCII22.\n"
-#define MANY_UTF8_CRLF_RAW		"Lets sing!\r\n\xe2\x99\xab\xe2\x99\xaa\xe2\x99\xac\xe2\x99\xa9\r\nEat food\r\n\xf0\x9f\x8d\x85\xf0\x9f\x8d\x95\r\n"
-#define MANY_UTF8_LF_RAW		"Lets sing!\n\xe2\x99\xab\xe2\x99\xaa\xe2\x99\xac\xe2\x99\xa9\nEat food\n\xf0\x9f\x8d\x85\xf0\x9f\x8d\x95\n"
-
-#endif
-N   ¤  -       .sdt/objects/a6/410ed21ab347251dfa4e9821df7e14d8621c54b55914ac471dae96e5de633aB       ª   Û.]“ó]äµ›LLX6reØ*4£:WçX”:‡K×N   ¤  U      .sdt/objects/a6/42c968102bc58c388f7c9f81138919eac59cc4211f0afbb97cbef90c2a7b8fconst std = @import("std");
-const builtin = @import("builtin");
-const oid = @import("oid.zig");
-const object = @import("object.zig");
-const workspace = @import("workspace.zig");
-const Store = @import("store.zig").Store;
-const Oid = oid.Oid;
-
-extern "c" fn clonefile(src: [*:0]const u8, dst: [*:0]const u8, flags: c_uint) c_int;
-
-extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
-extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
-extern "c" fn close(fd: c_int) c_int;
-const FICLONE: c_ulong = 0x40049409;
-
-pub const Error = error{
-    BranchExists,
-    CloneFailed,
-};
-
-/// List branch names under `.sdt/refs/heads`. Caller frees each name and the slice.
-pub fn list(store: *Store, alloc: std.mem.Allocator) ![][]u8 {
-    const io = store.io;
-    var dir = try store.root.openDir(io, "refs/heads", .{ .iterate = true });
-    defer dir.close(io);
-
-    var names: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (names.items) |n| alloc.free(n);
-        names.deinit(alloc);
-    }
-
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        try names.append(alloc, try alloc.dupe(u8, entry.name));
-    }
-    return names.toOwnedSlice(alloc);
-}
-
-/// Create a new branch at the current HEAD branch's tip. Does not switch.
-pub fn create(store: *Store, name: []const u8) !void {
-    if (store.refExists(name)) return Error.BranchExists;
-    const branch = try store.headBranch();
-    defer store.alloc.free(branch);
-    const tip = try store.readRef(branch);
-    try store.updateRef(name, tip);
-}
-
-/// Point HEAD at `name` and materialize its tree into `work_dir`.
-/// MVP: assumes a clean working tree â€” we do not yet stash or merge dirty
-/// state; the CLI layer will auto-snapshot before switching.
-pub fn switchTo(store: *Store, work_dir: std.Io.Dir, name: []const u8) !void {
-    try store.setHeadBranch(name);
-    if (!store.refExists(name)) return; // unborn branch: nothing to materialize
-    const change = try store.readChange(try store.readRef(name));
-    defer object.freeChange(store.alloc, change);
-    try workspace.materialize(store, change.tree, work_dir);
-}
-
-/// Instant copy-on-write worktree via macOS clonefile(2). `dst_dir_path` must
-/// NOT already exist. Clones the entire src tree (including `.sdt`) for the MVP;
-/// a later refinement can exclude/redirect the repo dir to share one repo.
-pub fn work(io: std.Io, src_dir_path: []const u8, dst_dir_path: []const u8) !void {
-    if (builtin.os.tag == .macos) {
-        var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var dst_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const src_z = try std.fmt.bufPrintZ(&src_buf, "{s}", .{src_dir_path});
-        const dst_z = try std.fmt.bufPrintZ(&dst_buf, "{s}", .{dst_dir_path});
-        if (clonefile(src_z.ptr, dst_z.ptr, 0) != 0) {
-            return Error.CloneFailed;
-        }
-    } else {
-        try workTree(io, src_dir_path, dst_dir_path);
-    }
-}
-
-/// Recursively recreate the src tree at dst. On Linux each regular file is
-/// reflinked (FICLONE) for copy-on-write; on failure and on all other OSes it
-/// falls back to a plain byte copy.
-fn workTree(io: std.Io, src_dir_path: []const u8, dst_dir_path: []const u8) !void {
-    const alloc = std.heap.page_allocator;
-    var src_dir = try std.Io.Dir.openDirAbsolute(io, src_dir_path, .{ .iterate = true });
-    defer src_dir.close(io);
-
-    try std.Io.Dir.cwd().createDirPath(io, dst_dir_path);
-    var dst_dir = try std.Io.Dir.openDirAbsolute(io, dst_dir_path, .{});
-    defer dst_dir.close(io);
-
-    var walker = try src_dir.walk(alloc);
-    defer walker.deinit();
-
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory => try dst_dir.createDirPath(io, entry.path),
-            .file => {
-                var re
+#define FEW_UTF8_CRLF_RAW		"\xe2\x9a\xbdThe rest is ASCII01.\r\nThe rest is ASCII02.\r\nThe rest is ASCII03.\r\nThe rest is ASCII04.\r\nThe rest is ASCII05.\r\nThe rest is ASCII06.\r\nThe rest is ASCII07.\r\nThe rest is ASCII08.\r\nThe rest is ASCII09.\r\nThe rest is ASCII10.\r\nThe rest is ASCII11.\r\nThe rest is ASCII12.\r\nThe rest is ASCII13.\r\nThe rest is ASCII14.\r\nThe rest is ASCII15.\r\nThe rest is ASCII16.\r\nThe rest is ASCII17.\r\nThe rest is ASCII18.\r\nThe rest is ASCII19.\r\nThe rest is ASCII20.\r\nThe rest is ASCII21.\r\nThe res
