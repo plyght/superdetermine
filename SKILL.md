@@ -57,7 +57,7 @@ sdt sync . --force       # resets git's index to the new HEAD
 - **`sdt export . --force` is the only thing that makes an sdt-side rewrite visible to git.** Reorder, squash, split, rebase and point all happen purely in `.sdt`; `git log` shows the *old* history until you export.
 - **`sdt sync <dir>` picks the branch from git's HEAD, not from sdt's HEAD.** If sdt is on `feature` and git's HEAD is on `main`, a sync writes sdt's chain onto **`main`** — which on any benchmark or review is protected-history damage. Never run `sync` first. Run `export --force` (it sets git HEAD to the sdt branch), then `sync . --force`.
 - Without the `sync` afterwards the git index is left stale and `git status` shows spurious staged changes.
-- The background auto-mirror (`sdt config sync.git true`) has the same wrong-branch behaviour on a plain save, and after any history rewrite it refuses outright with *"refusing to move X in .git: N commits there are not in superdetermine"*. Treat every one of those messages as "git is not updated yet"; the explicit `export --force` at the end is what fixes it.
+- The background auto-mirror (`sdt config git-sync on`) has the same wrong-branch behaviour on a plain save, and after any history rewrite it refuses outright with *"refusing to move X in .git: N commits there are not in superdetermine"*. Treat every one of those messages as "git is not updated yet"; the explicit `export --force` at the end is what fixes it.
 - `export` writes **all** sdt branches. Any scratch branch you made shows up in git, and **`sdt` has no branch delete** — so do not create scratch branches you cannot afford to leave behind.
 
 ---
