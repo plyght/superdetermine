@@ -1,4 +1,221 @@
-, std.Io.Dir.cwd()) catch {
+ {
+            const d = editDistance(cmd, e.name);
+            if (d < best_score) {
+                best_score = d;
+                best = e.name;
+            }
+        }
+    }
+    for (aliases) |a| {
+        const d = editDistance(cmd, a.short);
+        if (d < best_score) {
+            best_score = d;
+            best = a.full;
+        }
+    }
+    return best;
+}
+
+fn canonical(cmd: []const u8) []const u8 {
+    for (aliases) |a| {
+        if (eq(cmd, a.short)) return a.full;
+    }
+    return cmd;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    const io = init.io;
+
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(alloc);
+    var arg_it = init.minimal.args.iterate();
+    defer arg_it.deinit();
+    while (arg_it.next()) |a| try args_list.append(alloc, a);
+    const args = args_list.items;
+
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
+    const w = &stdout.interface;
+    ui.init(io, std.Io.File.stdout());
+    defer w.flush() catch {};
+
+    if (args.len < 2) {
+        try printUsage(w);
+        return;
+    }
+
+    const cmd = canonical(args[1]);
+    const rest = args[2..];
+
+    if (eq(cmd, "version")) {
+        try w.print("gr {s}\n", .{version});
+    } else if (eq(cmd, "update")) {
+        var nightly = false;
+        for (rest) |a| {
+            if (eq(a, "--nightly")) nightly = true;
+        }
+        try update.run(io, alloc, w, version, nightly);
+    } else if (eq(cmd, "help")) {
+        try printUsage(w);
+    } else if (eq(cmd, "init")) {
+        try cmdInit(io, alloc, w);
+    } else if (eq(cmd, "save")) {
+        try cmdSave(io, alloc, w, rest);
+    } else if (eq(cmd, "describe")) {
+        try cmdDescribe(io, alloc, w, rest);
+    } else if (eq(cmd, "status")) {
+        try cmdStatus(io, alloc, w, rest);
+    } else if (eq(cmd, "diff")) {
+        try cmdDiff(io, alloc, w);
+    } else if (eq(cmd, "log")) {
+        try cmdLog(io, alloc, w, rest);
+    } else if (eq(cmd, "branch")) {
+        try cmdBranch(io, alloc, w);
+    } else if (eq(cmd, "new")) {
+        try cmdNew(io, alloc, w, rest);
+    } else if (eq(cmd, "switch")) {
+        try cmdSwitch(io, alloc, w, rest);
+    } else if (eq(cmd, "work")) {
+        try cmdWork(io, alloc, w, rest);
+    } else if (eq(cmd, "restore")) {
+        try cmdRestore(io, alloc, w, rest);
+    } else if (eq(cmd, "merge")) {
+        try cmdMerge(io, alloc, w, rest);
+    } else if (eq(cmd, "serve")) {
+        try cmdServe(io, alloc, w, rest);
+    } else if (eq(cmd, "fetch")) {
+        try cmdFetch(io, alloc, w, rest);
+    } else if (eq(cmd, "watch")) {
+        try cmdWatch(io, alloc, w);
+    } else if (eq(cmd, "moments")) {
+        try cmdMoments(io, alloc, w, rest);
+    } else if (eq(cmd, "grade")) {
+        try cmdGrade(io, alloc, w, rest);
+    } else if (eq(cmd, "doctor")) {
+        try cmdDoctor(io, alloc, w);
+    } else if (eq(cmd, "rewind")) {
+        try cmdRewind(io, alloc, w, rest);
+    } else if (eq(cmd, "back")) {
+        try cmdBack(io, alloc, w, rest);
+    } else if (eq(cmd, "green")) {
+        try cmdGreen(io, alloc, w);
+    } else if (eq(cmd, "undo")) {
+        try cmdUndo(io, alloc, w);
+    } else if (eq(cmd, "redo")) {
+        try cmdRedo(io, alloc, w);
+    } else if (eq(cmd, "import")) {
+        try cmdGit(io, alloc, w, rest, .import);
+    } else if (eq(cmd, "export")) {
+        try cmdGit(io, alloc, w, rest, .export_);
+    } else if (eq(cmd, "sync")) {
+        try cmdGit(io, alloc, w, rest, .sync);
+    } else if (eq(cmd, "push")) {
+        try cmdPush(io, alloc, w, rest);
+    } else if (eq(cmd, "pull")) {
+        try cmdPull(io, alloc, w, rest);
+    } else if (eq(cmd, "clone")) {
+        try cmdClone(io, alloc, w, rest);
+    } else if (eq(cmd, "config")) {
+        try cmdConfig(io, alloc, w, rest);
+    } else if (eq(cmd, "why")) {
+        try cmdWhy(io, alloc, w, rest);
+    } else if (eq(cmd, "provenance")) {
+        try cmdProvenance(io, alloc, w);
+    } else if (eq(cmd, "blame")) {
+        try cmdBlame(io, alloc, w, rest);
+    } else if (eq(cmd, "resolve")) {
+        try cmdResolve(io, alloc, w, rest);
+    } else if (eq(cmd, "revert")) {
+        try cmdRevert(io, alloc, w, rest);
+    } else if (eq(cmd, "absorb")) {
+        try cmdAbsorb(io, alloc, w);
+    } else if (eq(cmd, "gc")) {
+        try cmdGc(io, alloc, w, rest);
+    } else if (eq(cmd, "lfs")) {
+        try cmdLfs(io, alloc, w, rest);
+    } else if (eq(cmd, "completions")) {
+        try cmdCompletions(w, rest);
+    } else if (eq(cmd, "key")) {
+        try cmdKey(io, alloc, w, rest);
+    } else if (eq(cmd, "seal")) {
+        try cmdSeal(io, alloc, w, rest);
+    } else if (eq(cmd, "unseal")) {
+        try cmdUnseal(io, alloc, w);
+    } else if (eq(cmd, "rotate")) {
+        try cmdRotate(io, alloc, w);
+    } else if (eq(cmd, "send")) {
+        try cmdSend(io, alloc, w, rest);
+    } else if (eq(cmd, "get")) {
+        try cmdGet(io, alloc, w, rest);
+    } else if (eq(cmd, "relay")) {
+        try cmdRelay(io, alloc, w, rest);
+    } else {
+        try w.print("{s}{s}{s} unknown command: {s}{s}{s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), cmd, ui.off(),
+        });
+        if (nearestCommand(cmd)) |guess| {
+            try w.print("  did you mean {s}gr {s}{s}?\n", .{ ui.on(.cyan), guess, ui.off() });
+        }
+        try w.print("{s}run `gr help` for the full list{s}\n", .{ ui.on(.dim), ui.off() });
+    }
+}
+
+fn eq(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+fn nowSeconds(io: std.Io) i64 {
+    const ns = std.Io.Clock.now(.real, io).nanoseconds;
+    return @intCast(@divTrunc(ns, 1_000_000_000));
+}
+
+fn messageFlag(rest: []const []const u8) []const u8 {
+    return flagValue(rest, "-m", "--message");
+}
+
+fn flagValue(rest: []const []const u8, short: []const u8, long: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        if ((eq(rest[i], short) or eq(rest[i], long)) and i + 1 < rest.len) {
+            return rest[i + 1];
+        }
+    }
+    return "";
+}
+
+fn envOr(name: [:0]const u8, fallback: []const u8) []const u8 {
+    if (fallback.len != 0) return fallback;
+    if (std.c.getenv(name)) |v| {
+        const s = std.mem.span(v);
+        if (s.len != 0) return s;
+    }
+    return "";
+}
+
+// Provenance is OFF by default: only recorded when a prompt/agent is explicitly
+// supplied (--prompt/--agent flag or GR_PROMPT/GR_AGENT env), and never when
+// config `provenance` is a falsy kill-switch.
+fn recordProvenance(io: std.Io, alloc: std.mem.Allocator, s: *Store, change: Oid, rest: []const []const u8) void {
+    const prompt = envOr("GR_PROMPT", flagValue(rest, "--prompt", "--prompt"));
+    const agent = envOr("GR_AGENT", flagValue(rest, "--agent", "--agent"));
+    if (prompt.len == 0 and agent.len == 0) return;
+    if (config.get(s, alloc, "provenance")) |maybe| {
+        if (maybe) |v| {
+            defer alloc.free(v);
+            if (eq(v, "off") or eq(v, "false") or eq(v, "0") or eq(v, "no")) return;
+        }
+    } else |_| {}
+    provenance.record(s, change, agent, prompt, nowSeconds(io)) catch {};
+}
+
+fn openWork(io: std.Io) !std.Io.Dir {
+    // cwd() is a special AT_FDCWD handle that cannot be iterated/seeked.
+    return std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+}
+
+fn openRepo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?Store {
+    return Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
         try w.print("{s}{s}{s} not a guardrail repo\n", .{ ui.on(.red), ui.cross, ui.off() });
         try ui.hint(w, "run `gr init` here, or cd into a repo");
         return null;
@@ -112157,209 +112374,4 @@ void test_submodule_inject_option__url(void)
 	git_submodule *sm;
 	git_str buf = GIT_STR_INIT;
 
-	cl_git_pass(git_str_joinpath(&buf, git_repository_workdir(g_repo), ".gitmodules"));
-	cl_git_rewritefile(buf.ptr,
-			   "[submodule \"naughty\"]\n"
-			   "    path = testrepo\n"
-			   "    url = -u./payload\n");
-	git_str_dispose(&buf);
-
-	/* We do want to find it, but with the appropriate field empty */
-	foundit = 0;
-	cl_git_pass(git_submodule_foreach(g_repo, find_naughty, &foundit));
-	cl_assert_equal_i(1, foundit);
-
-	cl_git_pass(git_submodule_lookup(&sm, g_repo, "naughty"));
-	cl_assert_equal_s("testrepo", git_submodule_path(sm));
-	cl_assert_equal_p(NULL, git_submodule_url(sm));
-
-	git_submodule_free(sm);
-}
-
-void test_submodule_inject_option__path(void)
-{
-	int foundit;
-	git_submodule *sm;
-	git_str buf = GIT_STR_INIT;
-
-	cl_git_pass(git_str_joinpath(&buf, git_repository_workdir(g_repo), ".gitmodules"));
-	cl_git_rewritefile(buf.ptr,
-			   "[submodule \"naughty\"]\n"
-			   "    path = --something\n"
-			   "    url = blah.git\n");
-	git_str_dispose(&buf);
-
-	/* We do want to find it, but with the appropriate field empty */
-	foundit = 0;
-	cl_git_pass(git_submodule_foreach(g_repo, find_naughty, &foundit));
-	cl_assert_equal_i(1, foundit);
-
-	cl_git_pass(git_submodule_lookup(&sm, g_repo, "naughty"));
-	cl_assert_equal_s("naughty", git_submodule_path(sm));
-	cl_assert_equal_s("blah.git", git_submodule_url(sm));
-
-	git_submodule_free(sm);
-}
-N   §  d      .sdt/objects/a6/1f0bca11866ff99f5ae7292a57fe524d1b1efd57e2a1b18ce47f24355ccd66PACK      êxúùåMJ1F˜9EˆÇTU* ‚f7∏ØJ*⁄hOKõπøo |´«˜ﬁ<Õ|á—Úà‘Sà%B≤<¬jôŒX+ã*k5ã√™∫Œ	#pw_r⁄m˙âq≠
-±J"¡^jbZ¿¨È(9‰öXPUK_m,))™ì˚|?Nˇ∫µﬂ‹EŒπ˘ß)∑„„˛Ú∂Àˆ˘ÿé˝Ÿ#Jë¡? ∏E˜mN˚áÍÆˆ=˝_¿ì˚ÕâOìòxúùåI
-¬@ ÔÛäæ“≥dÒﬁƒ{OOGM±Û˛@®SAïÆ"@≠‡}ÊSrXw
-ÜêrHv¿@,ïòS≠> –òöóú›Æ9î8J3¥ÈsY·ﬁYfÖ+≠⁄·§4/ØÌÚò®øèºLg∞.[t1tàf∑SWï?Rsìè¬o ÷|
-<Á¢xú340031Q(JML…M’+©(aò˘y´ãë¢à‹Üør<ßbM„;-õKf◊o	-õøÀŸØ“ ≥æÊ≥xúI-.…ÃKWHT(JML…M’+©(·ÚÀ/W(OUHLIä•sRr2ÛR2RãRπ ÷/∏ı–¸R‹B5ÖÁÛÛærı'î´±π9z≥·õ¥#aPMxú322240031Q(JML…M’+©(ah{§qsÇ◊7◊∂ó+ÃXw•∫5˛è~|ƒf•¡˛lyç+ñÒ ìµxúI-.…ÃKWHT(JML…M’+©(· UgÜ˜+ø£Z˘Ç¬¶5,Ä≤NÈÅœ-∑gd√É˘∏y5–”N   §  -       .sdt/objects/a6/2d02b385586cb1c304001166aec5042c91b56e4d864e4617ea72146cb9ef7eB       ´   ‡#î¯Ò†ów›Vì€ <πΩìŒÁ¥§{F>38ô(˛·N   §  -       .sdt/objects/a6/30d6e4ba5a990054f9a1298d606e1d0aa7f024014edca507f4658bc17e5dedB       A   ΩÜ°kîw·eÀ,H˙1∫›ÔÖA›ˆmz:û„e"ÌËŸN   §        .sdt/objects/a6/33d2355c85e3d5dec9b42614208649712826fa0e799a015bc44cdce1c0387a/*
- * Copyright (C) the libgit2 contributors. All rights reserved.
- *
- * This file is part of libgit2, distributed under the GNU GPL v2 with
- * a Linking Exception. For full terms see the included COPYING file.
- */
-
-#include <stdio.h>
-#include <git2.h>
-#include "common.h"
-#include "cmd.h"
-
-int cli_opt__show_help = 0;
-int cli_opt__use_pager = 1;
-
-static int show_version = 0;
-static char *command = NULL;
-static char **args = NULL;
-
-const cli_opt_spec cli_common_opts[] = {
-	CLI_COMMON_OPT,
-
-	{ CLI_OPT_TYPE_SWITCH,    "version",   0, &show_version, 1,
-	  CLI_OPT_USAGE_DEFAULT,   NULL,      "display the version" },
-	{ CLI_OPT_TYPE_ARG,       "command",   0, &command,      0,
-	  CLI_OPT_USAGE_REQUIRED, "command", "the command to run" },
-	{ CLI_OPT_TYPE_ARGS,      "args",      0, &args,         0,
-	  CLI_OPT_USAGE_DEFAULT,  "args",    "arguments for the command" },
-	{ 0 }
-};
-
-const cli_cmd_spec cli_cmds[] = {
-	{ "blame",       cmd_blame,       "Show the origin of each line of a file" },
-	{ "cat-file",    cmd_cat_file,    "Display an object in the repository" },
-	{ "clone",       cmd_clone,       "Clone a repository into a new directory" },
-	{ "config",      cmd_config,      "View or set configuration values " },
-	{ "hash-object", cmd_hash_object, "Hash a raw object and product its object ID" },
-	{ "help",        cmd_help,        "Display help information" },
-	{ "index-pack",  cmd_index_pack,  "Create an index for a packfile" },
-	{ "init",        cmd_init,        "Create a new git repository" },
-	{ NULL }
-};
-
-/*
- * Reorder the argv as it was given, since git has the notion of global
- * options (like `--help` or `-c key=val`) that we want to pass to the
- * subcommand, and that can appear early in the arguments, before the
- * command name. Put the command-name in argv[1] to allow easier parsing.
- */
-static void reorder_args(char **argv, size_t first)
-{
-	char *tmp;
-	size_t i;
-
-	if (first == 1)
-		return;
-
-	tmp = argv[first];
-
-	for (i = first; i > 1; i--)
-		argv[i] = argv[i - 1];
-
-	argv[1] = tmp;
-}
-
-/*
- * When invoked without a command, or just with `--help`, we invoke
- * the help command; but we want to preserve only arguments that would
- * be useful for that.
- */
-static void help_args(int *argc, char **argv)
-{
-	cli_opt__show_help = 0;
-
-	argv[0] = "help";
-	*argc = 1;
-}
-
-int main(int argc, char **argv)
-{
-	const cli_cmd_spec *cmd;
-	cli_opt_parser optparser;
-	cli_opt opt;
-	int ret = 0;
-
-	if (git_libgit2_init() < 0) {
-		cli_error("failed to initialize libgit2");
-		exit(CLI_EXIT_GIT);
-	}
-
-	cli_opt_parser_init(&optparser, cli_common_opts, argv + 1, argc - 1, CLI_OPT_PARSE_GNU);
-
-	/* Parse the top-level (common) options and command information */
-	while (cli_opt_parser_next(&opt, &optparser)) {
-		if (!opt.spec) {
-			cli_opt_status_fprint(stderr, PROGRAM_NAME, &opt);
-			cli_opt_usage_fprint(stderr, PROGRAM_NAME, NULL, cli_common_opts, CLI_OPT_USAGE_SHOW_HIDDEN);
-			ret = CLI_EXIT_USAGE;
-			goto done;
-		}
-
-		/*
-		 * When we see a command, stop parsing and capture the
-		 * remaining arguments as args for the command itself.
-		 */
-		if (command) {
-			reorder_args(argv, optparser.idx);
-			break;
-		}
-	}
-
-	if (show_version) {
-		printf("%s version %s\n", PROGRAM_NAME, LIBGIT2_VERSION);
-		goto done;
-	}
-
-	if (!command) {
-		help_args(&argc, argv);
-		ret = cmd_help(argc, argv);
-		goto done;
-	}
-
-	if ((cmd = cli_cmd_spec_byname(command)) == NULL) {
-		ret = cli_error("'%s' is not a %s command. See '%s help'.",
-		                command, PROGRAM_NAME, PROGRAM_NAME);
-		goto done;
-	}
-
-	ret = cmd->fn(argc - 1, &argv[1]);
-
-done:
-	git_libgit2_shutdown();
-	return ret;
-}
-N   §  ¿      .sdt/objects/a6/3959910623d41ea0ac4029b43feaaed5e917fc835968faa7bdf890ef1aaf6f#ifndef INCLUDE_filter_crlf_h__
-#define INCLUDE_filter_crlf_h__
-
-/*
- * file content for files in the resources/crlf repository
- */
-
-#define UTF8_BOM "\xEF\xBB\xBF"
-
-#define ALL_CRLF_TEXT_RAW		"crlf\r\ncrlf\r\ncrlf\r\ncrlf\r\n"
-#define ALL_LF_TEXT_RAW			"lf\nlf\nlf\nlf\nlf\n"
-#define MORE_CRLF_TEXT_RAW		"crlf\r\ncrlf\r\nlf\ncrlf\r\ncrlf\r\n"
-#define MORE_LF_TEXT_RAW		"lf\nlf\ncrlf\r\nlf\nlf\n"
-
-#define ALL_CRLF_TEXT_AS_CRLF	ALL_CRLF_TEXT_RAW
-#define ALL_LF_TEXT_AS_CRLF		"lf\r\nlf\r\nlf\r\nlf\r\nlf\r\n"
-#define MORE_CRLF_TEXT_AS_CRLF	"crlf\r\ncrlf\r\nlf\r\ncrlf\r\ncrlf\r\n"
-#define MORE_LF_TEXT_AS_CRLF	"lf\r\nlf\r\ncrlf\r\nlf\r\nlf\r\n"
-
-#define ALL_CRLF_TEXT_AS_LF		"crlf\ncrlf\ncrlf\ncrlf\n"
-#define ALL_LF_TEXT_AS_LF		ALL_LF_TEXT_RAW
-#define MORE_CRLF_TEXT_AS_LF	"crlf\ncrlf\nlf\ncrlf\ncrlf\n"
-#define MORE_LF_TEXT_AS_LF		"lf\nlf\ncrlf\nlf\nlf\n"
-
-#define FEW_UTF8_CRLF_RAW		"\xe2\x9a\xbdThe rest is ASCII01.\r\nThe rest is ASCII02.\r\nThe rest is ASCII03.\r\nThe rest is ASCII04.\r\nThe rest is ASCII05.\r\nThe rest is ASCII06.\r\nThe rest is ASCII07.\r\nThe rest is ASCII08.\r\nThe rest is ASCII09.\r\nThe rest is ASCII10.\r\nThe rest is ASCII11.\r\nThe rest is ASCII12.\r\nThe rest is ASCII13.\r\nThe rest is ASCII14.\r\nThe rest is ASCII15.\r\nThe rest is ASCII16.\r\nThe rest is ASCII17.\r\nThe rest is ASCII18.\r\nThe rest is ASCII19.\r\nThe rest is ASCII20.\r\nThe rest is ASCII21.\r\nThe res
+	cl_git_pass(git_str_joinpath(&buf, git_repository_workdir(g_repo), ".gitmodul

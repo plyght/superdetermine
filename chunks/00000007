@@ -1,4 +1,259 @@
- sljit_jump *jump = NULL;
+] != NULL)
+    JUMPHERE(jump[0]);
+#endif
+  return cc + 32 / sizeof(pcre_uchar);
+
+#if defined SUPPORT_UTF || defined COMPILE_PCRE16 || defined COMPILE_PCRE32
+  case OP_XCLASS:
+  if (check_str_ptr)
+    detect_partial_match(common, backtracks);
+  compile_xclass_matchingpath(common, cc + LINK_SIZE, backtracks);
+  return cc + GET(cc, 0) - 1;
+#endif
+  }
+SLJIT_UNREACHABLE();
+return cc;
+}
+
+static SLJIT_INLINE pcre_uchar *compile_charn_matchingpath(compiler_common *common, pcre_uchar *cc, pcre_uchar *ccend, jump_list **backtracks)
+{
+/* This function consumes at least one input character. */
+/* To decrease the number of length checks, we try to concatenate the fixed length character sequences. */
+DEFINE_COMPILER;
+pcre_uchar *ccbegin = cc;
+compare_context context;
+int size;
+
+context.length = 0;
+do
+  {
+  if (cc >= ccend)
+    break;
+
+  if (*cc == OP_CHAR)
+    {
+    size = 1;
+#ifdef SUPPORT_UTF
+    if (common->utf && HAS_EXTRALEN(cc[1]))
+      size += GET_EXTRALEN(cc[1]);
+#endif
+    }
+  else if (*cc == OP_CHARI)
+    {
+    size = 1;
+#ifdef SUPPORT_UTF
+    if (common->utf)
+      {
+      if (char_has_othercase(common, cc + 1) && char_get_othercase_bit(common, cc + 1) == 0)
+        size = 0;
+      else if (HAS_EXTRALEN(cc[1]))
+        size += GET_EXTRALEN(cc[1]);
+      }
+    else
+#endif
+    if (char_has_othercase(common, cc + 1) && char_get_othercase_bit(common, cc + 1) == 0)
+      size = 0;
+    }
+  else
+    size = 0;
+
+  cc += 1 + size;
+  context.length += IN_UCHARS(size);
+  }
+while (size > 0 && context.length <= 128);
+
+cc = ccbegin;
+if (context.length > 0)
+  {
+  /* We have a fixed-length byte sequence. */
+  OP2(SLJIT_ADD, STR_PTR, 0, STR_PTR, 0, SLJIT_IMM, context.length);
+  add_jump(compiler, backtracks, CMP(SLJIT_GREATER, STR_PTR, 0, STR_END, 0));
+
+  context.sourcereg = -1;
+#if defined SLJIT_UNALIGNED && SLJIT_UNALIGNED
+  context.ucharptr = 0;
+#endif
+  do cc = byte_sequence_compare(common, *cc == OP_CHARI, cc + 1, &context, backtracks); while (context.length > 0);
+  return cc;
+  }
+
+/* A non-fixed length character will be checked if length == 0. */
+return compile_char1_matchingpath(common, *cc, cc + 1, backtracks, TRUE);
+}
+
+/* Forward definitions. */
+static void compile_matchingpath(compiler_common *, pcre_uchar *, pcre_uchar *, backtrack_common *);
+static void compile_backtrackingpath(compiler_common *, struct backtrack_common *);
+
+#define PUSH_BACKTRACK(size, ccstart, error) \
+  do \
+    { \
+    backtrack = sljit_alloc_memory(compiler, (size)); \
+    if (SLJIT_UNLIKELY(sljit_get_compiler_error(compiler))) \
+      return error; \
+    memset(backtrack, 0, size); \
+    backtrack->prev = parent->top; \
+    backtrack->cc = (ccstart); \
+    parent->top = backtrack; \
+    } \
+  while (0)
+
+#define PUSH_BACKTRACK_NOVALUE(size, ccstart) \
+  do \
+    { \
+    backtrack = sljit_alloc_memory(compiler, (size)); \
+    if (SLJIT_UNLIKELY(sljit_get_compiler_error(compiler))) \
+      return; \
+    memset(backtrack, 0, size); \
+    backtrack->prev = parent->top; \
+    backtrack->cc = (ccstart); \
+    parent->top = backtrack; \
+    } \
+  while (0)
+
+#define BACKTRACK_AS(type) ((type *)backtrack)
+
+static void compile_dnref_search(compiler_common *common, pcre_uchar *cc, jump_list **backtracks)
+{
+/* The OVECTOR offset goes to TMP2. */
+DEFINE_COMPILER;
+int count = GET2(cc, 1 + IMM2_SIZE);
+pcre_uchar *slot = common->name_table + GET2(cc, 1) * common->name_entry_size;
+unsigned int offset;
+jump_list *found = NULL;
+
+SLJIT_ASSERT(*cc == OP_DNREF || *cc == OP_DNREFI);
+
+OP1(SLJIT_MOV, TMP1, 0, SLJIT_MEM1(SLJIT_SP), OVECTOR(1));
+
+count--;
+while (count-- > 0)
+  {
+  offset = GET2(slot, 0) << 1;
+  GET_LOCAL_BASE(TMP2, 0, OVECTOR(offset));
+  add_jump(compiler, &found, CMP(SLJIT_NOT_EQUAL, SLJIT_MEM1(SLJIT_SP), OVECTOR(offset), TMP1, 0));
+  slot += common->name_entry_size;
+  }
+
+offset = GET2(slot, 0) << 1;
+GET_LOCAL_BASE(TMP2, 0, OVECTOR(offset));
+if (backtracks != NULL && !common->jscript_compat)
+  add_jump(compiler, backtracks, CMP(SLJIT_EQUAL, SLJIT_MEM1(SLJIT_SP), OVECTOR(offset), TMP1, 0));
+
+set_jumps(found, LABEL());
+}
+
+static void compile_ref_matchingpath(compiler_common *common, pcre_uchar *cc, jump_list **backtracks, BOOL withchecks, BOOL emptyfail)
+{
+DEFINE_COMPILER;
+BOOL ref = (*cc == OP_REF || *cc == OP_REFI);
+int offset = 0;
+struct sljit_jump *jump = NULL;
+struct sljit_jump *partial;
+struct sljit_jump *nopartial;
+
+if (ref)
+  {
+  offset = GET2(cc, 1) << 1;
+  OP1(SLJIT_MOV, TMP1, 0, SLJIT_MEM1(SLJIT_SP), OVECTOR(offset));
+  /* OVECTOR(1) contains the "string begin - 1" constant. */
+  if (withchecks && !common->jscript_compat)
+    add_jump(compiler, backtracks, CMP(SLJIT_EQUAL, TMP1, 0, SLJIT_MEM1(SLJIT_SP), OVECTOR(1)));
+  }
+else
+  OP1(SLJIT_MOV, TMP1, 0, SLJIT_MEM1(TMP2), 0);
+
+#if defined SUPPORT_UTF && defined SUPPORT_UCP
+if (common->utf && *cc == OP_REFI)
+  {
+  SLJIT_ASSERT(TMP1 == SLJIT_R0 && STACK_TOP == SLJIT_R1);
+  if (ref)
+    OP1(SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_SP), OVECTOR(offset + 1));
+  else
+    OP1(SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(TMP2), sizeof(sljit_sw));
+
+  if (withchecks)
+    jump = CMP(SLJIT_EQUAL, TMP1, 0, SLJIT_R2, 0);
+
+  /* No free saved registers so save data on stack. */
+  OP1(SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), LOCALS0, STACK_TOP, 0);
+  OP1(SLJIT_MOV, SLJIT_R1, 0, STR_PTR, 0);
+  OP1(SLJIT_MOV, SLJIT_R3, 0, STR_END, 0);
+  sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_RET(SW) | SLJIT_ARG1(SW) | SLJIT_ARG2(SW) | SLJIT_ARG3(SW) | SLJIT_ARG4(SW), SLJIT_IMM, SLJIT_FUNC_OFFSET(do_utf_caselesscmp));
+  OP1(SLJIT_MOV, STACK_TOP, 0, SLJIT_MEM1(SLJIT_SP), LOCALS0);
+  OP1(SLJIT_MOV, STR_PTR, 0, SLJIT_RETURN_REG, 0);
+
+  if (common->mode == JIT_COMPILE)
+    add_jump(compiler, backtracks, CMP(SLJIT_LESS_EQUAL, SLJIT_RETURN_REG, 0, SLJIT_IMM, 1));
+  else
+    {
+    OP2(SLJIT_SUB | SLJIT_SET_Z | SLJIT_SET_LESS, SLJIT_UNUSED, 0, SLJIT_RETURN_REG, 0, SLJIT_IMM, 1);
+
+    add_jump(compiler, backtracks, JUMP(SLJIT_LESS));
+
+    nopartial = JUMP(SLJIT_NOT_EQUAL);
+    OP1(SLJIT_MOV, STR_PTR, 0, STR_END, 0);
+    check_partial(common, FALSE);
+    add_jump(compiler, backtracks, JUMP(SLJIT_JUMP));
+    JUMPHERE(nopartial);
+    }
+  }
+else
+#endif /* SUPPORT_UTF && SUPPORT_UCP */
+  {
+  if (ref)
+    OP2(SLJIT_SUB | SLJIT_SET_Z, TMP2, 0, SLJIT_MEM1(SLJIT_SP), OVECTOR(offset + 1), TMP1, 0);
+  else
+    OP2(SLJIT_SUB | SLJIT_SET_Z, TMP2, 0, SLJIT_MEM1(TMP2), sizeof(sljit_sw), TMP1, 0);
+
+  if (withchecks)
+    jump = JUMP(SLJIT_ZERO);
+
+  OP2(SLJIT_ADD, STR_PTR, 0, STR_PTR, 0, TMP2, 0);
+  partial = CMP(SLJIT_GREATER, STR_PTR, 0, STR_END, 0);
+  if (common->mode == JIT_COMPILE)
+    add_jump(compiler, backtracks, partial);
+
+  add_jump(compiler, *cc == OP_REF ? &common->casefulcmp : &common->caselesscmp, JUMP(SLJIT_FAST_CALL));
+  add_jump(compiler, backtracks, CMP(SLJIT_NOT_EQUAL, TMP2, 0, SLJIT_IMM, 0));
+
+  if (common->mode != JIT_COMPILE)
+    {
+    nopartial = JUMP(SLJIT_JUMP);
+    JUMPHERE(partial);
+    /* TMP2 -= STR_END - STR_PTR */
+    OP2(SLJIT_SUB, TMP2, 0, TMP2, 0, STR_PTR, 0);
+    OP2(SLJIT_ADD, TMP2, 0, TMP2, 0, STR_END, 0);
+    partial = CMP(SLJIT_EQUAL, TMP2, 0, SLJIT_IMM, 0);
+    OP1(SLJIT_MOV, STR_PTR, 0, STR_END, 0);
+    add_jump(compiler, *cc == OP_REF ? &common->casefulcmp : &common->caselesscmp, JUMP(SLJIT_FAST_CALL));
+    add_jump(compiler, backtracks, CMP(SLJIT_NOT_EQUAL, TMP2, 0, SLJIT_IMM, 0));
+    JUMPHERE(partial);
+    check_partial(common, FALSE);
+    add_jump(compiler, backtracks, JUMP(SLJIT_JUMP));
+    JUMPHERE(nopartial);
+    }
+  }
+
+if (jump != NULL)
+  {
+  if (emptyfail)
+    add_jump(compiler, backtracks, jump);
+  else
+    JUMPHERE(jump);
+  }
+}
+
+static SLJIT_INLINE pcre_uchar *compile_ref_iterator_matchingpath(compiler_common *common, pcre_uchar *cc, backtrack_common *parent)
+{
+DEFINE_COMPILER;
+BOOL ref = (*cc == OP_REF || *cc == OP_REFI);
+backtrack_common *backtrack;
+pcre_uchar type;
+int offset = 0;
+struct sljit_label *label;
+struct sljit_jump *zerolength;
+struct sljit_jump *jump = NULL;
 pcre_uchar *ccbegin = cc;
 int min = 0, max = 0;
 BOOL minimize;
@@ -111676,55 +111931,4 @@ Xkè„˜Ê±7ˆå‰„œçJà&¡h†şUğ>èy}Zgh³JW‡` …YZéNªD€GŠHùoıùøÈMhkp‡€ )†Ú\
 48Ü7và©Ã\À¼À‡$00$@¡CÚ¡Æ7Êp¤Àpÿc<åù\p‹ø€C;LÑ„¨©€€ñ(^Ğ£ 
 jğj„5˜A¸BÀ;ô`"˜ÃÑ˜P¡ehC’L4@+b YÌb
 "s&0|À€ €„9€ÜÆ°}$ã ãrE\@ƒ1ğllªA
-ZNô rA  Â‘fÁòğÄnğÖ…´„A3`QP@;Ğ`+(Ä9¾ƒ˜	Mjb“d*ÀgÀƒ|˜†4 ”iì1 E9ê¡O{@ 
-€ˆ}8ã
-.PA,‘ ¤À‡ˆˆ°•s` ÂtF*S¦ÿá¸®ğf˜è%à?Ô`b|ƒìˆ6`”ŞX/†RÌÓrXÃ+(‰dp†zXã.˜Dá\2“+@Hô5U'dpà€„Àè†\À‚2Í‹÷ÄÁ
-Âğ'l€¥X‡0R(€\ğ#^¢ÃMkjÓ›â4§:İ©d@ĞIA#¢«À¤±58àdTÁ }ğâh€ôAŒ™Õìf9ÛY8Lğ³V¬£6ÀÀ
-¤!-4`A÷[G+xÀ«¦ì«ªÂĞ_SzSxpCpÀ@Œb6´y@my®†… b¼ÀY0…=Ai½òÿ€Òq'°I\ÎdŠ?ÂàS$
->p a¬Ø+ìv”¤,%b¤Ç7ê` ÔaÄ˜Áf 
-'iquÅ /ŞÁpè/ †.yé9+´‚¯@iTğã+…ág´<=ŒööŒïtÈà½1†5 ï(D=0KxDâ9Cèçû5‚¤Ğÿø0#`€MâuA0ĞA|À˜áÁ£²äBŒD Jp&pĞƒ ¡ÍÃ‹t Í˜Ç¦æx‚¨íÀ}äbS­Ã>„1 ¦DpáxÓPÀ Rƒ¾1)ìÉBÒPrÿ#ãXA›à•«¼y>&‚áƒ(láeam|cç¨VôXéC
-Ø´ UbóÅ”)ö1
-P ”Ğï Úä€'¤å	ÀÏó<…5ÈíÀA›,$Ê55:2 Â(Ü‘IaÆ/˜iTf¹e<Áx…>:! Q‘@€RMà„à¬Æ8®À+í>g[­(B’?dÍRÊ(H<>|óèÆÉ0Hb0„b›°µáÚÉ&xawœ#§‚;³¼B­`õ@[˜ ˜‚ê&€à¡äÚÇŒäÄ|8/€ÿlWw"Í›0`y„ğ4àq…¤Lc@À—·ëñƒ<ä"ùÂP@lqH#(mø0i<Áy2ÊıøñŠÖ­èk; @Vq¦3 hE;Jƒ35£]HkSÁÖ”ÛLR’3lĞëîøæ+V`©¿¦mm„=1¤PÔAÌØBFàXê Ù(€³<Òœ Õ€G$I‚÷v‚³M)Á æÀqÄGêv-	>ÇWËvéX»¬–iLÁC::q¼)`Ä£
-"í¹CvpnSTPëõ•ä7ÕT‚¦t€‚AÇ9ÒAlyÿÄ"!¿z;*!xúÚ¿úåoÿô!ŒÖÁUœ¯D
-R5w0¸Ÿ¢ĞÇtˆ‡#5Ãü <BHóH"†ø;@A¸, î@…¢n€JğcAòŞ‘
-ø€…Á˜ğ7„ƒ¤¬Ã‘íÉ@“õJdtÀtB¢dFˆ	H†ôB=¤ƒ5ƒ€_‰Œ™İÈ9 Âíˆ€HK¬!€ˆPÂÜNè@+ğ", 	ÀÔ/ÌÀTÀ¤Å\Àu5:ï­;ì@£I.Ô4™dxÀ¸;°4`€h€dÌR;À‚\ÀHÂ;ÄÂ@XÃÿ7¬aŒåĞZÄÒ‡`Àƒ>ÄõŒ
-°¡Š6½(¨,”Ç<€Ë8íC+@ƒ3ø "àC/ğ@Ô5ŒP yÌÁªŒCÅc¼3¤C!ôà;E74aJ´¾éÛÃ%é‘Àğ:ğvøšÂ­C#˜@4€0¼ƒ!À„C=ô˜Â<˜P¢ì1c3:ã3Bc5ñ€) Ã<\ÅLÍB98CÌ=EÍ½‚İ4@¬ƒ50dÕˆÖÎŒCè];P‚@Ò-	4İÓQbÕ„8XC‹S¤€ì;Ì:€X˜ÙDBB,Ä`AÄ9ƒdÀÈÁËeÁ¸İÿ\IÜÙ#eÕ]àLC;ÔÁÔü)ÀCàÁ}^‘ìBÈ0Rœƒ5°@>ET@¬¤‡N9T€„Á8XC  (C:,BZ=…¯Œ”T4 ,“Ò8…T Z4VŒöÔ+Àí•bÈC8‚!4‚ZBÈ_%¼@OÎm\€ÂòíOÿĞC.€S|À¡ƒ ˜6µCöQ 	ÔÁ4Ì·À‚pÀuĞñ =˜ß‚úÅB;‚2Æ¢üBı5Åıåßş9À°Ã44A à`]åÂ9´1H|C=Ä.™]×c<ÙŒ(çÿp‚ p ºÀdC=p(¨ 0€±‘Nx© (òŒ€'¸€Ò ˆÙ#¦è`!tNlÀ0!7 ¡Ö€1dF0D‚F¹C†Z!ÂAÅt€Xra2ŒAçğ	)0Ô@$´c ¤ÅSĞa­õä‡ %˜8å¥ü6	›D”Ãe	–”@ğ‚<”ï 'ìÃ+`À….Ì,€(B2¬
-;L×µA…\Á4ˆPSVÖ 0d†0HÂ ;à@è7¤Ãô˜TÌb-ò¨¸,À0@Oê1¬C”@P@qqÂx€Í1$Û>ÔÁÿzå›ÂiœÊéNmÀA¨—0ôÀ8@\ÉPSš(‚~	@	4@àC20 Í`g…=<Œ‚<‚Ø<*Ó¹X;´B\¡ëD3„Ã¸)îá@¬8°+¨XŒ28d!¤C2 *é¬10c8–HpäÜñ/ñbµø@‡€€1‚Ö€¦œk	Ø€)ğC+Ì$Jp4	 ÔtŸHŞ4dAå¡:(Ã9Ñ•‚¼T‘Ü‘ q×T>El„ƒ2$S`ÀùA$ñçœúZeÈƒX’¥Rù€¤æ!E–Á¥;DÂñÉŒC2@ˆ (¼èÿõW_ş%\	¦‡a"&ªÀH(¼Ã7ì’v ©4€AùuØ:ŒÂ.ö";‚ğÅŸ;˜‚hEì( 
-øS=«‘ÀÄMÃ8`£ Œ<¬AA7Ôƒ”Ú#áƒ©eëa¸^äxmä„‹dl€À<@Ã,€puŒˆ@Xçƒ$À…4C;Ë…'\øÊ¨ñC­S±tHÚÖ| ØKìÀ
-dA9¼ÃÆâÃˆ@¿64åÂU‚5pƒ×ŒÃ/\]§!¨Êm@x‚<¼ ,%ÜÅ	x@OVè,£“õâ>ğAWVÓ&Cÿ´‰ĞCî	@2ğƒ­@.°C=˜@&ğƒ(l,Ãëğ‚5 >|C"0ÄŞa˜çI‚ŠË»î ;”ÃìÀd:0©“BÔe] ,Ê"-RWğ80+A¹uéAˆ@ªée!(ƒ<uŒ«¿BpKğ?†À @ğm9ÁD¬ÚA0À°@BÄ†<Øë 4ÀìC2ÀxñÂ:„£xB;„¥]#È#=2!¥ƒ2H 8@Ô=Øg‘ú.ÈÀ4@$¬4ü„:(€|=°®   ğ,.AL5ˆƒ $aÿà„ƒ:ôA8@4‰ÀÅ±"/ôÀl)ñƒ!€ lÁ4ÔµzÎ$ƒ8¸Á 0 %–B6„C(@ÎA8¸„¯?Qì3hÊüÀíAeçÂ(<€v@—¼B\”Á4¤Ã0LÁR0V=¬™`€¨C9 Á8ÀœV¤1À(¬/Ø€ÃÈ7|Ã  0Ä~í%h,`vlĞìÖ:…Ä	ó€ ;X/41¨( œ^u:@<@ Xƒ>`–Q,ÀáÃ(2\@"ÌC2TÁ  )?Ã‰KÍœC# øEÓ¢<”€@ÿ%”Ã‘q.@Ì†À)cav‰4¡E
-ĞèÀï¬­:, ¼@+,êu–" ±ñ )1 )¬C/¼ 0÷Š€>ğ¨°(ØBW@Ğ¤±_| ¨hCÀ)<!åš	N,5H›[€Â0Ø€+QC\/ÈBéBÅ,¡Ã8HA À+ğ#4 ÌÀj•‚/€üÀMœÍ ‚"Óòc0€„ƒ5 *õ $B;C, \`@,¨D³¡Á7´’!€!„<¨ ,1ĞC#L¨ÂP  €Ã<(Vø@§ÈhTtÀ
-lÂ>ğ‚så_cÀÌC84´ÿ1>!ôŠ@éÜ¯T0Q5tGİ8Â;‹³ğ4ì• €ƒ>Áğ X]ô|j-ƒwx‹·ÈÀ $ÃKB2Ìƒ0L¢½‚;ˆÃKJB3$‚@@ªÕ1ô(ˆƒ:ˆB_¯@"àC|ïÂjğ;Æc€2ÔÃ0]QC*B!hçØ>ƒTˆÔ@%$(Ì$pƒşpAU´+ …<l±8\„!xBµlôÅM.Ìƒ5B#ŒAÎ¸ %ÈÃ7H"$;8ÃLQŸJ/€B¬gœ‚>@C'1¼Ã<ò;u@±B'<ÁJ¢ XÁ+€¸ŠÃ<@ƒ$ˆ8ÿ;œBçlÀŒÃ;"ğA+(Ca@e"¬C:´‚'ì‘ûŠ4 /ètb\¼Ám2F÷dT†•e]¹Àöp)„ø.XLQÔfğ‚'ğ[] C~“ñ0°ğFÿÌƒ_b3çæ4@Uxjda.ƒ!Ì9:ˆÃliD‚>pÃ(ğ‚<@”Ç’æLæùş:@ªBv&üÁjš1àC0ôÁ(ô7'hĞÀ1~)HB¬4m:´0ğ'H„6Å¹p0¼  M¥/ğB!ğÁqpÃ,Àà )èƒ4‚y°CÙ¡C+ğA0´8¬@Shú8Ğ¢'ôÿ9€LÃ‰ğÁ+”C:ôÁ(n Ä@åø X/ğÁ(ü	;ô@¤Q5ó+ÔÁps%á€, Xƒ Æ_h“ ¼fœÌ0   G²1Ü\›t ˜>Lz¸×üàÀ.ì |7ò +ìÂJC.´B°	XE+H‚4ÔÃ+ì p 0†KB0ÈC‘úÂ`À"€%Lt€h]J¤:s!ôÁ.drüÀhìB°+Öo\©l"}x! Yèc=°Ã7 _,ˆÂ=˜Ç7ôÀJV@<;œÁİ/zìËşìK ô;„É<pÃ4ÿ¼ JÎÃŠîÃ"€%7ìÃ’ÎC,ˆç88èAƒ>ÀÃÇ$'èQp?A„^íJB;èƒ52úš30ŒÃt"‡‹Â>ÀCMÀƒ2ª`@04f=@;ğŒ°! Ä»rèØÁÓÇJ$<h#Nß<wÂ Ñc—¾uèôY{"b!C°ŞÕ“§îŒƒR’écÇN7~¼„$ÑÁˆµ}õÖ1Ú°…0tğ¹Ğ`©ÍsÆ…+÷®¾].zq†Û>uåä‰k bÄ4‚Í›o\#H0¨3˜‘
-HÀAÇÛ•l“öõûp`ÁƒmzHÁˆß®!ÿl‚˜ª¼rêôÁƒáa¡ÕXòæ,ÃÀIğêÍ÷_«F èÃOØ!1¸H6P
-Úí¢°ƒ)Êö­ãºT	…®¤Óç5}å„01L·yåê½+#3C¨Ø•^‡‡h¸é:ÏÔŠ!A@i?İ4 >Ìy‡¯œy”a‡/°	FÖÑGe¾p€°mr€pÜSg;D"á5”ghø‘æ p˜¦lêAgÅ)tËL„\J’ç2ø`ƒ9ÒYqw8a>†@ ã›}äig@p¡Î¸Rf}x n¡@a‡A`˜  06èÀ‡\tAÿ Ç [€”s¸agyêA$¡8X!ÊYP—>X„)îc‡*ÿš nÊéÆ"Ü€‰êy´|Ş(?>Ş™§·dœØs„Â°FŸ¨ÀQƒ=%Dêƒ˜€.Oí …:ÂÙtæ™Æ \0¤4®nÛ‡£8°!y¦¸ )0(„²yÖ	å€° ƒŸ}ÎQY†V fkê)G£.@Ê¬aæ	Æ	WO]—İvİ}Şxå—Şzíw.ü e2ªØp¡
-~ğbQ)ãnR	96IÄ!2È…)üè„'Èø"3&Ò6ğ‚ŒÂã’É CˆŸ2»ÿ }„)`6PøÁ@JÙ£&ÌÜ 	9<ƒ‰/Ò˜Áƒ„øÂ‹) ¡ä&©¬X™+‚ô@2á„(¶é!¸À…=ÂN 
-2šp93†É£!0ûàƒoÖQgˆ—J‡4ö°ä  \h>(Î D; 8Yä&¾ÀÚÌ@@—}¡€ò›RÎÚä{M‡Wˆ4æN–2ì(…2¼9¤²»@[áp8£’·­0cõ…~Hƒ	º*Š.~ÈìrÓµaK6YÃ²ÕÕ@8Ù‚	ÙB¡Š.¬È"^è‚Î^ù‡ùªfÂN Ùâ‡l3CşvÙÃsÿáEByc	—cåtç…,”Á3›é<Pƒ*È¡P³²Õ|aŒğB÷¬ğXA|f…¼`<™k¥³ ğĞ	?L¡~6©ZÜVfà¸€‹èp6Ú…dC PºÁ¨`j!ÌĞÔW„‰0ÃìwX‚ˆİ<€‚ä•Av‚òKr±NÔÀL„Ñ•ÈĞ¼µlÁ6ñ†!” <]„Ÿ%öÀ¤±]¸  %´¾Á ZjÃ?,¾€´¾l`*“›«<0ƒ4È[ÛÖ:†ò}Á'C „±9¤òt±”å,iYÿK[Ş—7i@
-` ‚
-T tpÀXV@.V /PìÇ
-˜€ €Ç¡Ğ­ĞM¨}@ˆE,ÀÄ
-ˆ h@3I@à€˜f„Ù ˜ ˜àÌL¨ùM›Ls3ğgR„ÙÏR 0 ÀÌ êŞtÕ;ÑñN”s0K9‡0|@P@Ÿ é
-`ğ}rH%Ô4ÕJğŠX4á@Iá@C+`ª\ŞT˜ì¤Ú0aà‚Ì)è¦=¶¤ ¥xèB00rhf¢fèübÒd® 0^«Dğ‚o: ¨('RĞ ª
-u¨fò@0@ƒ…ÿªöœ	>à ’B€Ù¤*¦©ªÚk­ÉtÁ4Õ¸à˜fX30
-4€ €kA§’º&´ ¤JMw2ıj5ÉfOyşÕ/ê1!`˜HŠvxb*¬;à€d~4¤ÓjÍşÒ#/`W]½éMµ: « EŠH?ğ‚İØô¦¨ª€G_€¹rà+ Áh‘r ö&•'o=@Md†Ä£Td%0  ~G9®@ÚèŞ¿ùÕï~ù›™€—!økÒP›´XªàKpŞrÿ›ZB2¸]xğó|ª¼AãXàø c8Áf\…	ƒ‚&üàÿ‡ıUq_’&bÀ—±_à¿˜]4^q‹oìâ›ØØÁ@î‹Œû‚˜B§ÀAÀËãxéÊ
-UÈ\,uœ,«XÆT%²-ÓëŒwÔ¡8Y]¡‹q˜+VóšÙÜf7¿ùyx*œí‚!¨!>F
-Æ0Xô ®ñºÀ„LgCÑ‰Vt,Cğ Cp#¼¥~	İE_úT+08ÂE-äàÄ7¤Ñ‰)aÕ©VõªYİê0€¯¢ª€‚B·×¹Öõ®İ°,Å¼Æµ `Kw¡CB¼ ia÷˜Ï–ö¥ßÓu€¨H„PpXËÚÿÖsRPà€D›6˜˜·7ìiŸÉ¾oîö·om“l?µÜç®wfÄıhóİ´Ìöj3op#¥ß7Ròn›|ß¹wP@p›Uà 8ÀÜp¿2âñr:¯„‡}ZõË&`[GHµ!ÏqšPò‚›åJ8~SXGÜÛp€Í_Ş¸¡+°t`0À 2ùdğ ‚¥û…Rø\`S4 ¸ú_øS€ì§]mİÃp°ïda~µIŒP‡"ú¦u5@ÏéÜa à-]+ Í¾ €aû»Ğ¾\À€8Ã
-öı9üáŸ¦ëÿÛ1¹Æ4ØÃlğW
-Ø!”ço	.v5c;=}	äÀ!,¾/¸Àq†)Û8ØÃ"{ª„SPAè(À„?Œ¡ë§ò€şP„Ïg
-("Èï›bÀìá7»Ì>øv} é±OÊP ø À½„Ò?vô›B.0?¼Ôş„R!Å¯/(à  @óæ% -®/JÀÄoüÌJ`ş
-.ñ†é’ `ÀÀn©dÉÆ@ Á ÖE÷È ù®/0:@øîà2ÔL²ì@¢o0º| ú€bJÅ6@ã@æŞå\€˜¡0 Ğ:€äÀ~)Tÿ`bÖ!dP0€Ô!Š ‚:À	öà( çŞ)LÚå¤@ªğÎ/àÔ~À„’¦Æ!Fp¿t¥üÀˆn	œ tR€Ï
-	Üm†À"é/	
-Ş¦mâ !z	æì/D`ÄaL@ó>À b!Dğ’œ É€à^ ˆ¡íøhüàl­¿:`”	-k¬ì ¯0†€(ÀÂº€ûâ bAB!mèbÎœ ç£”aü ol@áÒA^àğ«€ÀLáÒ‘×Ñâ%øp1t:àôL!„ÿ!Ba\Lnà@ºÔŠ@
-U`ÿ€ÆÁ& ºPà.‰	Á
-L ûâ dÃÊ`×±M¡n^bñ(òá áxA^Ábm–`ôğèT˜HÒahà("¤¦`¦0ñ¾@À¦Á„@Œşâ†€†!à¡
-`Å@ 	 î€oN%,£+sÄÀx¾²/~r’ÁtÊ^ è¡,l0
-@ö €FÀ@ ÏAÁñãT öÁÀƒ/lÂ,p
-ê!ä`“¢ Z©´áP@îÁğ0)Â¢1ÿs]D“qz@²á
-L‘]HÓ&&IœajFZD!ú€
--ğ ^ÁTÓ/<­/D-"­'%‘öÁ¦Àûü",D *Aÿ£ ‚AbÁ|Ó²vïÆ¡®Ñ€@ÀÁ’Fs1C‚5‘"4G  AJá£Î³]<>Ğ
-”Aà¤>`Ö¡¡ ÿâ
-ÀğòX¢²@¾át0€öáxÀ„€ö!”SB@ Š¥TïyP !èA>€ï"8ã  î3…äAàáI`>™³S¼@œaö’/
-ÀÊAêA<”RGÏÿò	š¡œ€àF¢
-!&1Ës¹JÀè¡”Ä&F"Æ€.A*a*áÖBBÂBIãÆAÆ0`àÁEé¡4d9k^àÚÔ4`ĞqAÆ!öa
- <ÛôJÙåÂDúÀK#@ôÁ|à°48® AÕàñ+,@€Æ† íô -JÁä@¸TˆÀPÇ!ˆáx0à z5Rl€  W…5$ ×`j '»MXyµW/ dºM `¨Áà †!àìä!D   àÖ ô!  Ø.À	†á^AÎâ‹ÿõ æƒT%ÁÃ€`SNW¡õ ~õŸ¬@¾Á&)
-€ê!øÕ&êÕî ?Cã4î  W <xc{õàºµXy …ÕŠõW;` V`Òá
-
- ãfğ¶3Êí * dn:VX(4 ô ğds ä¡*  `>Ê ú ra `(fMX-¶Wƒ†É`
+ZNô rA  Â‘fÁòğÄnğÖ…´„A3`QP@;Ğ`+(Ä9¾ƒ˜	Mjb“d*ÀgÀƒ|˜†4 ”iì1 E9ê¡O{

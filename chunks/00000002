@@ -1,4 +1,9 @@
-39,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E1000 */
+,139,139, /* U+DE800 */
+139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+DF000 */
+139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+DF800 */
+222,223,224,225,223,223,223,223,223,223,223,223,223,223,223,223, /* U+E0000 */
+223,223,223,223,223,223,223,223,223,223,223,223,223,223,223,223, /* U+E0800 */
+139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E1000 */
 139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E1800 */
 139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E2000 */
 139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E2800 */
@@ -57575,7 +57580,7 @@ test "merge conflicts a symlink against a regular file" {
     try testing.expectEqualStrings("some/target", p_data);
     try testing.expect(!hasConflictMarkers(p_data));
 }
-N   ¤  -       .sdt/objects/52/e5623590a67a5b1629fb3ce4b5de3166f310d42637573d5b74a6aadaa28264B          #úÒÖZpÂ¬@óoàá‡êWXPĞw è^L   í          .sdt/objects/53N   ¤  Ğ       .sdt/objects/53/0f96df67b633109c83e4047666fbedb774ef2ec98922b5da8ff3535be09723x+)JMU022g040031QH,.H,JL/-Ö+©(aø*Á^ÛúIÍaå–-M§MJC&¥¦¦Õd|“Ğ÷i½<O˜ófMkbØ9Ó`jòK3sr2ÁÊ¼kÂºõJê6Ì{%{¯¡•ª,½(±¬¬èÈ³3‹ßd=é»dø³(ü~¡c<TQ~eqIjÄÆõòÇêo®½/Î¸¢nãÉ˜’)Gg@U•¥&æ€ÕL¹t@ ıK“ğ^Ñ"¥«~÷ß_¯™½ =’^tN   ¤  -       .sdt/objects/53/113b702d86f06a0df6ced822a57ba00f46610f10d7421eaf67dfad8a387a79B       ©   ÷šŒª‘aL§©›6Î@4ftK~Ûæmrõ‘Ú2øÇõN   ¤  v       .sdt/objects/53/11bf8b2ed5dc61eb39e5fc3264d854bef94362dbc04c9548f0333963755d80xEÍ±Â AbªpHşÿ3àrpl‰ş3DâÙh³9Îï±lÙok-åóï¾¶»Ù§}Ù·İ¯­ÕÒŠV´¢­hE+ZÑšÖ´¦5­iMkZÓšÖ´¡mhCÚĞ†6´¡-´ĞB-´ĞB-´Ğ¶Kû¸8ŒZN   ¤  -       .sdt/objects/53/1904382f5c2d83178bce4dd5f5536dee958a24249f0805dfb6724cd34f2770B      è   ¡.5soYKæÎÔ–åaßŞ§³ö³ÇF}`Z›sÈN   ¤  -       .sdt/objects/53/205fef05db073320e31ff3ec0e910350f42d2f0c1ef830b1aebbd189de9ac8B       Ç   sÔØÓK‰Èÿï\KbÅ_4¦8êqVt¸¿?6N   ¤          .sdt/objects/53/2086cbaa83c567f403c9bcfd69569c0c586dabfac5dea8c45259d4b0de880ax¥Ë!@=Shfù%Æx±†!ëÅ Æö]kğöò/{k©-âa]xW«s	=,lÄP…‰
+N   ¤  -       .sdt/objects/52/e5623590a67a5b1629fb3ce4b5de3166f310d42637573d5b74a6aadaa28264B          #úÒÖZpÂ¬@óoàá‡êWXPĞw è^LN   ¤  Ä       .sdt/objects/52/e78fa0487b8e12f631114fb9344833b8a58c96928e41166656675c80118a58Cg¢d¸H¢+×XÀrà»N¹8Lƒ’íwxÌ1ü‘   >.¬»&1­÷¬Ay¾1ÇœJ)ÓsÇuüÜ1\ë»¯BR‘ÅÄÇÅª[Ã    jûİ     plyght <plyght@peril.lol>   Dsay why apricot is fetched rather than pointed at a sibling checkout   í          .sdt/objects/53N   ¤  Ğ       .sdt/objects/53/0f96df67b633109c83e4047666fbedb774ef2ec98922b5da8ff3535be09723x+)JMU022g040031QH,.H,JL/-Ö+©(aø*Á^ÛúIÍaå–-M§MJC&¥¦¦Õd|“Ğ÷i½<O˜ófMkbØ9Ó`jòK3sr2ÁÊ¼kÂºõJê6Ì{%{¯¡•ª,½(±¬¬èÈ³3‹ßd=é»dø³(ü~¡c<TQ~eqIjÄÆõòÇêo®½/Î¸¢nãÉ˜’)Gg@U•¥&æ€ÕL¹t@ ıK“ğ^Ñ"¥«~÷ß_¯™½ =’^tN   ¤  -       .sdt/objects/53/113b702d86f06a0df6ced822a57ba00f46610f10d7421eaf67dfad8a387a79B       ©   ÷šŒª‘aL§©›6Î@4ftK~Ûæmrõ‘Ú2øÇõN   ¤  v       .sdt/objects/53/11bf8b2ed5dc61eb39e5fc3264d854bef94362dbc04c9548f0333963755d80xEÍ±Â AbªpHşÿ3àrpl‰ş3DâÙh³9Îï±lÙok-åóï¾¶»Ù§}Ù·İ¯­ÕÒŠV´¢­hE+ZÑšÖ´¦5­iMkZÓšÖ´¡mhCÚĞ†6´¡-´ĞB-´ĞB-´Ğ¶Kû¸8ŒZN   ¤  -       .sdt/objects/53/1904382f5c2d83178bce4dd5f5536dee958a24249f0805dfb6724cd34f2770B      è   ¡.5soYKæÎÔ–åaßŞ§³ö³ÇF}`Z›sÈN   ¤  -       .sdt/objects/53/205fef05db073320e31ff3ec0e910350f42d2f0c1ef830b1aebbd189de9ac8B       Ç   sÔØÓK‰Èÿï\KbÅ_4¦8êqVt¸¿?6N   ¤          .sdt/objects/53/2086cbaa83c567f403c9bcfd69569c0c586dabfac5dea8c45259d4b0de880ax¥Ë!@=Shfù%Æx±†!ëÅ Æö]kğöò/{k©-âa]xW«s	=,lÄP…‰
 Šë#g0KÈêIC¶©––,5ù“1¡– ™9;aãlB«è=×>ô­|h}_{{õMŸe·?º¶şêu¸·‹6˜Àšˆô"€Úí>:å„Êƒ6^Õ¤±KdN   ¤        .sdt/objects/53/220c41b6661ac23317eb7edb2c6e173c535eaf731629914fd7a7f8a124d12a/*
  * Copyright (C) the libgit2 contributors. All rights reserved.
  *
@@ -100173,30 +100178,4 @@ fn resolveChangeOrFail(
         try w.print("{s}{s}{s} {s}{s}{s} is a captured moment, not a change\n", .{
             ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
         });
-        try ui.hint(w, "a branch can only point at a change; `sdt rewind` moves the working tree to a moment");
-        return null;
-    };
-}
-
-/// Whether a rewrite's report puts the new tip's tree on disk, or leaves the
-/// working tree exactly as the command found it.
-const TreeAfter = enum { checkout, keep };
-
-fn reportRewrite(
-    io: std.Io,
-    alloc: std.mem.Allocator,
-    w: *std.Io.Writer,
-    s: *Store,
-    before_tree: ?Oid,
-    r: history.Result,
-    what: []const u8,
-    tree_after: TreeAfter,
-) !void {
-    const tip = s.readChange(r.new) catch {
-        try w.print("{s} done\n", .{what});
-        return;
-    };
-    defer object.freeChange(alloc, tip);
-
-    if (tree_after == .checkout) {
-        var work = try open
+        try ui.hint(w, "a branch can only point at a change; `sdt rewind` moves the working t
