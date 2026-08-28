@@ -36,6 +36,9 @@
             .url = "git+https://github.com/allyourcodebase/libgit2#ee14d04543ce7a1c152e071e29cdafb8fc4125f1",
             .hash = "libgit2-1.9.0-uizqTX3cAAB_rhZNbFWFd0M4vTjD-NBtssjdi6Vt_00R",
         },
+        // Fetched, not a `../apricot` path: a sibling checkout exists on one
+        // machine and nowhere else, so every CI runner and every clone failed
+        // to build until this named a URL.
         .apricot = .{
             .url = "git+https://github.com/plyght/apricot#5c38b7b7c9d331d0876e1f91e1021314e24c3c35",
             .hash = "apricot-0.1.0-dev-koMqVMI7CQBA32DER0M_Cx4SHNumTyj_4vmPBbnONITh",
