@@ -1,4 +1,22 @@
-object.freeTree(alloc, tgt);
+ = rest[0];
+    } else if (head_change.parents.len != 0) {
+        const parent = try s.readChange(head_change.parents[0]);
+        defer object.freeChange(alloc, parent);
+        target_tree = parent.tree;
+    } else {
+        try w.writeAll("nothing before the first change to revert to\n");
+        return;
+    }
+
+    var work = try openWork(io);
+    defer work.close(io);
+
+    // Clean-checkout the target tree: drop currently-tracked files that the
+    // target does not have, then materialize the target's files.
+    const cur_tree = try s.readTree(head_change.tree);
+    defer object.freeTree(alloc, cur_tree);
+    const tgt = try s.readTree(target_tree);
+    defer object.freeTree(alloc, tgt);
     var keep = std.StringHashMap(void).init(alloc);
     defer keep.deinit();
     for (tgt.entries) |e| try keep.put(e.path, {});
@@ -44976,7 +44994,7 @@ gitbench --prepare "sandbox_repo testrepo && cd testrepo && git reset --hard HEA
 	 -- \
          --no-pager blame "branch_file.txt"
 N   ¤  £       .sdt/objects/93/45df4c6fdc902659cbfcd3f2bf4b904b3b8b8169ed1ea610bfce58845c73b6x¥KÂ0CYç¹ h2É$S	!6Ü€=Êg¢vQ‚Ú ®OAÜ€ı,[Îm§®ÑÙ]_D´7™)Y®2xa¤˜¡º3ÄÁ™ŠÌÉ†êÕ#.rßŠ%’e
-²J˜­0Qª°ZBÇ±@°TU|ö±-úR^q)ú:¶ymw}”~ÔY¾ÁÏr›OÚX"ÃhÀé=x µÑíl—?gT©·u*‚êQBNbN   ¤  -       .sdt/objects/93/526300e83253471e29a4697b92720fafb71e5b6cae02d2f1027f8a3213b139B       K   Í›£áGªÁ	;„(»0ª»€ƒµ÷w™ŸíÌI“Ğ{N   ¤  -       .sdt/objects/93/5c67486e9920d7536a629434c1a43aafd619a6b1673d1dff361336d340f453B      Z   J·Õo¼lëm–w‹tŸHÌC²ƒÖ¢!ØQ‡ĞLN   ¤  £       .sdt/objects/93/5cee3492021795048f9be50f7cd0742179aa0a97e22f4241afa0457aeced39x•A
+²J˜­0Qª°ZBÇ±@°TU|ö±-úR^q)ú:¶ymw}”~ÔY¾ÁÏr›OÚX"ÃhÀé=x µÑíl—?gT©·u*‚êQBNbN   ¤  -       .sdt/objects/93/4e9d137bdcfebdc64902d42a7f1e90a6809375f1fe90c81ac26b18aa88750fB      <   Ì¡½¼×˜ÌkeUJ^”]Ú;œe	¼*²'C’ƒnÄ ïN   ¤  -       .sdt/objects/93/526300e83253471e29a4697b92720fafb71e5b6cae02d2f1027f8a3213b139B       K   Í›£áGªÁ	;„(»0ª»€ƒµ÷w™ŸíÌI“Ğ{N   ¤  -       .sdt/objects/93/5c67486e9920d7536a629434c1a43aafd619a6b1673d1dff361336d340f453B      Z   J·Õo¼lëm–w‹tŸHÌC²ƒÖ¢!ØQ‡ĞLN   ¤  £       .sdt/objects/93/5cee3492021795048f9be50f7cd0742179aa0a97e22f4241afa0457aeced39x•A
 Â0E]ç³ëBÌ$©ˆx¯ ™dª…ÆHŒ ·7xWŞãÃ%ç¥‘Ş´*<Ã†}À“qVˆœÖZFŠ‰P‹'q/y§(–ÙšQÏèUxµ[©Ö%
 ~8É;äÇ*»XòĞ˜‰¼vä`«QkÕm¿Ğä¯‘:—&O)IşÀp]ÚåŞİ%V	M˜kÉ°.Ü©/××EÿN   ¤  -       .sdt/objects/93/64743d4a7579bf1fa4d19a0c2cb2da614765b63245d7f86fde2e82dd8d258bB       )   ,w®”†—ÀAW:¾]¶ù«YªJ>ûw²5ÎµúùN   ¤  -       .sdt/objects/93/69f7c88f0b6f1a365eeab79455b25b1c4b7bc6b5fe5357cd2ecef86472460bB      )   e8l÷fY{ÂŸ'Š—†}Õ€ğxŞî5_èØN   ¤  -       .sdt/objects/93/6d4d087f43dd73f82373354232b099ddd57dff7e365e8cc3dedbc879244640B      è   ¼áÎÒ13eO[ ŠÁË[<»íwU,¬T~ã+)N   ¤  …       .sdt/objects/93/6d537d99c01b68de3eb7e9894502d13e780054adc4d839206e78d2624217f1x+)JMU04±`040031QHËÌI5Ô+©(a°²ûœşêó¿Ê÷¿s…mÊ<à£ùI‘X×†yË®Nö¾Ÿ£$¦vcÛ÷»ìéHŠŒÁŠ¾<d?dp¡+á·ã\É¶ùòÚêºs™ñGÿùÚÚÛ»lSãõÊÈÉ)9ï åy?N   ¤  -       .sdt/objects/93/6dd561c192b1d6976ca53876f5c0c9f6b03569e81434c9736ebd7d614d3684B      ô   ÜçÅoáû	ÓäÍUŸÜç°½@0ìç®àœ5ªKDÀÉN   ¤  -       .sdt/objects/93/6fd0c89db1958ff484dc16df90a6ac95181fdd8c217dda15c51aa6d986cedaB         BæœŞN{è˜ÆSzÒ‚ÅÉ}xß»Ìvó³ñ…Ê88N   ¤  -       .sdt/objects/93/711b18344ec01c762c92564ca28b3b59379d3b5a62082f46d405e35f8c436cB       Z   šräÑ°¸‚u»o¢)0”çáßÁRP|æ;GñÑN   ¤  -       .sdt/objects/93/74340e50801a72ed652782e98aedc90964c0a51c73214c553acd7051ff2788B      8   ¢\’JKªq‘ƒŸcPœ^¯5XÉ¦£Ÿù×û´N   ¤  R      .sdt/objects/93/779f13cf87e9e8429bd1d4c84a08c3e39aef3df1569e962e56e17e8d15d4230000000000000000000000000000000000000000 35632e43612c06a3ea924bfbacd48333da874c29 Edward Thomson <ethomson@edwardthomson.com> 1352100964 -0600	branch: Created from HEAD
 35632e43612c06a3ea924bfbacd48333da874c29 6718a45909532d1fcf5600d0877f7fe7e78f0b86 Edward Thomson <ethomson@edwardthomson.com> 1352100978 -0600	commit: trivial-11-branch
@@ -112309,22 +112327,4 @@ fn workTree(io: std.Io, src_dir_path: []const u8, dst_dir_path: []const u8) !voi
         switch (entry.kind) {
             .directory => try dst_dir.createDirPath(io, entry.path),
             .file => {
-                var reflinked = false;
-                if (builtin.os.tag == .linux) {
-                    reflinked = tryReflink(io, src_dir_path, dst_dir_path, entry) catch false;
-                }
-                if (!reflinked) {
-                    _ = try src_dir.updateFile(io, entry.path, dst_dir, entry.path, .{});
-                }
-            },
-            else => {},
-        }
-    }
-}
-
-/// Attempt a per-file reflink via the Linux FICLONE ioctl. Returns true on a
-/// successful copy-on-write clone; any failure returns false so the caller can
-/// fall back to a byte copy. Preserves the source's permission bits.
-fn tryReflink(io: std.Io, src_dir_path: []const u8, dst_dir_path: []const u8, entry: std.Io.Dir.Walker.Entry) !bool {
-    var src_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var dst_buf: [std.fs.max_path_
+                var re

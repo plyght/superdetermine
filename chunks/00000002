@@ -1,4 +1,7 @@
-9,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E8000 */
+,139,139,139,139,139, /* U+E6800 */
+139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E7000 */
+139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E7800 */
+139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E8000 */
 139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E8800 */
 139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E9000 */
 139,139,139,139,139,139,139,139,139,139,139,139,139,139,139,139, /* U+E9800 */
@@ -56066,7 +56069,10 @@ void test_core_oid__type_lookup(void)
 	cl_assert_equal_s("unknown", git_oid_type_name(0));
 	cl_assert_equal_s("unknown", git_oid_type_name(42));
 }
-N   ¤  -       .sdt/objects/52/5e9cd8e47b34f448eae8e0065619c9207b62605346f826f9fbfc50255e5abeB          W™cµ®ÈD€Q8&@3×Ì°OÈ¬ú¹!Ü>‡Õ(yÀN   ¤  -       .sdt/objects/52/7040be9e2a7f8e04128d4da848bd4fce8e53f41e1b97344804870a59380f71B      m   `š€nV§gVjï™ä,¼Tízî7]¹Ÿã"ÓíN   ¤  ¶      .sdt/objects/52/74fd9b70b1f7872274a960e24b79064ebeda001160030ea10359ecc0306351# a comment followed by some blank lines
+N   ¤  -       .sdt/objects/52/5e9cd8e47b34f448eae8e0065619c9207b62605346f826f9fbfc50255e5abeB          W™cµ®ÈD€Q8&@3×Ì°OÈ¬ú¹!Ü>‡Õ(yÀN   ¤  ³       .sdt/objects/52/6bd0c2f4a2efa50fde13df48a0eabb8bc62b46b77409f42adedb7c99647912CĞ.ï–Ñ“ÏåjhŒ’"¸¹ŠyKOÛ
+
+ª6…6w   uZßÀªGaÌ,4ÁĞĞy€“4Ôû q9Ç£ÂQ´8»!7D 
+~ ;ñƒàA    jØ      plyght <plyght@peril.lol>   3docs: name the setting the way the CLI now names itN   ¤  -       .sdt/objects/52/7040be9e2a7f8e04128d4da848bd4fce8e53f41e1b97344804870a59380f71B      m   `š€nV§gVjï™ä,¼Tízî7]¹Ÿã"ÓíN   ¤  ¶      .sdt/objects/52/74fd9b70b1f7872274a960e24b79064ebeda001160030ea10359ecc0306351# a comment followed by some blank lines
 
 
 
@@ -100202,16 +100208,4 @@ fn reportRewrite(
         try w.print("{d} path(s) came out conflicted, with both sides marked:\n", .{r.conflicts.len});
         for (r.conflicts) |p| try w.print("  ! {s}\n", .{p});
         try ui.hint(w, "fix the markers and `sdt save`, or `sdt undo` to put history back");
-        return;
-    }
-    try ui.hint(w, "`sdt undo` puts the old history back");
-}
-
-fn reportHistoryError(w: *std.Io.Writer, e: anyerror, what: []const u8) !bool {
-    switch (e) {
-        replay.Error.MergeChangeNotReplayable => {
-            try w.print("{s}{s}{s} that span contains a merge, so it cannot be replayed\n", .{
-                ui.on(.red), ui.cross, ui.off(),
-            });
-            try ui.hint(w, "rewrite the changes on one side of the merge instead");
-      
+ 

@@ -1,4 +1,16 @@
-  },
+       return;
+    }
+    try ui.hint(w, "`sdt undo` puts the old history back");
+}
+
+fn reportHistoryError(w: *std.Io.Writer, e: anyerror, what: []const u8) !bool {
+    switch (e) {
+        replay.Error.MergeChangeNotReplayable => {
+            try w.print("{s}{s}{s} that span contains a merge, so it cannot be replayed\n", .{
+                ui.on(.red), ui.cross, ui.off(),
+            });
+            try ui.hint(w, "rewrite the changes on one side of the merge instead");
+        },
         history.Error.UnbornBranch => try w.writeAll("nothing saved on this branch yet\n"),
         history.Error.NothingToDo => try w.print("nothing to {s}\n", .{what}),
         history.Error.OutOfRange => try w.writeAll("that is more history than this branch has\n"),
@@ -89846,7 +89858,7 @@ int git_refspec__dwim_one(git_vector *out, git_refspec *spec, git_vector *refs)
 
 	return git_vector_insert(out, cur);
 }
-N   ¤  -       .sdt/objects/7e/c0f5c57e4f63c88b83f9dd2ef504adc1e43a1eaeab266ba5ac8ffdf7bd5b4dB          “î2&Å¯ÎĞ”àOT¾¸8öJxbÕêAWGQH	_o‰N   ¤  -       .sdt/objects/7e/cc2d43c18b92e250b47cd81d9694eb28196f2ea66057499bc4f6ebbf3fee1dB         ^‰]BÓ÷sJ\wàu¢ˆLÖs¦•tu/bòg©kJä¹N   ¤  )       .sdt/objects/7e/ce5dd99a84566aa56b36922a262087a0a7fc86e054932d196056be39f7900axKÊÉOR0²d(NÌMUÈÌS0MÌ)QHÌK3t“Šó’3¸ ßìN   ¤  -       .sdt/objects/7e/d09edf965d130b69d11245574f4725cb91ecf0b23c8c488bc21d702240cfeeB      T   “t€Ğ;$)±<C˜`y¤IY¦só4°å	N   ¤  ˆ       .sdt/objects/7e/d464750ce3f6d29a1186ca0f0d8e66e78555bd9e835b622c03811b9a67493dx1Â0©ıŠë‘P.6‰-!DCKÅÎöEIaÙ‡¿Ç|­f§ØMRÊ¦€aØieRt|ÈH}\f—Ù.ˆ4Ò„ÌŞöb#zé*®ùM5Ã}•Òä'îöG—²¥*M=$)gÀÑºã4û û¡ÇtÙ•ÿ_07júB	¤ë@=@5N   ¤  •       .sdt/objects/7e/dafad88c2a3d34360a012d753a9fc4486325a518e78d5ba75aea6cf713fe79x+)JMU045`040031QĞKÏ,ÉÍO)ÍI-f8õ?»Öeº}ğãç/\›*Ñ-¹îTYZfNª¡^IE	CDûÒ§bG­¯öıægz“µÀpÛ¿Y×‘9I¤sí9$¹ò§÷û­Goİä;ªæahf 
+N   ¤  -       .sdt/objects/7e/c0f5c57e4f63c88b83f9dd2ef504adc1e43a1eaeab266ba5ac8ffdf7bd5b4dB          “î2&Å¯ÎĞ”àOT¾¸8öJxbÕêAWGQH	_o‰N   ¤  -       .sdt/objects/7e/cc2d43c18b92e250b47cd81d9694eb28196f2ea66057499bc4f6ebbf3fee1dB         ^‰]BÓ÷sJ\wàu¢ˆLÖs¦•tu/bòg©kJä¹N   ¤  )       .sdt/objects/7e/ce5dd99a84566aa56b36922a262087a0a7fc86e054932d196056be39f7900axKÊÉOR0²d(NÌMUÈÌS0MÌ)QHÌK3t“Šó’3¸ ßìN   ¤  a       .sdt/objects/7e/ce98ba230c7ef8b00fe0e09ec9f31091f60e836b86fd13a87af5fe926e9dcfO   ³ÃÌ®oa¨IKq šº¸[æ.bk¸çfNë=NÕ-fßÇjBz(’ÜÉÖnçÖ]Òº‹(4P5ïG¢g†U™=š snapshot    jØ    masterN   ¤  -       .sdt/objects/7e/d09edf965d130b69d11245574f4725cb91ecf0b23c8c488bc21d702240cfeeB      T   “t€Ğ;$)±<C˜`y¤IY¦só4°å	N   ¤  ˆ       .sdt/objects/7e/d464750ce3f6d29a1186ca0f0d8e66e78555bd9e835b622c03811b9a67493dx1Â0©ıŠë‘P.6‰-!DCKÅÎöEIaÙ‡¿Ç|­f§ØMRÊ¦€aØieRt|ÈH}\f—Ù.ˆ4Ò„ÌŞöb#zé*®ùM5Ã}•Òä'îöG—²¥*M=$)gÀÑºã4û û¡ÇtÙ•ÿ_07júB	¤ë@=@5N   ¤  •       .sdt/objects/7e/dafad88c2a3d34360a012d753a9fc4486325a518e78d5ba75aea6cf713fe79x+)JMU045`040031QĞKÏ,ÉÍO)ÍI-f8õ?»Öeº}ğãç/\›*Ñ-¹îTYZfNª¡^IE	CDûÒ§bG­¯öıægz“µÀpÛ¿Y×‘9I¤sí9$¹ò§÷û­Goİä;ªæahf 
 Å¥Iû4«–eê66;Ş S•ï)b»äa‚. c >óN   ¤  -       .sdt/objects/7e/db645e86e582925630389ff351feb5fcce74ec6510e049334ec7c0c969dbaaB         ¼>‘B«£Ìn/Ì¿Â-°±ÇQTg®¯°jAéÎÆN   ¤  *       .sdt/objects/7e/de5af8ae8840a2d450bd564e8cb5f96b827f906647095e69acd83897154b70e90810b8df3e80c413d903f631643c716887138d 
 N   ¤  -       .sdt/objects/7e/e00655e04a2a9082b363aaeb67caa4062191529f4ab4906780f139aeff9006B      H   Ğ<*³ `£–ÅØÍ@ÎyzîÈq'ÙIØ¡ØN   ¤  -       .sdt/objects/7e/e50d7d162803016ef0f7ffa06a761595e8137ba27f6b44a6cd2ebd419f58b1B      C   úVW/z4ŠO|øÀ×©0sÚî´„Úø7ŞË7iß]3şÄN   ¤        .sdt/objects/7e/ec1263581978e121617d2c50f316bcfe03ecf6c336f0aa2fdc14438e9b58d4/*
  * Copyright (C) the libgit2 contributors. All rights reserved.
@@ -100965,22 +100977,4 @@ fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         };
         defer object.freeChange(alloc, tc);
         target_tree = tc.tree;
-        target_desc = rest[0];
-    } else if (head_change.parents.len != 0) {
-        const parent = try s.readChange(head_change.parents[0]);
-        defer object.freeChange(alloc, parent);
-        target_tree = parent.tree;
-    } else {
-        try w.writeAll("nothing before the first change to revert to\n");
-        return;
-    }
-
-    var work = try openWork(io);
-    defer work.close(io);
-
-    // Clean-checkout the target tree: drop currently-tracked files that the
-    // target does not have, then materialize the target's files.
-    const cur_tree = try s.readTree(head_change.tree);
-    defer object.freeTree(alloc, cur_tree);
-    const tgt = try s.readTree(target_tree);
-    defer 
+        target_desc
