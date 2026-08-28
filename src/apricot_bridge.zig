@@ -31,24 +31,59 @@ pub fn signature(author: []const u8) apricot.git_forge.Signature {
     };
 }
 
+/// What the server said about the last failed request, for the message the user
+/// actually reads. Same shape as `git.lastError()`: the CLI is one request at a
+/// time, so the detail belongs beside the error rather than threaded through
+/// every signature.
+var last_failure: apricot.git_transport.Failure = .{};
+
+pub fn lastStatus() u16 {
+    return last_failure.status;
+}
+
+pub fn lastDetail() []const u8 {
+    return last_failure.detail();
+}
+
+/// Credentials never travel over cleartext.
+///
+/// A token in a `Basic` header on `http://` is a token handed to anybody on the
+/// path. git refuses this by default too; a plain-HTTP remote is still usable,
+/// it just goes unauthenticated and gets an honest 401 rather than a leak.
+fn allowsCredentials(remote: []const u8) bool {
+    return !std.ascii.startsWithIgnoreCase(remote, "http://");
+}
+
 const Session = struct {
     allocator: std.mem.Allocator,
     client: apricot.git_http.Client,
     owned_token: ?[]u8,
+    helper: ?proc.Cred,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, remote: []const u8) Session {
         var owned_token: ?[]u8 = null;
-        const credentials: ?apricot.http_client.Credentials = if (proc.envToken()) |token| .{
+        var helper: ?proc.Cred = null;
+        const credentials: ?apricot.http_client.Credentials = if (!allowsCredentials(remote))
+            null
+        else if (proc.envToken()) |token| .{
             .username = "apricot",
             .password = std.mem.span(token),
         } else if (proc.githubAuthToken(allocator, remote)) |token| blk: {
             owned_token = token;
             break :blk .{ .username = "x-access-token", .password = token };
+        } else if (proc.credentialFill(remote)) |cred| blk: {
+            // Whatever git already knows: the keychain, a helper, a .netrc. Not
+            // reaching for this is why every forge that is not GitHub answered
+            // a perfectly good push with 401.
+            helper = cred;
+            break :blk .{ .username = cred.user, .password = cred.pass };
         } else null;
+        last_failure = .{};
         return .{
             .allocator = allocator,
             .client = .{ .allocator = allocator, .io = io, .credentials = credentials },
             .owned_token = owned_token,
+            .helper = helper,
         };
     }
 
@@ -58,10 +93,19 @@ const Session = struct {
             @memset(token, 0);
             self.allocator.free(token);
         }
+        if (self.helper) |cred| {
+            @memset(cred.pass, 0);
+            cred.free();
+        }
     }
 
     fn smart(self: *Session, allocator: std.mem.Allocator, remote: []const u8) apricot.git_transport.SmartHttp {
-        return .{ .allocator = allocator, .http = self.client.http(), .base_url = remote };
+        return .{
+            .allocator = allocator,
+            .http = self.client.http(),
+            .base_url = remote,
+            .failure = &last_failure,
+        };
     }
 };
 
@@ -144,6 +188,13 @@ pub fn fetchInto(
     const tip = try net.fetchSparse(destination, source_store, native_branch, "");
     try destination.updateRef(destination_ref, tip);
     return tip;
+}
+
+test "credentials are withheld from a cleartext remote" {
+    try std.testing.expect(allowsCredentials("https://github.com/x/y"));
+    try std.testing.expect(allowsCredentials("HTTPS://github.com/x/y"));
+    try std.testing.expect(!allowsCredentials("http://192.168.1.9/x/y"));
+    try std.testing.expect(!allowsCredentials("HTTP://192.168.1.9/x/y"));
 }
 
 test "bridge exposes embedded Apricot transport" {

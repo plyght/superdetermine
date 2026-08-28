@@ -4541,7 +4541,22 @@ fn reportApricotFailure(w: *std.Io.Writer, operation: []const u8, remote: []cons
     switch (err) {
         error.AuthenticationRequired => try w.print("{s} {s} requires authentication. for GitHub, run `gh auth login`; for another forge, set GIT_TOKEN or GITHUB_TOKEN\n", .{ operation, remote }),
         error.PermissionDenied => try w.print("{s} {s} was denied. check that your account and token have access to this repository\n", .{ operation, remote }),
+        error.RepositoryNotFound => try w.print("{s} {s} found no repository there. check the URL, and that you can see it\n", .{ operation, remote }),
+        error.RateLimited => try w.print("{s} {s} was rate limited. wait a minute and try again\n", .{ operation, remote }),
+        error.ServerError, error.RequestTimeout => try w.print("{s} {s} failed on the far end, after retrying. the forge is having a bad minute, not your repo\n", .{ operation, remote }),
         else => try w.print("{s} {s} failed: {s}\n", .{ operation, remote, @errorName(err) }),
+    }
+    // Whatever the server actually said. Without this the status line and the
+    // body — the two places a forge puts the reason — never reach the person
+    // who has to act on them.
+    const status = apricot_bridge.lastStatus();
+    if (status != 0) {
+        const detail = apricot_bridge.lastDetail();
+        if (detail.len != 0) {
+            try w.print("  {s}the server said {d}: {s}{s}\n", .{ ui.on(.dim), status, detail, ui.off() });
+        } else {
+            try w.print("  {s}the server said {d}, with no explanation{s}\n", .{ ui.on(.dim), status, ui.off() });
+        }
     }
 }
 
@@ -4814,7 +4829,17 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         const destination = try std.fs.path.resolve(alloc, &.{ cwd, into });
         defer alloc.free(destination);
         const fetched = apricot_bridge.fetchDefault(alloc, io, rest[0]) catch |e| switch (e) {
-            error.MissingCarrierRef, error.MissingBranch => null,
+            // No carrier there, so this repo has no native history to take —
+            // only the projection git can see. Falling through to a git clone
+            // is right, but doing it in silence hands somebody a flattened
+            // history that looks complete and is not.
+            error.MissingCarrierRef, error.MissingBranch => blk: {
+                try w.print("{s}{s}{s} no native carrier at {s}: cloning the git history only\n", .{
+                    ui.on(.yellow), ui.warn, ui.off(), rest[0],
+                });
+                try ui.hint(w, "moments, verdicts and the op-log live in the carrier, and are not in git");
+                break :blk null;
+            },
             else => {
                 try reportApricotFailure(w, "native clone from", rest[0], e);
                 return;

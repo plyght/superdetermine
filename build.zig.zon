@@ -40,8 +40,8 @@
         // machine and nowhere else, so every CI runner and every clone failed
         // to build until this named a URL.
         .apricot = .{
-            .url = "git+https://github.com/plyght/apricot#5c38b7b7c9d331d0876e1f91e1021314e24c3c35",
-            .hash = "apricot-0.1.0-dev-koMqVMI7CQBA32DER0M_Cx4SHNumTyj_4vmPBbnONITh",
+            .url = "git+https://github.com/plyght/apricot#945ba095a9343fc657b82faaf6564431421dd523",
+            .hash = "apricot-0.1.0-dev-koMqVOZVCQA0bEnk8mRlPhe555Xuc4emgIADwKuZwmsO",
         },
     },
     .paths = .{
