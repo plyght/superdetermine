@@ -4,7 +4,18 @@ const zon = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Ship a fast binary by default; `zig build -Doptimize=Debug` opts back in.
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    //
+    // Deliberately not `standardOptimizeOption`: with a preferred mode that
+    // helper still defaults to Debug unless `-Drelease` is passed, so a plain
+    // `zig build` — which is what CI, the release workflow, and anyone building
+    // from source runs — produced a Debug binary whose allocator captures a
+    // stack trace on every allocation. That is around 25x slower on a tree of
+    // any size. The default is the mode we ship.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse .ReleaseFast;
     const apricot_dep = b.dependency("apricot", .{
         .target = target,
         .optimize = optimize,

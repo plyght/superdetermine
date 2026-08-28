@@ -587,6 +587,66 @@ fn isMarkerLine(line: []const u8, ch: u8) bool {
     return l.len == 7 or l[7] == ' ';
 }
 
+/// Blobs already scanned and found free of conflict markers.
+///
+/// `sdt status` will not let a `<<<<<<<` reach a push, so it looks at every
+/// tracked file, not only the ones a merge remembers. Read literally that is
+/// the whole worktree on every status. Whether a blob holds markers is a
+/// property of its bytes alone, so the answer keys on the content hash and
+/// survives: the stat cache says which blob a file holds without opening it,
+/// and a blob already known clean is never read again. The file is rewritten
+/// from what the last scan saw, so it stays the size of the tree rather than
+/// growing with history, and losing it costs one slow status.
+pub const CleanBlobs = struct {
+    const file = "marker-clean";
+
+    seen: std.AutoHashMapUnmanaged([Oid.len]u8, void),
+    keep: std.AutoHashMapUnmanaged([Oid.len]u8, void),
+    alloc: std.mem.Allocator,
+
+    pub fn load(store: *Store, alloc: std.mem.Allocator) CleanBlobs {
+        var self: CleanBlobs = .{ .seen = .empty, .keep = .empty, .alloc = alloc };
+        const data = store.root.readFileAlloc(store.io, file, alloc, .unlimited) catch return self;
+        defer alloc.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len != Oid.len * 2) continue;
+            const o = Oid.fromHex(line) catch continue;
+            self.seen.put(alloc, o.bytes, {}) catch return self;
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *CleanBlobs) void {
+        self.seen.deinit(self.alloc);
+        self.keep.deinit(self.alloc);
+    }
+
+    pub fn isClean(self: *const CleanBlobs, o: Oid) bool {
+        return self.seen.contains(o.bytes);
+    }
+
+    /// Record that `o` holds no markers, and that it is still in the tree.
+    pub fn markClean(self: *CleanBlobs, o: Oid) void {
+        self.keep.put(self.alloc, o.bytes, {}) catch {};
+    }
+
+    pub fn save(self: *CleanBlobs, store: *Store) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.alloc);
+        var it = self.keep.keyIterator();
+        while (it.next()) |k| {
+            const o = Oid{ .bytes = k.* };
+            var hex: [Oid.len * 2]u8 = undefined;
+            _ = o.toHex(&hex);
+            out.appendSlice(self.alloc, &hex) catch return;
+            out.append(self.alloc, '\n') catch return;
+        }
+        store.writeFileAtomic(file, out.items) catch {};
+    }
+};
+
 pub fn hasConflictMarkers(data: []const u8) bool {
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |l| {

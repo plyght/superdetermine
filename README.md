@@ -68,7 +68,8 @@ sdt back                                  # it is still there
 Grading is the part that runs your code, so it stays inert until you say what to run:
 
 ```sh
-sdt config checks.full "zig build test"
+sdt setup                                 # asks the three questions that matter
+sdt config check "zig build test"         # or set just that one
 ```
 
 `sdt` uses no daemon. On macOS, launchd already runs. Launchd watches the worktree and starts `sdt` only after a file changes. That `sdt` process does its work and stops. Idle CPU use is zero, because no process waits.
@@ -106,7 +107,7 @@ To stop capture, set `moments.enabled = false`. To stop grading, set `checks.ena
 superdetermine does not replace git or GitHub, and adopting it is reversible. It sits next to your `.git`, and you decide how far to lean in:
 
 - Keep committing and pushing with git as usual. superdetermine imports and exports full history losslessly, so you are never locked in.
-- Or enable dual-write (`sdt config --global sync.git true`) and every `sdt save` also lands a normal git commit, so your team, GitHub, and CI keep working while you drive with sdt.
+- Or enable dual-write (`sdt config git-sync on --global`) and every `sdt save` also lands a normal git commit, so your team, GitHub, and CI keep working while you drive with sdt.
 - Run `sdt export <dir>` to materialize a plain git repo at any time.
 
 If superdetermine turns out not to be for you, your git history is right there, untouched.
@@ -127,6 +128,7 @@ Replication is the part where the two look closest and are not. Both put your wo
 
 ```
 sdt init
+sdt setup                  # name, email, and the command that says it works
 sdt save -m "message"      # sv   snapshot the working tree (no add, no stash)
 sdt status | sdt diff | sdt log     # st | d | l
 sdt new feature            # n    branch and switch
@@ -191,7 +193,25 @@ sdt lfs fetch | sdt lfs push
 sdt lfs env                # endpoint, cache location, settings
 ```
 
-On import, sdt resolves LFS pointers to the real bytes (from `.git/lfs/objects`, else the LFS batch API) and stores them chunked in its own object database, so `sdt diff`, `sdt blame` and `sdt work` all see real files. On export and push it writes the pointers back and uploads any objects the remote is missing. Set `sdt config lfs.smudge false` to keep pointers verbatim instead, `lfs.url` to override the endpoint, and `lfs.upload false` to skip uploads.
+On import, sdt resolves LFS pointers to the real bytes (from `.git/lfs/objects`, else the LFS batch API) and stores them chunked in its own object database, so `sdt diff`, `sdt blame` and `sdt work` all see real files. On export and push it writes the pointers back and uploads any objects the remote is missing. Set `sdt config lfs-smudge off` to keep pointers verbatim instead, `sdt config lfs-url <endpoint>` to override the endpoint, and `sdt config lfs-upload off` to skip uploads.
+
+## Configuration
+
+Settings have names, and `sdt config` on its own prints every one of them with its value and where that value came from:
+
+```
+sdt config                            # everything, grouped, with defaults
+sdt config check                      # what this one is, and what it takes
+sdt config check "zig build test"     # set it for this repo
+sdt config name "Ada" --global        # set it for every repo on this machine
+sdt config capture-every 3s           # durations, percentages and on/off are understood
+sdt config check --unset              # back to the default
+sdt setup                             # ask me the three that matter
+```
+
+A value is checked before it is written, so `sdt config cut sometimes` says what `cut` takes instead of storing a word nothing reads, and a misspelling suggests what it probably meant. Identity (`name`, `email`, `default-branch`) is written for the whole machine by default; everything else belongs to the repo. `--global` and `--local` override that either way.
+
+On disk it is still `key = value` with dotted keys — `.sdt/config` in the repo, `~/.config/sdt/config` for the machine — and those keys keep working on the command line too. `sdt config --keys` prints the mapping for when you are editing a file rather than typing a command.
 
 ## Secrets you can actually commit
 
@@ -290,7 +310,7 @@ That is the whole setup. There is no account, no host, no invite, and no list to
 
 **Same-path edits do not stop anyone.** Where two people genuinely changed the same file, the result is a superposition rather than conflict markers: both whole versions are kept, the worktree materialises one, and every peer's tree still compiles and still grades. `sdt super` shows what is holding more than one version and `sdt collapse` keeps one.
 
-**Greens travel.** A verdict is keyed by `(tree, tier, command, inputs)` and by nothing about the machine that produced it, so a check another peer already paid for answers here for the identical tree. On a team, or across a fleet of agents grinding the same tree, that is the compounding one. Turn it off with `sdt config mesh.verdicts false`.
+**Greens travel.** A verdict is keyed by `(tree, tier, command, inputs)` and by nothing about the machine that produced it, so a check another peer already paid for answers here for the identical tree. On a team, or across a fleet of agents grinding the same tree, that is the compounding one. Turn it off with `sdt config mesh-verdicts off`.
 
 **Moments do not travel.** Capture is per-machine and arrives by the hundred; your teammates want your changes, not your keystrokes.
 
@@ -313,7 +333,7 @@ Adopting a peer's verdict means trusting a check you did not watch run. That tru
 A link is opened once, authenticated once, and reconciled once in full. After that it stays up and carries deltas, so an edit does not pay for a handshake. On a LAN the wire is sub-millisecond; what you actually wait for is the poll that notices your tree moved, which is 25ms by default and is the number to turn down:
 
 ```sh
-sdt config mesh.interval-ms 10
+sdt config mesh-every 10ms
 ```
 
 The reason this stays cheap as history grows is that a peer remembers which subtrees it has already seen whole, so working out what to send touches what changed rather than what exists. Gossip is O(new), not O(repo).
@@ -334,8 +354,9 @@ Binaries are statically linked, so no system libgit2 is required.
 Requires Zig 0.16.
 
 ```
-zig build           # produces zig-out/bin/sdt
+zig build                       # produces zig-out/bin/sdt, ReleaseFast
 zig build test
+zig build -Doptimize=Debug      # slow binary, every safety check on
 ```
 
 ## Status

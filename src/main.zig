@@ -34,6 +34,8 @@ const live = @import("live.zig");
 const mesh = @import("mesh.zig");
 const net = @import("net.zig");
 const ignore = @import("ignore.zig");
+const settings = @import("settings.zig");
+const index = @import("index.zig");
 const provenance = @import("provenance.zig");
 const attribution = @import("attribution.zig");
 const agentscan = @import("agentscan.zig");
@@ -152,7 +154,8 @@ const sections = [_]Section{
         .{ .name = "init", .desc = "create a superdetermine repo here" },
         .{ .name = "gc", .args = "[--dry-run]", .desc = "reclaim unreachable objects" },
         .{ .name = "purge", .args = "<path...> [--dry-run] [--force]", .desc = "erase a path from all history, then gc" },
-        .{ .name = "config", .alias = "cfg", .args = "<key> [val]", .desc = "identity and defaults" },
+        .{ .name = "setup", .desc = "answer three questions and be configured" },
+        .{ .name = "config", .alias = "cfg", .args = "[name] [value]", .desc = "every setting, by name" },
         .{ .name = "completions", .alias = "comp", .args = "<shell>", .desc = "fish | zsh | bash" },
         .{ .name = "update", .desc = "update sdt (--nightly for the latest build)" },
         .{ .name = "version", .desc = "" },
@@ -475,6 +478,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdClone(io, alloc, w, rest);
     } else if (eq(cmd, "config")) {
         try cmdConfig(io, alloc, w, rest);
+    } else if (eq(cmd, "setup")) {
+        try cmdSetup(io, alloc, w);
     } else if (eq(cmd, "why")) {
         try cmdWhy(io, alloc, w, rest);
     } else if (eq(cmd, "provenance")) {
@@ -718,7 +723,7 @@ fn startCapturing(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void
     try w.print("{s}{s}{s} capturing every state, in the background, with no daemon\n", .{
         ui.on(.green), ui.check, ui.off(),
     });
-    try ui.hint(w, "`sdt moments` lists them, `sdt green` needs a check: `sdt config checks.full \"...\"`");
+    try ui.hint(w, "`sdt moments` lists them, `sdt green` needs a check: `sdt setup`");
     try ui.hint(w, "`sdt grade --off` stops it");
 }
 
@@ -1547,44 +1552,297 @@ fn cmdWhy(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     }
 }
 
+/// Where a value came from, which is most of what somebody asking "why is it
+/// doing that" needs to know.
+const Source = enum { local, global, default };
+
+const Resolved = struct {
+    /// Owned when present.
+    value: ?[]u8,
+    from: Source,
+};
+
+fn resolveSetting(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    s: ?*Store,
+    key: []const u8,
+) Resolved {
+    if (s) |repo| {
+        if (config.getLocal(repo, alloc, key) catch null) |v| {
+            if (v.len != 0) return .{ .value = v, .from = .local };
+            alloc.free(v);
+        }
+    }
+    if (config.globalGet(io, alloc, key) catch null) |v| {
+        if (v.len != 0) return .{ .value = v, .from = .global };
+        alloc.free(v);
+    }
+    return .{ .value = null, .from = .default };
+}
+
+fn sourceLabel(from: Source) []const u8 {
+    return switch (from) {
+        .local => "this repo",
+        .global => "you",
+        .default => "default",
+    };
+}
+
+/// Print every setting, what it is, and where its value came from.
+fn listConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s: ?*Store) !void {
+    try w.print("{s}sdt config{s} {s}what this repo and this machine are set to{s}\n", .{
+        ui.on(.bold), ui.off(), ui.on(.dim), ui.off(),
+    });
+
+    var group: []const u8 = "";
+    for (&settings.table) |*item| {
+        if (!eq(group, item.group)) {
+            group = item.group;
+            try w.print("\n  {s}{s}{s}\n", .{ ui.on(.bold), group, ui.off() });
+        }
+        const r = resolveSetting(io, alloc, s, item.key);
+        defer if (r.value) |v| alloc.free(v);
+
+        try w.print("    {s}{s}{s}", .{ ui.on(.cyan), item.name, ui.off() });
+        try ui.pad(w, item.name, 20);
+
+        if (r.value) |v| {
+            const shown = try settings.display(alloc, item, v);
+            defer alloc.free(shown);
+            try w.writeAll(shown);
+            try ui.pad(w, shown, 26);
+            try w.print("{s}{s}{s}\n", .{ ui.on(.dim), sourceLabel(r.from), ui.off() });
+        } else {
+            const unset_note = if (item.default.len != 0) item.default else "unset";
+            try w.print("{s}{s}{s}", .{ ui.on(.dim), unset_note, ui.off() });
+            try ui.pad(w, unset_note, 26);
+            try w.print("{s}{s}{s}\n", .{ ui.on(.dim), item.desc, ui.off() });
+        }
+    }
+
+    try w.writeAll("\n");
+    try ui.hint(w, "`sdt config <name> <value>` sets one, `--global` for every repo");
+    try ui.hint(w, "`sdt config <name>` explains one; `sdt setup` asks for the few that matter");
+}
+
+/// Explain one setting: what it is, what it takes, and what it is set to.
+fn explainSetting(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: ?*Store,
+    item: *const settings.Setting,
+) !void {
+    const r = resolveSetting(io, alloc, s, item.key);
+    defer if (r.value) |v| alloc.free(v);
+
+    if (r.value) |v| {
+        const shown = try settings.display(alloc, item, v);
+        defer alloc.free(shown);
+        try w.print("{s}{s}{s} {s}  {s}({s}){s}\n", .{
+            ui.on(.cyan), item.name, ui.off(), shown, ui.on(.dim), sourceLabel(r.from), ui.off(),
+        });
+    } else if (item.default.len != 0) {
+        try w.print("{s}{s}{s} {s}{s} (default){s}\n", .{
+            ui.on(.cyan), item.name, ui.off(), ui.on(.dim), item.default, ui.off(),
+        });
+    } else {
+        try w.print("{s}{s}{s} {s}unset{s}\n", .{
+            ui.on(.cyan), item.name, ui.off(), ui.on(.dim), ui.off(),
+        });
+    }
+    try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), item.desc, ui.off() });
+    if (item.choices.len != 0) {
+        try w.print("  {s}one of:{s}", .{ ui.on(.dim), ui.off() });
+        for (item.choices) |c| try w.print(" {s}", .{c});
+        try w.writeAll("\n");
+    } else {
+        try w.print("  {s}takes {s}{s}\n", .{ ui.on(.dim), settings.expected(item), ui.off() });
+    }
+    try w.print("  {s}stored as {s} in {s}{s}\n", .{
+        ui.on(.dim),
+        item.key,
+        if (item.scope == .global) "your config" else ".sdt/config",
+        ui.off(),
+    });
+}
+
+/// The dotted keys, for the config files where they are what you write.
+fn listKeys(w: *std.Io.Writer) !void {
+    try w.print("{s}the keys `.sdt/config` and your global config use{s}\n\n", .{ ui.on(.dim), ui.off() });
+    for (&settings.table) |*item| {
+        try w.print("  {s}{s}{s}", .{ ui.on(.cyan), item.key, ui.off() });
+        try ui.pad(w, item.key, 28);
+        try w.print("{s}\n", .{item.name});
+    }
+}
+
+fn setSetting(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: ?*Store,
+    item: *const settings.Setting,
+    scope: settings.Scope,
+    raw: []const u8,
+) !void {
+    const value = settings.normalize(alloc, item, raw) catch {
+        try w.print("{s}{s}{s} {s} takes ", .{ ui.on(.red), ui.cross, ui.off(), item.name });
+        if (item.choices.len != 0) {
+            for (item.choices, 0..) |c, i| {
+                if (i != 0) try w.writeAll(if (i + 1 == item.choices.len) " or " else ", ");
+                try w.print("{s}", .{c});
+            }
+        } else {
+            try w.writeAll(settings.expected(item));
+        }
+        try w.print(", not {s}{s}{s}\n", .{ ui.on(.bold), raw, ui.off() });
+        return;
+    };
+    defer alloc.free(value);
+
+    switch (scope) {
+        .global => try config.globalSet(io, alloc, item.key, value),
+        .local => {
+            const repo = s orelse {
+                try w.print("{s}{s}{s} {s} belongs to a repo, and this is not one\n", .{
+                    ui.on(.red), ui.cross, ui.off(), item.name,
+                });
+                try ui.hint(w, "run `sdt init` here, or set it for every repo with --global");
+                return;
+            };
+            try config.set(repo, item.key, value);
+        },
+    }
+
+    const shown = try settings.display(alloc, item, value);
+    defer alloc.free(shown);
+    try w.print("{s}{s}{s} {s} is {s}{s}{s}{s}\n", .{
+        ui.on(.green), ui.check,                                         ui.off(),
+        item.name,     ui.on(.bold),                                     shown,
+        ui.off(),      if (scope == .global) ", for every repo" else "",
+    });
+}
+
+fn unsetSetting(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: ?*Store,
+    item: *const settings.Setting,
+    scope: settings.Scope,
+) !void {
+    switch (scope) {
+        .global => config.globalUnset(io, alloc, item.key) catch {},
+        .local => {
+            const repo = s orelse return;
+            config.unset(repo, item.key) catch {};
+        },
+    }
+    try w.print("{s}{s}{s} {s} is back to {s}\n", .{
+        ui.on(.green),                                        ui.check, ui.off(), item.name,
+        if (item.default.len != 0) item.default else "unset",
+    });
+}
+
 fn cmdConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    var global = false;
+    var scope: ?settings.Scope = null;
+    var do_unset = false;
     var pos: [2][]const u8 = undefined;
     var np: usize = 0;
+
     for (rest) |a| {
         if (eq(a, "--global") or eq(a, "-g")) {
-            global = true;
+            scope = .global;
+        } else if (eq(a, "--local") or eq(a, "-l")) {
+            scope = .local;
+        } else if (eq(a, "--unset") or eq(a, "--remove")) {
+            do_unset = true;
+        } else if (eq(a, "--keys")) {
+            return listKeys(w);
         } else if (np < 2) {
             pos[np] = a;
             np += 1;
         }
     }
-    if (np == 0) {
-        try w.writeAll("usage: sdt config [--global] <key> [value]\n");
-        return;
+    // `sdt config unset <name>` reads the way people say it.
+    if (np != 0 and eq(pos[0], "unset")) {
+        do_unset = true;
+        pos[0] = if (np > 1) pos[1] else "";
+        np -= 1;
     }
-    const key = pos[0];
-    if (global) {
-        if (np >= 2) {
-            try config.globalSet(io, alloc, key, pos[1]);
-            try w.print("set (global) {s} = {s}\n", .{ key, pos[1] });
-        } else {
-            const v = try config.globalGet(io, alloc, key);
-            defer if (v) |x| alloc.free(x);
-            if (v) |x| try w.print("{s}\n", .{x}) else try w.writeAll("(unset)\n");
+
+    // A repo is optional: identity and defaults are worth reading and writing
+    // from anywhere, and only a repo-scoped write actually needs one.
+    var store_val = Store.discover(io, alloc, std.Io.Dir.cwd()) catch null;
+    defer if (store_val) |*st| st.deinit();
+    const s: ?*Store = if (store_val) |*st| st else null;
+
+    if (np == 0) return listConfig(io, alloc, w, s);
+
+    const name = pos[0];
+    const item = settings.find(name) orelse {
+        // A dotted key this version does not know is still a key: config files
+        // outlive the table, and a setting added by a newer sdt must remain
+        // writable by an older one.
+        if (std.mem.indexOfScalar(u8, name, '.') != null) {
+            return rawKey(io, alloc, w, s, name, if (np > 1) pos[1] else null, scope orelse .local, do_unset);
         }
+        try w.print("{s}{s}{s} there is no setting called {s}{s}{s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), name, ui.off(),
+        });
+        if (settings.suggest(name)) |near| {
+            try w.print("  did you mean {s}{s}{s}? {s}{s}{s}\n", .{
+                ui.on(.cyan), near.name, ui.off(), ui.on(.dim), near.desc, ui.off(),
+            });
+        }
+        try ui.hint(w, "`sdt config` lists every setting there is");
+        return;
+    };
+
+    const effective = scope orelse item.scope;
+    if (do_unset) return unsetSetting(io, alloc, w, s, item, effective);
+    if (np < 2) return explainSetting(io, alloc, w, s, item);
+    return setSetting(io, alloc, w, s, item, effective, pos[1]);
+}
+
+/// Read or write a dotted key with no entry in the table, verbatim.
+fn rawKey(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: ?*Store,
+    key: []const u8,
+    value: ?[]const u8,
+    scope: settings.Scope,
+    do_unset: bool,
+) !void {
+    if (do_unset) {
+        switch (scope) {
+            .global => config.globalUnset(io, alloc, key) catch {},
+            .local => if (s) |repo| config.unset(repo, key) catch {},
+        }
+        try w.print("{s}{s}{s} {s} unset\n", .{ ui.on(.green), ui.check, ui.off(), key });
         return;
     }
-    var s = (try openRepo(io, alloc, w)) orelse return;
-    defer s.deinit();
-    if (np >= 2) {
-        try config.set(&s, key, pos[1]);
-        try w.print("set {s} = {s}\n", .{ key, pos[1] });
-    } else {
-        const v = try config.get(&s, alloc, key);
-        defer if (v) |x| alloc.free(x);
-        if (v) |x| try w.print("{s}\n", .{x}) else try w.writeAll("(unset)\n");
+    if (value) |v| {
+        switch (scope) {
+            .global => try config.globalSet(io, alloc, key, v),
+            .local => {
+                const repo = s orelse {
+                    try w.print("{s}{s}{s} not a superdetermine repo\n", .{ ui.on(.red), ui.cross, ui.off() });
+                    return;
+                };
+                try config.set(repo, key, v);
+            },
+        }
+        try w.print("{s}{s}{s} {s} = {s}\n", .{ ui.on(.green), ui.check, ui.off(), key, v });
+        return;
     }
+    const r = resolveSetting(io, alloc, s, key);
+    defer if (r.value) |v| alloc.free(v);
+    if (r.value) |v| try w.print("{s}\n", .{v}) else try w.writeAll("(unset)\n");
 }
 
 fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1643,7 +1901,7 @@ fn gateOnGreen(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s: *Stor
         try w.print("{s}{s}{s} no check configured, so nothing can be verified\n", .{
             ui.on(.red), ui.cross, ui.off(),
         });
-        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`, or pass `--no-require-green`");
+        try ui.hint(w, "set one with `sdt config check \"zig build test\"`, or pass `--no-require-green`");
         return false;
     }
 
@@ -1817,14 +2075,33 @@ fn markedTrackedPaths(io: std.Io, alloc: std.mem.Allocator, s: *Store, work: std
     const tree = s.readTree(change.tree) catch return out.toOwnedSlice(alloc);
     defer object.freeTree(alloc, tree);
 
+    // Every tracked file is looked at, but a file whose bytes have not changed
+    // since a scan that found no markers is never read again: the stat cache
+    // names the blob it holds, and the clean-blob set answers for that blob.
+    var stat_cache = index.Index.load(s, alloc) catch index.Index.empty(alloc);
+    defer stat_cache.deinit();
+    var clean = merge.CleanBlobs.load(s, alloc);
+    defer clean.deinit();
+    defer clean.save(s);
+
     for (tree.entries) |e| {
         if (e.mode == .symlink) continue;
         const st = work.statFile(io, e.path, .{}) catch continue;
         if (st.size > conflict_scan_limit) continue;
+        const cached = stat_cache.lookup(e.path, st);
+        if (cached) |blob| {
+            if (clean.isClean(blob)) {
+                clean.markClean(blob);
+                continue;
+            }
+        }
         const data = readWorkFile(io, work, e.path, alloc) catch continue;
         defer alloc.free(data);
         if (isBinary(data)) continue;
-        if (!merge.hasConflictMarkers(data)) continue;
+        if (!merge.hasConflictMarkers(data)) {
+            if (cached) |blob| clean.markClean(blob);
+            continue;
+        }
         try out.append(alloc, try alloc.dupe(u8, e.path));
     }
     return out.toOwnedSlice(alloc);
@@ -2604,7 +2881,7 @@ fn meshRun(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
 
     if (!set.enabled) {
         try w.print("{s}{s}{s} mesh.enabled is off\n", .{ ui.on(.yellow), ui.warn, ui.off() });
-        try ui.hint(w, "`sdt config mesh.enabled true` to turn it back on");
+        try ui.hint(w, "`sdt config mesh on` to turn it back on");
         return;
     }
 
@@ -2723,7 +3000,7 @@ fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         try w.print("and grading, every {d}ms\n", .{mset.interval_ms});
     } else {
         try w.print("every {d}ms; no check configured, so nothing is ever run\n", .{mset.interval_ms});
-        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+        try ui.hint(w, "set one with `sdt config check \"zig build test\"`");
     }
     try ui.hint(w, "ctrl-c to stop; `sdt grade --on` does this with no terminal and no daemon");
     try w.flush();
@@ -3066,7 +3343,212 @@ fn cmdGreen(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     try rewindTo(io, alloc, w, "@green", false, null);
 }
 
+/// One line from the terminal, or null at end of input. Read a byte at a time
+/// on purpose: an answer is short, a person is slow, and this cannot lose a
+/// partial line to a buffer boundary the way a delimited read can.
+fn readLine(r: *std.Io.Reader, buf: []u8) ?[]const u8 {
+    var n: usize = 0;
+    while (n < buf.len) {
+        const c = r.takeByte() catch return if (n == 0) null else buf[0..n];
+        if (c == '\n') return buf[0..n];
+        buf[n] = c;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// One question, with what it is already set to offered as the answer.
+///
+/// Returns the answer, or null for "leave it alone" — an empty line with no
+/// current value. Caller frees.
+fn ask(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    r: *std.Io.Reader,
+    question: []const u8,
+    current: ?[]const u8,
+) !?[]u8 {
+    try w.print("  {s}", .{question});
+    if (current) |c| {
+        if (c.len != 0) try w.print(" {s}[{s}]{s}", .{ ui.on(.dim), c, ui.off() });
+    }
+    try w.writeAll(" ");
+    try w.flush();
+
+    var line_buf: [4096]u8 = undefined;
+    const line = readLine(r, &line_buf) orelse return null;
+    const answer = std.mem.trim(u8, line, " \t\r");
+    if (answer.len != 0) return try alloc.dupe(u8, answer);
+    if (current) |c| {
+        if (c.len != 0) return try alloc.dupe(u8, c);
+    }
+    return null;
+}
+
+fn askYes(w: *std.Io.Writer, r: *std.Io.Reader, question: []const u8, default_yes: bool) !bool {
+    try w.print("  {s} {s}[{s}]{s} ", .{
+        question,
+        ui.on(.dim),
+        if (default_yes) "Y/n" else "y/N",
+        ui.off(),
+    });
+    try w.flush();
+    var line_buf: [64]u8 = undefined;
+    const line = readLine(r, &line_buf) orelse return default_yes;
+    const answer = std.mem.trim(u8, line, " \t\r");
+    if (answer.len == 0) return default_yes;
+    return settings.boolOf(answer) orelse default_yes;
+}
+
+/// The few settings that decide whether superdetermine can do anything for you,
+/// asked one at a time.
+///
+/// Everything here can be set with `sdt config`; this exists because knowing
+/// *which* three settings matter is the part a first-time user does not have,
+/// and a list of forty is not an answer to that.
+fn cmdSetup(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    if (!ui.isTty()) {
+        try w.writeAll("`sdt setup` asks questions, so it needs a terminal\n");
+        try ui.hint(w, "`sdt config <name> <value>` sets any of them directly");
+        return;
+    }
+
+    var buf: [4096]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(io, &buf);
+    const r = &stdin.interface;
+
+    var store_val = Store.discover(io, alloc, std.Io.Dir.cwd()) catch null;
+    defer if (store_val) |*st| st.deinit();
+    const s: ?*Store = if (store_val) |*st| st else null;
+
+    try w.print("{s}setting up superdetermine{s}\n\n", .{ ui.on(.bold), ui.off() });
+
+    // Identity is about you, so it is written once for every repo on this
+    // machine rather than again in each one.
+    const name_now = config.globalGet(io, alloc, "user.name") catch null;
+    defer if (name_now) |v| alloc.free(v);
+    if (try ask(alloc, w, r, "your name?", name_now)) |v| {
+        defer alloc.free(v);
+        config.globalSet(io, alloc, "user.name", v) catch {};
+    }
+
+    const email_now = config.globalGet(io, alloc, "user.email") catch null;
+    defer if (email_now) |v| alloc.free(v);
+    if (try ask(alloc, w, r, "your email?", email_now)) |v| {
+        defer alloc.free(v);
+        config.globalSet(io, alloc, "user.email", v) catch {};
+    }
+
+    if (s == null) {
+        try w.print("\n{s}{s}{s} you are set up; this folder is not a repo yet\n", .{
+            ui.on(.green), ui.check, ui.off(),
+        });
+        try ui.hint(w, "`sdt init` here, then `sdt setup` again to set the check");
+        return;
+    }
+    const repo = s.?;
+
+    // The check is the whole point: without one, nothing can be graded, `sdt
+    // green` has nothing to rewind to, and every promise this tool makes about
+    // knowing what worked is inert.
+    const check_now = config.getLocal(repo, alloc, "checks.full") catch null;
+    defer if (check_now) |v| alloc.free(v);
+    try w.print("\n  {s}the command that says your code works, if there is one{s}\n", .{
+        ui.on(.dim), ui.off(),
+    });
+    const check = try ask(alloc, w, r, "check?", check_now);
+    defer if (check) |v| alloc.free(v);
+    if (check) |v| config.set(repo, "checks.full", v) catch {};
+
+    if (check == null) {
+        try w.print("\n{s}{s}{s} you are set up; nothing will be graded until a check is set\n", .{
+            ui.on(.green), ui.check, ui.off(),
+        });
+        try ui.hint(w, "`sdt config check \"<command>\"` when you have one");
+        return;
+    }
+
+    var work = openWork(io) catch {
+        try w.print("\n{s}{s}{s} you are set up\n", .{ ui.on(.green), ui.check, ui.off() });
+        return;
+    };
+    defer work.close(io);
+    const repo_abs = try work.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(repo_abs);
+
+    const already = (sched.agentStatus(io, alloc, repo_abs) catch .unsupported) == .installed;
+    if (already) {
+        try w.print("\n{s}{s}{s} you are set up; the check already runs on its own\n", .{
+            ui.on(.green), ui.check, ui.off(),
+        });
+        return;
+    }
+
+    try w.writeAll("\n");
+    if (try askYes(w, r, "run it on its own whenever the tree changes?", true)) {
+        _ = try startAutoGrading(io, alloc, w, repo_abs);
+    } else {
+        try w.print("{s}{s}{s} you are set up; `sdt grade` runs the check when you ask\n", .{
+            ui.on(.green), ui.check, ui.off(),
+        });
+    }
+}
+
+/// Hand background grading to the OS scheduler for this repo. Reports whether
+/// it is now on. Shared by `sdt grade --on` and `sdt setup`, because "and run it
+/// for me" is the same promise however it was asked for.
+fn startAutoGrading(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    repo_abs: []const u8,
+) !bool {
+    const exe = update.selfExePathAlloc(alloc) catch |e| {
+        try w.print("could not locate the sdt binary: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    defer alloc.free(exe);
+
+    // Apple documents WatchPaths but not whether it fires for a change inside a
+    // watched directory, and the whole design rests on that. Measure it here
+    // rather than promise it.
+    try w.writeAll("checking that this machine can watch a directory... ");
+    try w.flush();
+    if (!sched.selfTest(io, alloc, 8000)) {
+        try w.print("{s}no{s}\n", .{ ui.on(.yellow), ui.off() });
+        try w.writeAll("automatic grading is not available here\n");
+        try ui.hint(w, "run `sdt watch` in a terminal instead; it does the same work");
+        return false;
+    }
+    try w.print("{s}yes{s}\n", .{ ui.on(.green), ui.off() });
+
+    sched.install(io, alloc, exe, repo_abs, .{}) catch |e| {
+        try w.print("{s}{s}{s} could not install the agent: {s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), @errorName(e),
+        });
+        try ui.hint(w, "`sdt watch` does the same work in the foreground");
+        return false;
+    };
+    try w.print("{s}{s}{s} automatic grading is on for this repo\n", .{
+        ui.on(.green), ui.check, ui.off(),
+    });
+    try ui.hint(w, "edits are captured and graded with no sdt command and no resident process");
+    return true;
+}
+
 fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !u8 {
+    // The agent fires on any change to the worktree, and deleting one is a
+    // change: `rm -rf` reliably wakes a tick against the repo it is removing.
+    // So an automated run never discovers a repo upwards — an agent is bound to
+    // one directory and must not end up grading its parent — and reads a missing
+    // `.sdt` as the delete it is, retiring itself rather than writing files back
+    // into a directory somebody is in the middle of removing.
+    if (hasFlag(rest, "--once")) {
+        std.Io.Dir.cwd().access(io, store.dir_name, .{}) catch {
+            _ = sched.prune(io, alloc);
+            return 0;
+        };
+    }
     var s = (try openRepo(io, alloc, w)) orelse return 0;
     defer s.deinit();
     var work = try openWork(io);
@@ -3113,36 +3595,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
 
     for (rest) |a| {
         if (eq(a, "--install") or eq(a, "--on")) {
-            const exe = update.selfExePathAlloc(alloc) catch |e| {
-                try w.print("could not locate the sdt binary: {s}\n", .{@errorName(e)});
-                return 0;
-            };
-            defer alloc.free(exe);
-
-            // Apple documents WatchPaths but not whether it fires for a change
-            // inside a watched directory, and the whole design rests on that.
-            // Measure it here rather than promise it.
-            try w.writeAll("checking that this machine can watch a directory... ");
-            try w.flush();
-            if (!sched.selfTest(io, alloc, 8000)) {
-                try w.print("{s}no{s}\n", .{ ui.on(.yellow), ui.off() });
-                try w.writeAll("automatic grading is not available here\n");
-                try ui.hint(w, "run `sdt watch` in a terminal instead; it does the same work");
-                return 0;
-            }
-            try w.print("{s}yes{s}\n", .{ ui.on(.green), ui.off() });
-
-            sched.install(io, alloc, exe, repo_abs, .{}) catch |e| {
-                try w.print("{s}{s}{s} could not install the agent: {s}\n", .{
-                    ui.on(.red), ui.cross, ui.off(), @errorName(e),
-                });
-                try ui.hint(w, "`sdt watch` does the same work in the foreground");
-                return 0;
-            };
-            try w.print("{s}{s}{s} automatic grading is on for this repo\n", .{
-                ui.on(.green), ui.check, ui.off(),
-            });
-            try ui.hint(w, "edits are captured and graded with no sdt command and no resident process");
+            _ = try startAutoGrading(io, alloc, w, repo_abs);
             return 0;
         }
         if (eq(a, "--uninstall") or eq(a, "--off")) {
@@ -3213,7 +3666,7 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     if (!set.enabled) {
         if (r.captured) {
             try ui.hint(w, "no check configured, so nothing was graded");
-            try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+            try ui.hint(w, "set one with `sdt config check \"zig build test\"`");
         }
         return if (automated) 0 else report.exitCode();
     }
@@ -3252,7 +3705,7 @@ fn cmdGradeRef(
         try w.print("{s}{s}{s} no {s} check configured, so there is nothing to grade with\n", .{
             ui.on(.red), ui.cross, ui.off(), tier.label(),
         });
-        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+        try ui.hint(w, "set one with `sdt config check \"zig build test\"`");
         return grade.exit_no_check;
     }
 
@@ -3383,7 +3836,7 @@ fn cmdAttest(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         try w.print("{s}{s}{s} no {s} check configured, so there is nothing to attest to\n", .{
             ui.on(.red), ui.cross, ui.off(), tier.label(),
         });
-        try ui.hint(w, "set one with `sdt config checks.full \"zig build test\"`");
+        try ui.hint(w, "set one with `sdt config check \"zig build test\"`");
         return grade.exit_no_check;
     }
 
@@ -3591,6 +4044,15 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         .not_installed => "off (`sdt grade --on`, or run `sdt watch`)",
         .unsupported => "not available here; use `sdt watch` in a terminal",
     }});
+
+    // Deleting a worktree does not unregister the agent watching it, so this is
+    // where the ones left pointing at repos that no longer exist are collected.
+    const pruned = sched.prune(io, alloc);
+    if (pruned != 0) {
+        try w.print("               retired {d} agent{s} whose repo no longer exists\n", .{
+            pruned, if (pruned == 1) "" else "s",
+        });
+    }
 
     const verdicts = try verdict.readAll(&s, alloc);
     defer alloc.free(verdicts);
@@ -5274,6 +5736,7 @@ test {
     _ = live;
     _ = mesh;
     _ = @import("index.zig");
+    _ = settings;
 }
 
 extern "c" fn chdir(path: [*:0]const u8) c_int;

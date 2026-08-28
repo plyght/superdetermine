@@ -58,6 +58,26 @@ fn upsert(old: []const u8, key: []const u8, value: []const u8, alloc: std.mem.Al
     return out.toOwnedSlice(alloc);
 }
 
+/// Drop every line setting `key`, leaving comments and everything else alone.
+fn remove(old: []const u8, key: []const u8, alloc: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |raw| {
+        if (raw.len == 0 and lines.peek() == null) break;
+        const line = std.mem.trim(u8, raw, ws);
+        if (line.len != 0 and line[0] != '#') {
+            if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+                if (std.mem.eql(u8, std.mem.trim(u8, line[0..eq], ws), key)) continue;
+            }
+        }
+        try out.appendSlice(alloc, raw);
+        try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 // --- local scope (repo `.sdt/config`) ---
 
 /// Read a key from local config, falling back to global. Caller frees.
@@ -83,6 +103,17 @@ pub fn set(store: *Store, key: []const u8, value: []const u8) !void {
         try alloc.dupe(u8, "");
     defer alloc.free(old);
     const new = try upsert(old, key, value, alloc);
+    defer alloc.free(new);
+    try store.root.writeFile(store.io, .{ .sub_path = "config", .data = new });
+}
+
+/// Remove a key from `.sdt/config`. Absent is success: the point is that the
+/// key is not set afterwards.
+pub fn unset(store: *Store, key: []const u8) !void {
+    const alloc = store.alloc;
+    const old = store.root.readFileAlloc(store.io, "config", alloc, .unlimited) catch return;
+    defer alloc.free(old);
+    const new = try remove(old, key, alloc);
     defer alloc.free(new);
     try store.root.writeFile(store.io, .{ .sub_path = "config", .data = new });
 }
@@ -136,6 +167,17 @@ pub fn globalSet(io: std.Io, alloc: std.mem.Allocator, key: []const u8, value: [
         try alloc.dupe(u8, "");
     defer alloc.free(old);
     const new = try upsert(old, key, value, alloc);
+    defer alloc.free(new);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = new });
+}
+
+/// Remove a key from the global config.
+pub fn globalUnset(io: std.Io, alloc: std.mem.Allocator, key: []const u8) !void {
+    const path = (try globalPath(alloc)) orelse return error.NoHome;
+    defer alloc.free(path);
+    const old = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited) catch return;
+    defer alloc.free(old);
+    const new = try remove(old, key, alloc);
     defer alloc.free(new);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = new });
 }
@@ -242,6 +284,27 @@ test "set upserts without duplicating" {
     const n = try getLocal(&store, alloc, "user.name");
     defer if (n) |v| alloc.free(v);
     try testing.expectEqualStrings("Second", n.?);
+}
+
+test "unset removes a key and leaves the rest of the file alone" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try set(&store, "user.name", "Nico");
+    try set(&store, "user.email", "n@x.com");
+    try unset(&store, "user.name");
+
+    try testing.expect((try getLocal(&store, alloc, "user.name")) == null);
+    const kept = try getLocal(&store, alloc, "user.email");
+    defer if (kept) |v| alloc.free(v);
+    try testing.expectEqualStrings("n@x.com", kept.?);
+
+    // Unsetting what was never set is not an error.
+    try unset(&store, "user.name");
 }
 
 test "get of missing key is null" {

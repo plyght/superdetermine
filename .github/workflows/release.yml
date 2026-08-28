@@ -225,9 +225,8 @@ jobs:
           tar xf zig.tar.xz
           echo "$PWD/${ZIG}" >> "$GITHUB_PATH"
 
-      # build.zig fixes the optimize mode to ReleaseFast (preferred_optimize_mode),
-      # so `-Doptimize` is not a valid flag — a plain `zig build` produces the
-      # release binary.
+      # build.zig defaults the optimize mode to ReleaseFast, so a plain
+      # `zig build` produces the release binary.
       - name: Build
         run: zig build
 

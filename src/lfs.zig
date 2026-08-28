@@ -1125,7 +1125,7 @@ pub fn run(ctx: Context, w: *std.Io.Writer, rest: []const []const u8) !void {
         var session = try Session.open(store, ctx.git_dir_abs, ctx.remote_url);
         defer session.deinit();
         if (session.endpoint == null) {
-            try w.writeAll("no LFS endpoint. set a remote, or `sdt config lfs.url <endpoint>`\n");
+            try w.writeAll("no LFS endpoint. set a remote, or `sdt config lfs-url <endpoint>`\n");
             return;
         }
         var reqs: std.ArrayList(Request) = .empty;

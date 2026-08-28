@@ -12,7 +12,8 @@ const proc = @import("proc.zig");
 const config = @import("config.zig");
 const freshness = @import("freshness.zig");
 const flow = @import("flow.zig");
-const Store = @import("store.zig").Store;
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
 const Oid = oid.Oid;
 
 /// Getting work done in the background without running a daemon.
@@ -58,9 +59,13 @@ pub fn settings(store: *Store, alloc: std.mem.Allocator) Settings {
         defer alloc.free(maybe);
         out.battery_floor = std.fmt.parseInt(u8, std.mem.trim(u8, maybe, " \t"), 10) catch out.battery_floor;
     }
-    if (config.get(store, alloc, "checks.budget") catch null) |maybe| {
+    // `checks.tick_budget`, not `checks.budget`: that one is the CPU share a
+    // check may use, a percentage, and reading a percentage as milliseconds
+    // capped every background tick at a few dozen milliseconds — the two
+    // meanings could not share a key.
+    if (config.get(store, alloc, "checks.tick_budget") catch null) |maybe| {
         defer alloc.free(maybe);
-        out.budget_ms = std.fmt.parseInt(i64, std.mem.trim(u8, maybe, " \t"), 10) catch out.budget_ms;
+        out.budget_ms = config.parseDurationMs(maybe) orelse out.budget_ms;
     }
     if (config.get(store, alloc, "moments.interval_ms") catch null) |maybe| {
         defer alloc.free(maybe);
@@ -155,12 +160,76 @@ pub const TickResult = struct {
     skipped: ?[]const u8 = null,
 };
 
+/// Is this still a repo, or the husk of one somebody is deleting?
+///
+/// `rm -rf` on a worktree is not atomic, and the launchd agent watches that very
+/// directory, so a delete reliably wakes a tick in the middle of itself. A tick
+/// that writes a lock or a stamp into a half-removed `.sdt` recreates the
+/// directory behind `rm`, which then stops with "Directory not empty" and leaves
+/// the repo's skeleton standing after the user asked for it to be gone. So every
+/// background write is gated on the repo still having the file `init` wrote
+/// first, and nothing is created underneath a delete.
+pub fn alive(store: *Store) bool {
+    store.root.access(store.io, "HEAD", .{}) catch return false;
+    return true;
+}
+
+/// Clean up after a repo that was deleted underneath a tick.
+///
+/// Only what the background path itself creates is removed — the lock and the
+/// stamp — and the directories are then removed with `deleteDir`, which fails
+/// on a directory that still holds anything. Nothing a user could still want is
+/// deletable through here even if `alive` were somehow wrong about a live repo.
+fn reap(store: *Store, work_dir: std.Io.Dir) void {
+    const io = store.io;
+    store.root.deleteFile(io, lock_path) catch {};
+    store.root.deleteFile(io, stamp_path) catch {};
+    store.root.deleteDir(io, "moments") catch {};
+    work_dir.deleteDir(io, store_mod.dir_name) catch {};
+
+    // The agent watches a directory that is going away; leaving it registered
+    // means launchd keeps trying to start a job in a repo that no longer exists.
+    const alloc = store.alloc;
+    if (work_dir.realPathFileAlloc(io, ".", alloc)) |abs| {
+        defer alloc.free(abs);
+        const status = agentStatus(io, alloc, abs) catch return;
+        if (status == .installed) uninstall(io, alloc, abs) catch {};
+    } else |_| {}
+}
+
 /// Do one bounded slice of background work: capture the tree if it moved, then
 /// apply the three grading triggers in priority order.
 ///
 /// This is the whole background story. It is called by the launchd agent, by
 /// `sdt watch`, or by hand; nothing about it assumes a long-lived process.
 pub fn tick(
+    store: *Store,
+    work_dir: std.Io.Dir,
+    ctx: grade.Context,
+    mset: moment.Settings,
+    set: Settings,
+) !TickResult {
+    if (!alive(store)) {
+        reap(store, work_dir);
+        return .{ .skipped = "this repo is being removed" };
+    }
+    const result = tickInner(store, work_dir, ctx, mset, set) catch |e| {
+        if (!alive(store)) {
+            reap(store, work_dir);
+            return .{ .skipped = "this repo is being removed" };
+        }
+        return e;
+    };
+    // The delete may have started while the tick was running, in which case the
+    // lock and stamp this tick wrote are exactly the leftovers to take back.
+    if (!alive(store)) {
+        reap(store, work_dir);
+        return .{ .skipped = "this repo is being removed" };
+    }
+    return result;
+}
+
+fn tickInner(
     store: *Store,
     work_dir: std.Io.Dir,
     ctx: grade.Context,
@@ -530,6 +599,86 @@ pub fn install(
     if (!out.ok()) return error.LaunchctlFailed;
 }
 
+/// The value of one `<key>…</key><string>…</string>` pair in a plist we wrote.
+/// Borrowed from `body`.
+fn plistString(body: []const u8, key: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const open = std.fmt.bufPrint(&buf, "<key>{s}</key><string>", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, body, open) orelse return null;
+    const rest = body[at + open.len ..];
+    const end = std.mem.indexOf(u8, rest, "</string>") orelse return null;
+    return rest[0..end];
+}
+
+/// Evict every installed agent whose repo is no longer there.
+///
+/// An agent outlives the repo it watches: deleting a worktree does not
+/// unregister anything, so a machine accumulates jobs launchd keeps trying to
+/// start in directories that are gone. Worse, one of those firing during an
+/// `rm -rf` is what recreates `.sdt` mid-delete. Returns how many were removed.
+pub fn prune(io: std.Io, alloc: std.mem.Allocator) usize {
+    if (builtin.os.tag != .macos) return 0;
+    const home = std.c.getenv("HOME") orelse return 0;
+    const agents_path = std.fmt.allocPrint(alloc, "{s}/Library/LaunchAgents", .{std.mem.span(home)}) catch return 0;
+    defer alloc.free(agents_path);
+    var dir = std.Io.Dir.cwd().openDir(io, agents_path, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+
+    const uid = std.c.getuid();
+    var removed: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch return removed) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "dev.superdetermine.grade.")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".plist")) continue;
+
+        const body = dir.readFileAlloc(io, entry.name, alloc, .unlimited) catch continue;
+        defer alloc.free(body);
+        const work = plistString(body, "WorkingDirectory") orelse continue;
+
+        const repo_dir = std.Io.Dir.cwd().openDir(io, work, .{}) catch {
+            if (!definitelyGone(io, work)) continue;
+            if (evict(io, alloc, dir, entry.name, uid)) removed += 1;
+            continue;
+        };
+        var repo_dir_mut = repo_dir;
+        defer repo_dir_mut.close(io);
+        if (repo_dir_mut.access(io, store_mod.dir_name, .{})) |_| continue else |_| {}
+        if (evict(io, alloc, dir, entry.name, uid)) removed += 1;
+    }
+    return removed;
+}
+
+/// Is a missing directory deleted, or merely somewhere that is not mounted
+/// right now? An external disk is unplugged and comes back, and retiring its
+/// agent would quietly turn background grading off for a repo nobody deleted.
+/// A deleted directory has a living ancestor — the parent it was removed from —
+/// while an unmounted volume takes its whole subtree with it.
+fn definitelyGone(io: std.Io, path: []const u8) bool {
+    if (std.mem.startsWith(u8, path, "/Volumes/")) {
+        const rest = path["/Volumes/".len..];
+        const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = std.fmt.bufPrint(&buf, "/Volumes/{s}", .{rest[0..end]}) catch return false;
+        std.Io.Dir.cwd().access(io, root, .{}) catch return false;
+    }
+    var at = path;
+    while (std.fs.path.dirname(at)) |parent| : (at = parent) {
+        if (parent.len <= 1) return false;
+        if (std.Io.Dir.cwd().access(io, parent, .{})) |_| return true else |_| {}
+    }
+    return false;
+}
+
+fn evict(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, plist_name: []const u8, uid: std.c.uid_t) bool {
+    const label = plist_name[0 .. plist_name.len - ".plist".len];
+    const spec = std.fmt.allocPrint(alloc, "gui/{d}/{s}", .{ uid, label }) catch return false;
+    defer alloc.free(spec);
+    quietly(alloc, &.{ "launchctl", "bootout", spec });
+    dir.deleteFile(io, plist_name) catch return false;
+    return true;
+}
+
 pub fn uninstall(io: std.Io, alloc: std.mem.Allocator, repo_abs: []const u8) !void {
     if (builtin.os.tag != .macos) return error.Unsupported;
 
@@ -600,6 +749,45 @@ test "due gates on the stamp, and the stamp is written before work" {
     // An old stamp lets the next tick through.
     writeStamp(&store, nowMillis(io) - 10_000);
     try testing.expect(due(&store, set));
+}
+
+test "a tick into a repo being deleted writes nothing back and takes its own leftovers" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var work = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer work.close(io);
+
+    var store = try Store.init(io, alloc, work);
+    defer store.deinit();
+
+    // What `rm -rf` looks like from inside: the repo's contents are gone while
+    // the directory itself is still there, waiting on the rmdir that follows.
+    store.root.deleteTree(io, "objects") catch {};
+    store.root.deleteTree(io, "refs") catch {};
+    store.root.deleteFile(io, store_mod.chunk_key_file) catch {};
+    store.root.deleteFile(io, "HEAD") catch {};
+    try testing.expect(!alive(&store));
+
+    var rules: warrant.PathRules = .{};
+    const ctx = grade.Context{
+        .store = &store,
+        .work_dir = work,
+        .alloc = alloc,
+        .set = .{},
+        .rules = rules,
+    };
+    defer rules.deinit(alloc);
+
+    const r = try tick(&store, work, ctx, .{}, .{});
+    try testing.expect(r.skipped != null);
+    try testing.expect(!r.captured);
+
+    // Nothing was recreated, and the empty repo directory is gone, so the
+    // `rm -rf` that is still running finds an empty tree rather than a husk.
+    try testing.expectError(error.FileNotFound, work.access(io, store_mod.dir_name, .{}));
 }
 
 test "agent labels are stable per repo and differ across repos" {

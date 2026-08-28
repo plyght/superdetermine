@@ -107,6 +107,18 @@ const Ctx = struct {
     since_ms: i64,
     events: *std.ArrayList(EditEvent),
 
+    /// Could these bytes possibly name a file in this repo? An adapter that
+    /// only ever reports absolute paths, or resolves relative ones against a
+    /// `cwd` the file itself records, writes this repo's path down before it
+    /// can report an edit inside it. Matching the directory's bare name instead
+    /// was tried and is worthless: a repo called `big` or `web` appears in
+    /// every session on the machine. The one case this gives up is an agent
+    /// started *above* the repo that only ever wrote relative paths, which
+    /// falls back to attributing the edit to the human.
+    fn mentionsRepo(self: *const Ctx, data: []const u8) bool {
+        return std.mem.indexOf(u8, data, self.repo_abs) != null;
+    }
+
     /// Append an event iff its path is the repo dir or a file under it and it is
     /// recent enough. Dupes every string so parsed JSON can be freed immediately.
     fn push(self: *Ctx, agent: []const u8, session: []const u8, prompt: []const u8, abs_path: []const u8, new_hash: ?Oid, ts_ms: i64) !void {
@@ -179,10 +191,27 @@ fn mtimeMs(dir: std.Io.Dir, io: std.Io, path: []const u8) ?i64 {
     return @intCast(@divTrunc(st.mtime.nanoseconds, 1_000_000));
 }
 
+/// Whether a session file has to name this repo before it is worth parsing.
+///
+/// An adapter whose every event carries an absolute path — or resolves a
+/// relative one against a `cwd` the session file itself records — cannot
+/// produce an event for this repo out of bytes that never mention it. For those,
+/// one `indexOf` over the file replaces a full JSON parse of every line in it,
+/// and a machine with months of sessions for other projects stops paying for
+/// them on every save. Adapters that resolve paths against the repo directory
+/// itself (the permissive harvester) have no such guarantee and scan as before.
+const Mention = enum { required, not_required };
+
 /// Walk `base` recursively, invoking `cb` with the bytes of every regular file
 /// whose name ends in one of `exts` and whose mtime is recent enough. Each file's
 /// bytes are freed after `cb` returns. Per-file errors are swallowed.
-fn walkFiles(ctx: *Ctx, base: std.Io.Dir, exts: []const []const u8, cb: *const fn (ctx: *Ctx, path: []const u8, data: []const u8, mtime_ms: i64) void) void {
+fn walkFiles(
+    ctx: *Ctx,
+    base: std.Io.Dir,
+    exts: []const []const u8,
+    mention: Mention,
+    cb: *const fn (ctx: *Ctx, path: []const u8, data: []const u8, mtime_ms: i64) void,
+) void {
     const io = ctx.io;
     const alloc = ctx.alloc;
     var walker = base.walkSelectively(alloc) catch return;
@@ -200,6 +229,7 @@ fn walkFiles(ctx: *Ctx, base: std.Io.Dir, exts: []const []const u8, cb: *const f
                 if (mt < ctx.since_ms - mtime_slack_ms) continue;
                 const data = base.readFileAlloc(io, entry.path, alloc, .unlimited) catch continue;
                 defer alloc.free(data);
+                if (mention == .required and !ctx.mentionsRepo(data)) continue;
                 cb(ctx, entry.path, data, mt);
             },
             else => {},
@@ -311,7 +341,7 @@ fn isoToMs(s: []const u8) ?i64 {
 fn scanClaude(ctx: *Ctx) anyerror!void {
     var base = openHome(ctx.io, ctx.alloc, ".claude/projects") orelse return;
     defer base.close(ctx.io);
-    walkFiles(ctx, base, &.{".jsonl"}, claudeFile);
+    walkFiles(ctx, base, &.{".jsonl"}, .required, claudeFile);
 }
 
 const ClaudePending = struct {
@@ -522,7 +552,7 @@ fn claudeFile(ctx: *Ctx, _: []const u8, data: []const u8, _: i64) void {
 fn scanPi(ctx: *Ctx) anyerror!void {
     var base = openHome(ctx.io, ctx.alloc, ".pi/agent/sessions") orelse return;
     defer base.close(ctx.io);
-    walkFiles(ctx, base, &.{".jsonl"}, piFile);
+    walkFiles(ctx, base, &.{".jsonl"}, .required, piFile);
 }
 
 fn piFile(ctx: *Ctx, _: []const u8, data: []const u8, mtime_ms: i64) void {
@@ -595,7 +625,7 @@ fn piFile(ctx: *Ctx, _: []const u8, data: []const u8, mtime_ms: i64) void {
 fn scanCodex(ctx: *Ctx) anyerror!void {
     var base = openHome(ctx.io, ctx.alloc, ".codex/sessions") orelse return;
     defer base.close(ctx.io);
-    walkFiles(ctx, base, &.{".jsonl"}, codexFile);
+    walkFiles(ctx, base, &.{".jsonl"}, .required, codexFile);
 }
 
 fn codexFile(ctx: *Ctx, _: []const u8, data: []const u8, mtime_ms: i64) void {
@@ -708,7 +738,7 @@ fn lastToken(s: []const u8) ?[]const u8 {
 fn scanGemini(ctx: *Ctx) anyerror!void {
     var base = openHome(ctx.io, ctx.alloc, ".gemini/tmp") orelse return;
     defer base.close(ctx.io);
-    walkFiles(ctx, base, &.{".jsonl"}, geminiFile);
+    walkFiles(ctx, base, &.{".jsonl"}, .not_required, geminiFile);
 }
 
 fn geminiFile(ctx: *Ctx, _: []const u8, data: []const u8, mtime_ms: i64) void {
@@ -1089,11 +1119,31 @@ test "walkFiles descends into nested subagents directories" {
     var events: std.ArrayList(EditEvent) = .empty;
     defer freeList(alloc, &events);
     var ctx = testCtx(alloc, "/repo", &events);
-    walkFiles(&ctx, tmp.dir, &.{".jsonl"}, claudeFile);
+    walkFiles(&ctx, tmp.dir, &.{".jsonl"}, .required, claudeFile);
 
     try testing.expectEqual(@as(usize, 1), events.items.len);
     try testing.expectEqualStrings("/repo/deep.txt", events.items[0].path);
     try testing.expectEqualStrings("abc123", events.items[0].agent_id);
+}
+
+test "walkFiles skips a session that never names this repo" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "elsewhere.jsonl",
+        .data =
+        \\{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/other/deep.txt","content":"deep"}}]},"timestamp":"2026-01-01T00:00:01.000Z","sessionId":"S7"}
+        ,
+    });
+
+    var events: std.ArrayList(EditEvent) = .empty;
+    defer freeList(alloc, &events);
+    var ctx = testCtx(alloc, "/repo", &events);
+    walkFiles(&ctx, tmp.dir, &.{".jsonl"}, .required, claudeFile);
+    try testing.expectEqual(@as(usize, 0), events.items.len);
 }
 
 test "codex apply_patch exec_command parses the edited path" {
