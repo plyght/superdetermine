@@ -28,12 +28,14 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | **Warranted verdicts** | Each green result names who wrote the code and the check. It also names which changed files the check read. |
 | **Continuous capture** | Starts at `sdt init`. `sdt` keeps every state of the tree as a *moment*. Each moment costs less than one kilobyte. You never type `save` to stay safe. |
 | Content-addressed store (BLAKE3 + FastCDC) | Large files and binaries are first-class, deduped at the chunk level. No LFS. |
+| Durable by default | An acknowledged write is on the device, not in a cache a power cut empties. The barrier is spent where a name is published, so ordinary object writes stay at the speed they were. `sdt config durability fast` trades it back. |
 | Working copy is always a change | There is no staging area and no stash. `sdt save` names a boundary. It is not how `sdt` keeps your work. |
 | Operation log | `sdt undo` and `sdt redo` across the whole repo. Nothing gets lost. |
 | Instant copy-on-write worktrees | `sdt work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). |
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
 | Three-way merge + resolve | Conflict markers, then `sdt resolve <file>` / `sdt resolve --abort`. |
 | Absorb | `sdt absorb` folds working edits into the changes they belong to. |
+| Verdicts expire | A recorded verdict is kept for `verdicts.retain` (default 90d). A record another has superseded goes sooner, a green that aged out goes on time, and a red is never dropped for being old. |
 | Garbage collection | `sdt gc` reclaims space from unreachable objects (`--dry-run` to preview). What a rewrite abandoned stays recoverable for `gc.retain` (default 30d) and is collected after; anything a branch points at is kept regardless of age. |
 | Purge a path | `sdt purge <path...>` erases a path from every change, so `sdt gc` can reclaim what a mistakenly committed build directory holds. |
 | Prompt provenance (opt-in) | Record which agent or prompt produced a change, stored in the repo. |
@@ -84,6 +86,7 @@ sdt back 3                # rewind three moments
 sdt rewind @2h            # or @green~2, @yesterday, @a3f91c
 sdt moments               # what was captured, and what each one did
 sdt doctor                # what is on, what is degraded, and why
+                          # including whether a log has holes, and how much history they cover
 ```
 
 A rewind destroys nothing. `sdt` captures the state that you leave before it rewinds. `sdt undo` reverses the rewind.
@@ -311,6 +314,8 @@ That is the whole setup. There is no account, no host, no invite, and no list to
 **Same-path edits do not stop anyone.** Where two people genuinely changed the same file, the result is a superposition rather than conflict markers: both whole versions are kept, the worktree materialises one, and every peer's tree still compiles and still grades. `sdt super` shows what is holding more than one version and `sdt collapse` keeps one.
 
 **Greens travel.** A verdict is keyed by `(tree, tier, command, inputs)` and by nothing about the machine that produced it, so a check another peer already paid for answers here for the identical tree. On a team, or across a fleet of agents grinding the same tree, that is the compounding one. Turn it off with `sdt config mesh-verdicts off`.
+
+**One peer grades, not all of them.** Sharing a verdict after the fact still means everyone paid for it. Peers rank themselves for each grading job by hashing the job against their own id, so all of them independently reach the same ranking having agreed on nothing, and the ones that lose wait for the answer instead of computing it again. Nobody is elected; there is only a number each peer can work out for itself. A peer that loses still grades if the answer does not arrive, on a wait derived from what that check has actually been seen to take, because a duplicated run costs CPU and a run that never happens costs the point of the tool. `sdt config mesh-grade-claim off` goes back to everyone grading.
 
 **Moments do not travel.** Capture is per-machine and arrives by the hundred; your teammates want your changes, not your keystrokes.
 
