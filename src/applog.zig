@@ -1,5 +1,7 @@
 const std = @import("std");
-const Store = @import("store.zig").Store;
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
+const Durability = store_mod.Durability;
 
 /// O(1) appends to a line-oriented log inside `.sdt/`.
 ///
@@ -12,7 +14,25 @@ const Store = @import("store.zig").Store;
 /// The lock is held only for the length-then-write pair, which is what makes
 /// two `sdt` processes appending concurrently interleave whole records rather
 /// than shredding each other's bytes.
+///
+/// Extending the file and filling the extension are two separate things to a
+/// filesystem, and a crash between them leaves a record-shaped hole of zeroes
+/// that every reader here skips as malformed — a moment or a verdict that
+/// silently stops existing. Under `store.durability = strict` the bytes are
+/// flushed before the lock is dropped, so a record that appended is a record
+/// that is there.
 pub fn append(store: *Store, sub_path: []const u8, bytes: []const u8) !void {
+    return appendWith(store, sub_path, bytes, store.durability);
+}
+
+/// Append without the barrier whatever the repo asked for. For records a later
+/// one supersedes — a heartbeat, a re-derivable capture — where the cost of a
+/// flush per write outweighs losing the last of them.
+pub fn appendFast(store: *Store, sub_path: []const u8, bytes: []const u8) !void {
+    return appendWith(store, sub_path, bytes, .fast);
+}
+
+fn appendWith(store: *Store, sub_path: []const u8, bytes: []const u8, mode: Durability) !void {
     if (bytes.len == 0) return;
     const io = store.io;
 
@@ -24,6 +44,8 @@ pub fn append(store: *Store, sub_path: []const u8, bytes: []const u8) !void {
 
     const end = try file.length(io);
     try file.writePositionalAll(io, bytes, end);
+    // Still under the lock: the next appender reads a length it can trust.
+    if (mode == .strict) try store_mod.syncFile(io, file, .full);
 }
 
 /// Read a whole log. Absent file reads as empty rather than erroring, since a
@@ -118,4 +140,54 @@ test "rewrite replaces and append continues from the new end" {
     const data = try readAll(&store, alloc, "log");
     defer alloc.free(data);
     try testing.expectEqualStrings("bbbb\ncccc\n", data);
+}
+
+test "a strict append leaves no hole behind it" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    try testing.expectEqual(Durability.strict, store.durability);
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(alloc);
+
+    for (0..64) |i| {
+        const line = try std.fmt.allocPrint(alloc, "verdict {d} green\n", .{i});
+        defer alloc.free(line);
+        try append(&store, "log", line);
+        try expected.appendSlice(alloc, line);
+
+        // Every record that returned is on disk whole: the file is exactly as
+        // long as what was written, with no zero-filled gap standing in for a
+        // write that never landed.
+        const so_far = try readAll(&store, alloc, "log");
+        defer alloc.free(so_far);
+        try testing.expectEqualStrings(expected.items, so_far);
+        try testing.expect(std.mem.indexOfScalar(u8, so_far, 0) == null);
+    }
+}
+
+test "both durability modes append the same bytes" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try append(&store, "log", "one\n");
+    try appendFast(&store, "log", "two\n");
+    store.durability = .fast;
+    try append(&store, "log", "three\n");
+    store.durability = .strict;
+    try append(&store, "log", "four\n");
+
+    const data = try readAll(&store, alloc, "log");
+    defer alloc.free(data);
+    try testing.expectEqualStrings("one\ntwo\nthree\nfour\n", data);
 }

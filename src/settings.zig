@@ -201,6 +201,14 @@ pub const table = [_]Setting{
         .group = "what says your code works",
         .desc = "how long a timed-out check gets to exit before it is killed",
     },
+    .{
+        .name = "verdicts-retain",
+        .key = "verdicts.retain",
+        .kind = .duration,
+        .group = "what says your code works",
+        .desc = "how long a recorded verdict is kept",
+        .default = "90d",
+    },
 
     .{
         .name = "capture",
@@ -250,6 +258,15 @@ pub const table = [_]Setting{
         .group = "what is captured",
         .desc = "how long an unreachable object survives a `sdt gc`",
         .default = "14d",
+    },
+    .{
+        .name = "durability",
+        .key = "store.durability",
+        .kind = .choice,
+        .group = "what is captured",
+        .desc = "whether a write is flushed to the disk before it counts as saved",
+        .default = "strict",
+        .choices = &.{ "strict", "fast" },
     },
 
     .{
@@ -373,6 +390,14 @@ pub const table = [_]Setting{
         .kind = .toggle,
         .group = "talking to other repos",
         .desc = "share what your checks said with the room",
+    },
+    .{
+        .name = "mesh-grade-claim",
+        .key = "mesh.grade-claim",
+        .kind = .toggle,
+        .group = "talking to other repos",
+        .desc = "let one peer grade a tree while the others wait for its answer",
+        .default = "on",
     },
     .{
         .name = "mesh-every",

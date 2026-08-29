@@ -901,6 +901,185 @@ pub const VerdictPool = struct {
     }
 };
 
+// --- deciding who grades ---
+
+/// Which grading job a claim is about.
+///
+/// These are exactly the fields the verdict this run would produce is keyed by,
+/// and that is the whole point: the claim and the answer name the same thing, so
+/// a peer that defers is waiting for the precise record that would have made its
+/// own run a cache hit anyway.
+pub const Job = struct {
+    tree: Oid,
+    tier: verdict.Tier,
+    command: Oid,
+
+    pub fn fromKey(key: verdict.Key) Job {
+        return .{ .tree = key.tree, .tier = key.tier, .command = key.command };
+    }
+};
+
+const claim_domain = "gr-mesh-v1 grade claim";
+
+/// Rendezvous hashing: a peer's weight for one job.
+///
+/// The alternative to this is an election, and an election is the one thing this
+/// file has spent its whole existence not needing. A leader needs a term, a
+/// quorum, a failure detector and a story for what happens when the network
+/// splits — all of it state that has to be agreed before any code is graded, on
+/// a mesh whose entire premise is that nothing has to be agreed. Highest-random
+/// -weight hashing gets the same answer for free: every peer scores every peer
+/// against the job with the same one-way function, so they independently arrive
+/// at the same ranking having exchanged nothing at all. Nobody is elected;
+/// there is only a number, and each peer can work out its own.
+///
+/// The job is in the digest, not just the peer, so the ranking is re-drawn per
+/// job. A peer that wins one tree loses the next, which is what spreads a fleet
+/// grinding the same repo across the fleet instead of pinning every run onto
+/// whichever machine happened to hash high.
+pub fn claimScore(job: Job, peer: PeerId) u64 {
+    var h = Blake3.init(.{});
+    h.update(claim_domain);
+    h.update(&job.tree.bytes);
+    h.update(job.tier.label());
+    h.update(&job.command.bytes);
+    h.update(&peer);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return std.mem.readInt(u64, out[0..8], .big);
+}
+
+/// Whether `me` is the peer that should run this job, given the peers it can
+/// see. `peers` is this peer's own view and is expected to contain `me`.
+///
+/// Ties break on the peer id, which is 64 bits of process-local randomness, so
+/// the total order is strict and every peer computes the same one. That matters
+/// more than it looks: a ranking with ties could let two peers each conclude the
+/// other was ahead, and the pair would then wait on each other rather than on a
+/// grade.
+pub fn claims(job: Job, me: PeerId, peers: []const PeerId) bool {
+    const mine = claimScore(job, me);
+    for (peers) |p| {
+        if (std.mem.eql(u8, &p, &me)) continue;
+        const theirs = claimScore(job, p);
+        if (theirs > mine) return false;
+        if (theirs == mine and std.mem.order(u8, &p, &me) == .gt) return false;
+    }
+    return true;
+}
+
+/// Where a running mesh leaves a note of who it can currently see.
+///
+/// Grading happens in a different process from the mesh — `sdt grade --once`
+/// under launchd, or `sdt watch` — so the peer set has to cross a process
+/// boundary somehow, and a file this machine writes for itself is the cheapest
+/// crossing there is. This is not a registry and never becomes one: it is one
+/// peer's momentary opinion of the room, it is never sent anywhere, no other
+/// machine reads it, and nothing is correct because of what it says. It is a
+/// hint that lets a grade skip work, and every path that reads it survives the
+/// file being absent, stale or wrong.
+pub const roster_path = "mesh/peers";
+
+/// How long a roster line is worth believing. Comfortably more than the default
+/// heartbeat that refreshes it, so an ordinarily busy mesh never looks dead, and
+/// short enough that a mesh killed with `kill -9` — the one exit that skips the
+/// unlink in `close` — stops being believed in seconds rather than in hours.
+pub const roster_stale_ms: i64 = 15_000;
+
+pub const Roster = struct {
+    /// The peer id of the mesh process running on this machine.
+    me: PeerId,
+    /// Everyone it can see, `me` included.
+    peers: []PeerId,
+
+    pub fn deinit(self: Roster, alloc: std.mem.Allocator) void {
+        alloc.free(self.peers);
+    }
+};
+
+/// Record the room as it looks right now. Failure is silently fine: the only
+/// consequence is that a grade elsewhere on this machine assumes it is alone,
+/// which is the behaviour that predates any of this.
+pub fn writeRoster(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    me: PeerId,
+    peers: []const PeerId,
+    now_ms: i64,
+) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var hex: [peer_id_len * 2]u8 = undefined;
+    try out.print(alloc, "self {s} {d}\n", .{ peerHex(me, &hex), now_ms });
+    for (peers) |p| {
+        if (std.mem.eql(u8, &p, &me)) continue;
+        try out.print(alloc, "peer {s} {d}\n", .{ peerHex(p, &hex), now_ms });
+    }
+
+    store.root.createDirPath(store.io, "mesh") catch {};
+    try store.root.writeFile(store.io, .{ .sub_path = roster_path, .data = out.items });
+}
+
+pub fn clearRoster(store: *Store) void {
+    store.root.deleteFile(store.io, roster_path) catch {};
+}
+
+/// The room as the local mesh last saw it, or null when there is no local mesh
+/// worth listening to.
+///
+/// Null is the honest answer far more often than it looks: no mesh configured,
+/// no mesh running, a mesh that died, a file half written by a mesh that is
+/// still writing it. Every one of those has to mean "assume you are alone",
+/// because a caller that assumed otherwise would wait for a peer that does not
+/// exist.
+pub fn readRoster(store: *Store, alloc: std.mem.Allocator, now_ms: i64) ?Roster {
+    const data = store.root.readFileAlloc(
+        store.io,
+        roster_path,
+        alloc,
+        .limited(64 * 1024),
+    ) catch return null;
+    defer alloc.free(data);
+
+    var me: ?PeerId = null;
+    var peers: std.ArrayList(PeerId) = .empty;
+    errdefer peers.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        var it = std.mem.splitScalar(u8, line, ' ');
+        const tag = it.next() orelse continue;
+        const id_hex = it.next() orelse continue;
+        const ms_s = it.next() orelse continue;
+        const ms = std.fmt.parseInt(i64, ms_s, 10) catch continue;
+        if (now_ms - ms > roster_stale_ms) continue;
+        if (id_hex.len != peer_id_len * 2) continue;
+        var id: PeerId = undefined;
+        _ = std.fmt.hexToBytes(&id, id_hex) catch continue;
+
+        if (std.mem.eql(u8, tag, "self")) {
+            me = id;
+            peers.append(alloc, id) catch continue;
+        } else if (std.mem.eql(u8, tag, "peer")) {
+            peers.append(alloc, id) catch continue;
+        }
+    }
+
+    // Without a fresh `self` line there is no local peer to rank, so there is
+    // nothing to decide and the caller must behave as it always did.
+    if (me == null) {
+        peers.deinit(alloc);
+        return null;
+    }
+    return .{ .me = me.?, .peers = peers.toOwnedSlice(alloc) catch {
+        peers.deinit(alloc);
+        return null;
+    } };
+}
+
 // --- one link to one peer ---
 
 fn nowMillis(io: std.Io) i64 {
@@ -1212,6 +1391,12 @@ pub const Mesh = struct {
         self.links.deinit(self.alloc);
         self.unlockLinks();
 
+        // A mesh that has stopped must stop being believed at once rather than
+        // when its last roster line ages out, because every second in between is
+        // a second some grade on this machine might spend deferring to a peer
+        // nothing is connected to any more.
+        clearRoster(self.st);
+
         self.known.deinit(self.alloc);
         self.pushed.deinit(self.alloc);
         self.frontier.deinit();
@@ -1233,6 +1418,34 @@ pub const Mesh = struct {
 
     fn unlockStore(self: *Mesh) void {
         self.store_mutex.unlock(self.io);
+    }
+
+    /// How many peers are linked right now.
+    fn peerCount(self: *Mesh) usize {
+        var n: usize = 0;
+        self.lockLinks();
+        defer self.unlockLinks();
+        for (self.links.items) |l| {
+            if (l.alive.load(.acquire)) n += 1;
+        }
+        return n;
+    }
+
+    /// Leave the note that lets a grade running in another process on this
+    /// machine work out whether somebody else is about to have the answer.
+    fn publishRoster(self: *Mesh) void {
+        const alloc = self.alloc;
+        var peers: std.ArrayList(PeerId) = .empty;
+        defer peers.deinit(alloc);
+
+        self.lockLinks();
+        for (self.links.items) |l| {
+            if (!l.alive.load(.acquire)) continue;
+            peers.append(alloc, l.peer) catch continue;
+        }
+        self.unlockLinks();
+
+        writeRoster(self.st, alloc, self.me, peers.items, nowMillis(self.io)) catch {};
     }
 
     pub fn beacon(self: *Mesh) Beacon {
@@ -1659,6 +1872,9 @@ pub const Mesh = struct {
         var last_reseed = last_heartbeat;
         var last_verdict_len: u64 = self.verdictLogLen();
         var backoff: u32 = 1;
+        var last_roster = last_heartbeat;
+        var roster_peers: usize = std.math.maxInt(usize);
+        self.publishRoster();
 
         self.last_fingerprint = self.fingerprint(self.alloc) catch Oid.zero();
 
@@ -1691,6 +1907,16 @@ pub const Mesh = struct {
                 const us: u64 = @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1000));
                 self.broadcast(.{ .ping = us });
             }
+            // Refresh the roster when the room changes shape, and otherwise at
+            // the heartbeat. Writing it every tick would be forty tiny writes a
+            // second to say nothing had happened.
+            const live_now = self.peerCount();
+            if (live_now != roster_peers or now - last_roster >= self.opts.heartbeat_ms) {
+                roster_peers = live_now;
+                last_roster = now;
+                self.publishRoster();
+            }
+
             if (now - last_reseed >= self.opts.reseed_ms) {
                 last_reseed = now;
                 self.frontier.seed(self.st) catch {};
@@ -1728,7 +1954,7 @@ pub const Settings = struct {
     }
 };
 
-fn boolOf(v: []const u8) bool {
+pub fn boolOf(v: []const u8) bool {
     return !(std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "off") or
         std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "no"));
 }
@@ -2381,4 +2607,117 @@ test "an unshared tail is handed over once, and a trimmed log is re-offered whol
     const third = (try pool.unshared(&st, alloc)) orelse return error.TestExpectedTail;
     defer alloc.free(third);
     try testing.expectEqualStrings("x\n", third);
+}
+
+test "every peer ranks a grading job the same way" {
+    const alloc = testing.allocator;
+    _ = alloc;
+
+    const job = Job{
+        .tree = Oid.zero(),
+        .tier = .full,
+        .command = verdict.commandHash("zig build test"),
+    };
+    var peers: [4]PeerId = .{
+        [_]u8{1} ** peer_id_len,
+        [_]u8{2} ** peer_id_len,
+        [_]u8{3} ** peer_id_len,
+        [_]u8{4} ** peer_id_len,
+    };
+
+    // Exactly one peer claims, whichever peer is doing the asking, and the
+    // order the room happens to be listed in changes nothing.
+    var claimants: usize = 0;
+    for (peers) |me| {
+        if (claims(job, me, &peers)) claimants += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), claimants);
+
+    const reversed: [4]PeerId = .{ peers[3], peers[2], peers[1], peers[0] };
+    for (peers) |me| {
+        try testing.expectEqual(claims(job, me, &peers), claims(job, me, &reversed));
+    }
+
+    // The same peer scores the same on any machine: nothing here reads a clock,
+    // a socket or a local file.
+    try testing.expectEqual(claimScore(job, peers[0]), claimScore(job, peers[0]));
+
+    // A different job is a different ranking, which is what stops one peer
+    // owning everything.
+    const other = Job{ .tree = Oid.zero(), .tier = .fast, .command = job.command };
+    var differs = false;
+    for (peers) |me| {
+        if (claims(job, me, &peers) != claims(other, me, &peers)) differs = true;
+    }
+    try testing.expect(differs);
+}
+
+test "a peer alone in the room always claims its own work" {
+    const job = Job{
+        .tree = Oid.zero(),
+        .tier = .fast,
+        .command = verdict.commandHash("true"),
+    };
+    const me: PeerId = [_]u8{7} ** peer_id_len;
+    try testing.expect(claims(job, me, &.{me}));
+    try testing.expect(claims(job, me, &.{}));
+}
+
+test "claims spread across the room rather than landing on one peer" {
+    var peers: [4]PeerId = undefined;
+    for (&peers, 0..) |*p, i| p.* = [_]u8{@intCast(i + 1)} ** peer_id_len;
+
+    var wins: [4]usize = .{ 0, 0, 0, 0 };
+    const cmd = verdict.commandHash("zig build test");
+    for (0..400) |i| {
+        var tree = Oid.zero();
+        std.mem.writeInt(u64, tree.bytes[0..8], @intCast(i), .big);
+        const job = Job{ .tree = tree, .tier = .full, .command = cmd };
+
+        var claimed: usize = 0;
+        for (peers, 0..) |me, k| {
+            if (claims(job, me, &peers)) {
+                wins[k] += 1;
+                claimed += 1;
+            }
+        }
+        // Never nobody, and never two: the order is strict.
+        try testing.expectEqual(@as(usize, 1), claimed);
+    }
+    // A quarter each in expectation; the bound is loose enough not to be a
+    // test of the hash's exact tail and tight enough to catch a ranking that
+    // ignores the job.
+    for (wins) |w| {
+        try testing.expect(w > 50);
+        try testing.expect(w < 200);
+    }
+}
+
+test "a roster is believed while it is being written and not after" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var st = try Store.init(io, alloc, tmp.dir);
+    defer st.deinit();
+
+    // No mesh has ever run here.
+    try testing.expect(readRoster(&st, alloc, 1_000_000) == null);
+
+    const me: PeerId = [_]u8{1} ** peer_id_len;
+    const them: PeerId = [_]u8{2} ** peer_id_len;
+    try writeRoster(&st, alloc, me, &.{them}, 1_000_000);
+
+    const fresh = readRoster(&st, alloc, 1_000_100).?;
+    defer fresh.deinit(alloc);
+    try testing.expectEqualSlices(u8, &me, &fresh.me);
+    try testing.expectEqual(@as(usize, 2), fresh.peers.len);
+
+    // Long enough after the last line was written, the mesh that wrote it is
+    // assumed gone and the reader is alone again.
+    try testing.expect(readRoster(&st, alloc, 1_000_000 + roster_stale_ms + 1) == null);
+
+    clearRoster(&st);
+    try testing.expect(readRoster(&st, alloc, 1_000_100) == null);
 }

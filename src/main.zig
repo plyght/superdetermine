@@ -41,6 +41,7 @@ const attribution = @import("attribution.zig");
 const agentscan = @import("agentscan.zig");
 const update = @import("update.zig");
 const gc = @import("gc.zig");
+const integrity = @import("integrity.zig");
 const purge = @import("purge.zig");
 const blame = @import("blame.zig");
 const completions = @import("completions.zig");
@@ -4081,6 +4082,53 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         }
         try ui.hint(w, "               `sdt branch` lists every tip; `sdt point <ref>` keeps one");
     }
+
+    // Every log reader skips the lines it cannot parse, so one bad byte never
+    // takes the whole history down — and so the loss never surfaces anywhere
+    // either. This is where it surfaces.
+    if (integrity.inspect(&s, alloc)) |report| {
+        defer report.deinit(alloc);
+        const total = report.lines();
+        if (report.clean()) {
+            try w.print("  integrity    {d} log line{s}, all readable\n", .{
+                total, if (total == 1) "" else "s",
+            });
+        } else {
+            try w.print("  integrity    {s}{s} {d} of {d} log lines unreadable{s}\n", .{
+                ui.on(.yellow), ui.warn, report.unreadable(), total, ui.off(),
+            });
+            for (report.logs) |log| {
+                if (log.unreadable() == 0) continue;
+                try w.print("               {s}: ", .{log.path});
+                if (log.torn != 0) try w.print("{d} torn", .{log.torn});
+                if (log.torn != 0 and log.malformed != 0) try w.writeAll(", ");
+                if (log.malformed != 0) try w.print("{d} malformed", .{log.malformed});
+                try w.print(" of {d} lines\n", .{log.lines});
+                for (log.spans, 0..) |sp, i| {
+                    if (i == 4) {
+                        try w.print("                 and {d} more\n", .{log.spans.len - 4});
+                        break;
+                    }
+                    if (sp.lines() == 1) {
+                        try w.print("                 line {d} {s}", .{ sp.from_line, sp.kind.label() });
+                    } else {
+                        try w.print("                 lines {d}-{d} {s}", .{ sp.from_line, sp.to_line, sp.kind.label() });
+                    }
+                    const gap_ms = sp.gapMs();
+                    if (gap_ms > 0) {
+                        const gap_s: u64 = @intCast(@divTrunc(gap_ms, 1000));
+                        if (gap_s < 3600) {
+                            try w.print(", {d}m{d:0>2}s of history missing", .{ gap_s / 60, gap_s % 60 });
+                        } else {
+                            try w.print(", {d}h{d:0>2}m of history missing", .{ gap_s / 3600, (gap_s / 60) % 60 });
+                        }
+                    }
+                    try w.writeAll("\n");
+                }
+            }
+            try ui.hint(w, "               torn is an append a crash cut short; malformed is a writer bug");
+        }
+    } else |_| {}
 }
 
 fn cmdRecap(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -5743,6 +5791,7 @@ test {
     _ = lfs;
     _ = proc;
     _ = @import("applog.zig");
+    _ = @import("integrity.zig");
     _ = moment;
     _ = verdict;
     _ = revspec;

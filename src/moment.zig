@@ -575,6 +575,145 @@ pub fn count(store: *Store, alloc: std.mem.Allocator) !usize {
     return all.len;
 }
 
+// --- the tail sidecar ---
+
+/// `capture` needs exactly two facts about the log: the last moment, and how
+/// many there are. Both are O(1) properties of an append-only file, and the full
+/// parse that used to answer them made an hours-long session quadratic all over
+/// again. The sidecar caches them beside the log.
+///
+/// It is a cache and never a source of truth. The log stays authoritative, and a
+/// sidecar that is absent, unparseable or out of step with the log is silently
+/// rebuilt from it; deleting `.sdt/moments/tail` costs one slow capture and
+/// loses nothing at all.
+pub const tail_path = "moments/tail";
+
+const tail_magic = "tail-v1";
+
+/// What `capture` reads instead of the whole log.
+const Head = struct {
+    /// The log's byte length that these two facts describe.
+    len: u64,
+    /// How many parseable records the log holds.
+    total: usize,
+    /// The last of them, or null on an empty log. Caller frees `.branch`.
+    prev: ?Moment,
+};
+
+fn logLength(store: *Store) u64 {
+    const file = store.root.openFile(store.io, log_path, .{}) catch return 0;
+    defer file.close(store.io);
+    return file.length(store.io) catch 0;
+}
+
+/// The log's final `n` bytes, read positionally so the cost does not depend on
+/// how long the log is. Null whenever the read cannot be made to say anything.
+fn logSuffix(store: *Store, alloc: std.mem.Allocator, n: usize, len: u64) ?[]u8 {
+    if (n == 0 or n > len) return null;
+    const file = store.root.openFile(store.io, log_path, .{}) catch return null;
+    defer file.close(store.io);
+    const buf = alloc.alloc(u8, n) catch return null;
+    const got = file.readPositionalAll(store.io, buf, len - n) catch {
+        alloc.free(buf);
+        return null;
+    };
+    if (got != n) {
+        alloc.free(buf);
+        return null;
+    }
+    return buf;
+}
+
+/// The sidecar, if and only if it still agrees with the log.
+///
+/// Two checks, both O(1). The length must match, which catches every append
+/// behind our back — another process capturing, a crash-torn record, `trim`, and
+/// `purge`'s direct `applog.rewrite`, none of which can land on the exact byte
+/// count the sidecar recorded. The final record must match too, which catches
+/// the one case length alone cannot: a rewrite that happens to be the same size,
+/// such as a hand-edited log. A cache that is wrong about `prev` writes a delta
+/// against the wrong base, so the second check is worth its one small read.
+fn readTail(store: *Store, alloc: std.mem.Allocator) ?Head {
+    const raw = store.root.readFileAlloc(store.io, tail_path, alloc, .limited(64 * 1024)) catch return null;
+    defer alloc.free(raw);
+
+    const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return null;
+    const line = raw[nl + 1 ..];
+    if (line.len == 0) return null;
+
+    var it = std.mem.splitScalar(u8, raw[0..nl], ' ');
+    if (!std.mem.eql(u8, it.next() orelse return null, tail_magic)) return null;
+    const len = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+    const total = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    if (total == 0) return null;
+
+    if (logLength(store) != len) return null;
+    const suffix = logSuffix(store, alloc, line.len, len) orelse return null;
+    defer alloc.free(suffix);
+    if (!std.mem.eql(u8, suffix, line)) return null;
+
+    const m = parseLine(alloc, std.mem.trimEnd(u8, line, "\n")) catch return null;
+    return .{ .len = len, .total = total, .prev = m };
+}
+
+/// Best effort: a sidecar that fails to write costs the next capture a full
+/// read, which is what capture did unconditionally before it existed. Written
+/// atomically so a concurrent writer can only lose the race, never tear the
+/// file into something a reader half-believes.
+fn writeTail(store: *Store, alloc: std.mem.Allocator, len: u64, total: usize, line: []const u8) void {
+    const data = std.fmt.allocPrint(alloc, "{s} {d} {d}\n{s}", .{ tail_magic, len, total, line }) catch return;
+    defer alloc.free(data);
+    store.writeFileAtomic(tail_path, data) catch {};
+}
+
+/// Drop the sidecar after rewriting the log. The length check would catch the
+/// rewrite anyway — that is what makes `purge`, which rewrites the log without
+/// knowing the sidecar exists, self-healing — but a cache known to be wrong is
+/// not worth leaving on disk.
+fn invalidateTail(store: *Store) void {
+    store.root.deleteFile(store.io, tail_path) catch {};
+}
+
+/// The last moment and the record count: from the sidecar when it agrees with
+/// the log, from a full parse when it does not. Caller frees `.prev.branch`.
+fn logHead(store: *Store, alloc: std.mem.Allocator) !Head {
+    if (readTail(store, alloc)) |h| return h;
+    return rebuildHead(store, alloc);
+}
+
+fn rebuildHead(store: *Store, alloc: std.mem.Allocator) !Head {
+    const data = try applog.readAll(store, alloc, log_path);
+    defer alloc.free(data);
+
+    var total: usize = 0;
+    var prev: ?Moment = null;
+    var prev_line: []const u8 = "";
+    errdefer if (prev) |p| alloc.free(p.branch);
+
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, data, "\n"), '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const m = parseLine(alloc, line) catch continue;
+        if (prev) |p| alloc.free(p.branch);
+        prev = m;
+        prev_line = line;
+        total += 1;
+    }
+
+    // Only cache a log whose final bytes are the record we would compare against
+    // later. When the log ends in something unparseable the last moment is not
+    // the last line, no suffix comparison could ever succeed, and a sidecar that
+    // is guaranteed stale is worse than none.
+    if (prev != null and data.len >= prev_line.len + 1 and
+        data[data.len - 1] == '\n' and
+        std.mem.eql(u8, data[data.len - prev_line.len - 1 .. data.len - 1], prev_line))
+    {
+        writeTail(store, alloc, data.len, total, data[data.len - prev_line.len - 1 ..]);
+    }
+
+    return .{ .len = data.len, .total = total, .prev = prev };
+}
+
 // --- capture ---
 
 fn nowMillis(io: std.Io) i64 {
@@ -611,9 +750,14 @@ pub fn capture(
     // re-read it, which made capturing the n-th moment cost O(n) log parsing
     // and the whole session O(n^2), which is exactly the shape this module exists to
     // avoid, reintroduced one convenience call at a time.
-    const existing = try readAll(store, alloc);
-    defer freeMoments(alloc, existing);
-    const prev: ?Moment = if (existing.len == 0) null else existing[existing.len - 1];
+    //
+    // And now no read of the log at all on the common path. One full read is
+    // still O(n), so a session that captures every few seconds for hours stayed
+    // quadratic with a smaller constant. The two facts that read was for come
+    // from the tail sidecar instead, which the log is always free to contradict.
+    const h = try logHead(store, alloc);
+    defer if (h.prev) |p| alloc.free(p.branch);
+    const prev = h.prev;
 
     if (prev) |p| {
         if (p.full_tree.eql(full_tree)) return .unchanged;
@@ -622,7 +766,7 @@ pub fn capture(
     const branch = try store.headBranch();
     errdefer alloc.free(branch);
 
-    const total = existing.len;
+    const total = h.total;
     const want_keyframe = prev == null or
         set.keyframe_interval <= 1 or
         total % set.keyframe_interval == 0;
@@ -638,7 +782,7 @@ pub fn capture(
             // which also re-anchors every future delta on solid ground.
             Error.MomentCorrupt, Error.MomentNotFound => {
                 repr = try store.writeRaw(enc);
-                return try finish(store, alloc, branch, full_tree, repr, .keyframe, cause, set, total);
+                return try finish(store, alloc, branch, full_tree, repr, .keyframe, cause, set, total, h.len);
             },
             else => return e,
         };
@@ -668,7 +812,7 @@ pub fn capture(
         }
     }
 
-    return try finish(store, alloc, branch, full_tree, repr, kind, cause, set, total);
+    return try finish(store, alloc, branch, full_tree, repr, kind, cause, set, total, h.len);
 }
 
 fn finish(
@@ -681,6 +825,7 @@ fn finish(
     cause: Cause,
     set: Settings,
     total: usize,
+    log_len: u64,
 ) !CaptureResult {
     const ms = nowMillis(store.io);
     const m = Moment{
@@ -697,6 +842,13 @@ fn finish(
     const line = try formatLine(alloc, m);
     defer alloc.free(line);
     try applog.append(store, log_path, line);
+
+    // The cached length is derived from what this process appended, never read
+    // back from the file. A length read back would agree with a log that a
+    // concurrent capture has already added a record to, and the sidecar would
+    // then be confidently wrong about both `prev` and the count. Derived, it
+    // simply disagrees, and disagreement is the whole self-healing mechanism.
+    writeTail(store, alloc, log_len + line.len, total + 1, line);
 
     // Retention almost always decides nothing, and deciding it costs a full
     // log read, so it is not run on every capture. The count is already known
@@ -735,6 +887,7 @@ pub fn trim(store: *Store, alloc: std.mem.Allocator, set: Settings) !void {
 
     if (want >= all.len) {
         try applog.rewrite(store, log_path, "");
+        invalidateTail(store);
         return;
     }
 
@@ -759,6 +912,7 @@ pub fn trim(store: *Store, alloc: std.mem.Allocator, set: Settings) !void {
         try out.appendSlice(alloc, line);
     }
     try applog.rewrite(store, log_path, out.items);
+    invalidateTail(store);
 }
 
 /// Rewrite `survivors` so the first is a keyframe and the rest are deltas along
@@ -767,6 +921,7 @@ pub fn trim(store: *Store, alloc: std.mem.Allocator, set: Settings) !void {
 fn reanchor(store: *Store, alloc: std.mem.Allocator, survivors: []const Moment) !void {
     if (survivors.len == 0) {
         try applog.rewrite(store, log_path, "");
+        invalidateTail(store);
         return;
     }
 
@@ -821,6 +976,7 @@ fn reanchor(store: *Store, alloc: std.mem.Allocator, survivors: []const Moment) 
     }
 
     try applog.rewrite(store, log_path, out.items);
+    invalidateTail(store);
 }
 
 /// Every object a moment's representation chain depends on, so `gc` can treat
@@ -1243,4 +1399,172 @@ test "parseDuration understands units and falls back on junk" {
     try testing.expectEqual(@as(i64, 7200), parseDuration("2h", 1));
     try testing.expectEqual(@as(i64, 14 * 86400), parseDuration("14d", 1));
     try testing.expectEqual(@as(i64, 42), parseDuration("nonsense", 42));
+}
+
+test "a deleted tail sidecar rebuilds from the log" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const set = testSettings();
+    for (0..6) |i| {
+        const body = try std.fmt.allocPrint(alloc, "v{d}", .{i});
+        defer alloc.free(body);
+        try work.writeFile(io, .{ .sub_path = "a.txt", .data = body });
+        const r = try capture(&store, work, .poll, set);
+        if (r == .captured) alloc.free(r.captured.branch);
+    }
+
+    const warm = try logHead(&store, alloc);
+    defer if (warm.prev) |p| alloc.free(p.branch);
+
+    // The user is allowed to delete a cache.
+    store.root.deleteFile(io, tail_path) catch {};
+    const cold = try logHead(&store, alloc);
+    defer if (cold.prev) |p| alloc.free(p.branch);
+
+    try testing.expectEqual(warm.total, cold.total);
+    try testing.expectEqual(warm.len, cold.len);
+    try testing.expectEqualSlices(u8, &warm.prev.?.id, &cold.prev.?.id);
+    try testing.expect(warm.prev.?.repr.eql(cold.prev.?.repr));
+
+    // Rebuilding rewrote it, so the next read is warm again and still right.
+    const again = try logHead(&store, alloc);
+    defer if (again.prev) |p| alloc.free(p.branch);
+    try testing.expectEqual(warm.total, again.total);
+    try testing.expectEqualSlices(u8, &warm.prev.?.id, &again.prev.?.id);
+}
+
+test "a log rewritten behind the sidecar's back is detected, not believed" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const set = testSettings();
+    for (0..4) |i| {
+        const body = try std.fmt.allocPrint(alloc, "v{d}", .{i});
+        defer alloc.free(body);
+        try work.writeFile(io, .{ .sub_path = "a.txt", .data = body });
+        const r = try capture(&store, work, .poll, set);
+        if (r == .captured) alloc.free(r.captured.branch);
+    }
+
+    // Exactly what `purge` does: rewrite the log without knowing the sidecar
+    // exists. The sidecar is left on disk, stale, claiming four moments.
+    try applog.rewrite(&store, log_path, "");
+    const h = try logHead(&store, alloc);
+    defer if (h.prev) |p| alloc.free(p.branch);
+    try testing.expectEqual(@as(usize, 0), h.total);
+    try testing.expect(h.prev == null);
+
+    // And capture carries on from the truth: an empty log takes a keyframe.
+    try work.writeFile(io, .{ .sub_path = "a.txt", .data = "after the purge" });
+    const next = try capture(&store, work, .poll, set);
+    defer alloc.free(next.captured.branch);
+    try testing.expectEqual(ReprKind.keyframe, next.captured.kind);
+
+    // A partial rewrite is caught the same way, by length.
+    const survivors = try readAll(&store, alloc);
+    defer freeMoments(alloc, survivors);
+    try testing.expectEqual(@as(usize, 1), survivors.len);
+}
+
+test "captures are identical with and without a warm sidecar" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var warm_tmp = std.testing.tmpDir(.{});
+    defer warm_tmp.cleanup();
+    var cold_tmp = std.testing.tmpDir(.{});
+    defer cold_tmp.cleanup();
+
+    var warm_store = try Store.init(io, alloc, warm_tmp.dir);
+    defer warm_store.deinit();
+    var cold_store = try Store.init(io, alloc, cold_tmp.dir);
+    defer cold_store.deinit();
+
+    try warm_tmp.dir.createDirPath(io, "work");
+    try cold_tmp.dir.createDirPath(io, "work");
+    var warm_work = try warm_tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer warm_work.close(io);
+    var cold_work = try cold_tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer cold_work.close(io);
+
+    const set = Settings{ .enabled = true, .keyframe_interval = 5, .max = 10_000 };
+    for (0..40) |i| {
+        const name = try std.fmt.allocPrint(alloc, "f{d}.txt", .{i % 12});
+        defer alloc.free(name);
+        const body = try std.fmt.allocPrint(alloc, "value {d}", .{i});
+        defer alloc.free(body);
+        try warm_work.writeFile(io, .{ .sub_path = name, .data = body });
+        try cold_work.writeFile(io, .{ .sub_path = name, .data = body });
+
+        const a = try capture(&warm_store, warm_work, .poll, set);
+        if (a == .captured) alloc.free(a.captured.branch);
+        // The cold repo never gets to use its cache, so every capture there
+        // takes the full-read path this sidecar exists to avoid.
+        cold_store.root.deleteFile(io, tail_path) catch {};
+        const b = try capture(&cold_store, cold_work, .poll, set);
+        if (b == .captured) alloc.free(b.captured.branch);
+    }
+
+    const warm = try readAll(&warm_store, alloc);
+    defer freeMoments(alloc, warm);
+    const cold = try readAll(&cold_store, alloc);
+    defer freeMoments(alloc, cold);
+
+    // Everything a moment is except when it happened: the same keyframe
+    // decisions, the same content-addressed representations, the same trees.
+    try testing.expectEqual(warm.len, cold.len);
+    try testing.expect(warm.len > 20);
+    for (warm, cold) |a, b| {
+        try testing.expectEqual(a.kind, b.kind);
+        try testing.expect(a.full_tree.eql(b.full_tree));
+        try testing.expect(a.repr.eql(b.repr));
+    }
+}
+
+test "trimming the log invalidates the sidecar" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const set = Settings{ .enabled = true, .keyframe_interval = 3, .max = 10_000 };
+    for (0..12) |i| {
+        const body = try std.fmt.allocPrint(alloc, "v{d}", .{i});
+        defer alloc.free(body);
+        try work.writeFile(io, .{ .sub_path = "a.txt", .data = body });
+        const r = try capture(&store, work, .poll, set);
+        if (r == .captured) alloc.free(r.captured.branch);
+    }
+
+    try trim(&store, alloc, .{ .enabled = true, .keyframe_interval = 3, .max = 4 });
+
+    const all = try readAll(&store, alloc);
+    defer freeMoments(alloc, all);
+    const h = try logHead(&store, alloc);
+    defer if (h.prev) |p| alloc.free(p.branch);
+    try testing.expectEqual(all.len, h.total);
+    try testing.expectEqualSlices(u8, &all[all.len - 1].id, &h.prev.?.id);
 }

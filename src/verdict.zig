@@ -1,6 +1,8 @@
 const std = @import("std");
 const oid = @import("oid.zig");
 const applog = @import("applog.zig");
+const config = @import("config.zig");
+const moment = @import("moment.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -267,6 +269,143 @@ pub fn record(store: *Store, v: Verdict) !void {
     const line = try formatLine(alloc, v);
     defer alloc.free(line);
     try applog.append(store, log_path, line);
+
+    // Retention sweeps from here rather than from a caller, because every call
+    // site is somewhere that just finished running a check and has no reason to
+    // know this log has a size. A failed sweep is not a failed record: the
+    // verdict is already durable, and the log being longer than it needs to be
+    // costs nothing but bytes.
+    if (sweeps.fetchAdd(1, .monotonic) % sweep_interval != sweep_interval - 1) return;
+    if (logLength(store) < sweep_floor) return;
+    trim(store, alloc, nowMillis(store.io), settings(store, alloc)) catch {};
+}
+
+// --- retention ---
+
+/// How many recorded verdicts pass between retention sweeps, counted per
+/// process rather than out of the log, which is the same trade `moment.zig`
+/// makes at `trim_interval`: a sweep is a full read and rewrite, and it only has
+/// to stay off the critical path of every grade. Recording a verdict already
+/// cost a check run, so the interval can be small.
+const sweep_interval: usize = 128;
+
+/// And how big the log has to be before a sweep is worth reading it at all.
+/// Under a few hundred records there is nothing to reclaim that matters, and
+/// leaving small logs alone is also what keeps the trigger from being a second,
+/// quieter retention policy that nobody configured.
+const sweep_floor: u64 = 64 * 1024;
+
+var sweeps: std.atomic.Value(usize) = .init(0);
+
+fn logLength(store: *Store) u64 {
+    const file = store.root.openFile(store.io, log_path, .{}) catch return 0;
+    defer file.close(store.io);
+    return file.length(store.io) catch 0;
+}
+
+pub const Settings = struct {
+    /// Retention window in seconds, applied to greens only.
+    ///
+    /// Ninety days rather than the fortnight moments keep: a moment dropped
+    /// costs a state nobody was going to rewind to, while a verdict dropped
+    /// costs a suite re-run, and a tree that comes back — a rewind, a revert, a
+    /// branch picked up again months later — should still be answered from the
+    /// log rather than from the CPU.
+    retain_s: i64 = 90 * 24 * 60 * 60,
+    /// The hard bound underneath the window, since reds never age out and
+    /// something has to stop an infinitely long log. Twenty thousand records is
+    /// a few megabytes.
+    max: usize = 20_000,
+};
+
+pub fn settings(store: *Store, alloc: std.mem.Allocator) Settings {
+    var out: Settings = .{};
+    if (config.get(store, alloc, "verdicts.retain")) |maybe| {
+        if (maybe) |v| {
+            defer alloc.free(v);
+            out.retain_s = moment.parseDuration(v, out.retain_s);
+        }
+    } else |_| {}
+    return out;
+}
+
+fn nowMillis(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1_000_000));
+}
+
+/// Drop verdicts that can no longer answer anything, in increasing order of what
+/// dropping one costs the user.
+///
+/// First, superseded records. Later records win, so only the newest record for a
+/// full key is ever reachable; every earlier one answers a question that has
+/// already been answered again. Reclaiming those is free — no lookup that
+/// succeeded before can miss afterwards.
+///
+/// Then aged-out greens, and only greens, on exactly the reasoning `isStale`
+/// gives for ageing them at lookup: a pass is a measurement that goes off, a red
+/// is a fact about the code. A red is dropped by nothing but the cap.
+///
+/// Survivors keep their record order, so "later records win" reads the same
+/// after a sweep as before it.
+pub fn trim(store: *Store, alloc: std.mem.Allocator, now_ms: i64, set: Settings) !void {
+    const all = try readAll(store, alloc);
+    defer alloc.free(all);
+    if (all.len == 0) return;
+
+    var keep = try alloc.alloc(bool, all.len);
+    defer alloc.free(keep);
+    @memset(keep, false);
+
+    var newest = std.AutoHashMap([Oid.len + 1 + Oid.len + Oid.len]u8, usize).init(alloc);
+    defer newest.deinit();
+    for (all, 0..) |v, i| try newest.put(fullKeyBytes(.{
+        .tree = v.tree,
+        .tier = v.tier,
+        .command = v.command,
+        .inputs = v.inputs,
+    }), i);
+    var it = newest.valueIterator();
+    while (it.next()) |i| keep[i.*] = true;
+
+    const cutoff_ms = now_ms - set.retain_s * 1000;
+    for (all, 0..) |v, i| {
+        if (!keep[i]) continue;
+        if (v.result != .green) continue;
+        // A record with no timestamp cannot be shown to be outside the window,
+        // and dropping it on a guess costs a re-run.
+        if (v.ms == 0) continue;
+        if (v.ms < cutoff_ms) keep[i] = false;
+    }
+
+    var kept: usize = 0;
+    for (keep) |k| {
+        if (k) kept += 1;
+    }
+    if (set.max != 0 and kept > set.max) {
+        var over = kept - set.max;
+        for (keep) |*k| {
+            if (over == 0) break;
+            if (!k.*) continue;
+            k.* = false;
+            over -= 1;
+            kept -= 1;
+        }
+    }
+
+    // Nothing to reclaim, so nothing is rewritten. A sweep that rewrites the log
+    // to exactly what it already said is a window in which a crash can lose a
+    // record for no gain at all.
+    if (kept == all.len) return;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (all, 0..) |v, i| {
+        if (!keep[i]) continue;
+        const line = try formatLine(alloc, v);
+        defer alloc.free(line);
+        try out.appendSlice(alloc, line);
+    }
+    try applog.rewrite(store, log_path, out.items);
 }
 
 /// Every verdict in record order. Malformed lines are skipped. Caller frees.
@@ -366,6 +505,16 @@ pub const Index = struct {
         return self.get(.{ .tree = tree, .tier = .fast, .command = command_fast });
     }
 };
+
+/// The memoization key in full, declared inputs included. `keyBytes` is
+/// deliberately the coarser index key; retention has to reason about what a
+/// `lookup` can reach, and a lookup matches inputs too.
+fn fullKeyBytes(key: Key) [Oid.len + 1 + Oid.len + Oid.len]u8 {
+    var out: [Oid.len + 1 + Oid.len + Oid.len]u8 = undefined;
+    @memcpy(out[0 .. Oid.len + 1 + Oid.len], &keyBytes(key));
+    @memcpy(out[Oid.len + 1 + Oid.len ..], &key.inputs.bytes);
+    return out;
+}
 
 fn keyBytes(key: Key) [Oid.len + 1 + Oid.len]u8 {
     var out: [Oid.len + 1 + Oid.len]u8 = undefined;
@@ -737,4 +886,221 @@ test "index answers many trees in one pass" {
         .tier = .fast,
         .command = cmd,
     }) == null);
+}
+
+test "retention drops superseded records and keeps the answer" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-s");
+    const cmd = commandHash("zig build test");
+    const now: i64 = 1_700_000_000_000;
+
+    // The same question answered five times: only the last answer is reachable.
+    for (0..5) |i| {
+        var v = sample(tree, .full, cmd, if (i == 4) .green else .red);
+        v.ms = now - @as(i64, @intCast(4 - i)) * std.time.ms_per_min;
+        v.exit_code = @intCast(i);
+        try record(&store, v);
+    }
+
+    try trim(&store, alloc, now, .{});
+
+    const all = try readAll(&store, alloc);
+    defer alloc.free(all);
+    try testing.expectEqual(@as(usize, 1), all.len);
+
+    const got = (try lookup(&store, alloc, .{ .tree = tree, .tier = .full, .command = cmd })).?;
+    try testing.expectEqual(Result.green, got.result);
+    try testing.expectEqual(@as(i32, 4), got.exit_code);
+}
+
+test "a superseded record for a different declared input is not the same record" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-i");
+    const cmd = commandHash("bun test");
+    const now: i64 = 1_700_000_000_000;
+
+    var v1 = sample(tree, .full, cmd, .green);
+    v1.inputs = Oid.ofBytes("lockfile v1");
+    v1.ms = now;
+    try record(&store, v1);
+    var v2 = sample(tree, .full, cmd, .green);
+    v2.inputs = Oid.ofBytes("lockfile v2");
+    v2.ms = now;
+    try record(&store, v2);
+
+    try trim(&store, alloc, now, .{});
+
+    // Two keys, two answers. Collapsing them would re-run a check that has
+    // already been run under exactly the environment being asked about.
+    for ([_]Oid{ v1.inputs, v2.inputs }) |in| {
+        try testing.expect((try lookup(&store, alloc, .{
+            .tree = tree,
+            .tier = .full,
+            .command = cmd,
+            .inputs = in,
+        })) != null);
+    }
+}
+
+test "retention ages out a stale green and never ages out a red" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const cmd = commandHash("pytest");
+    const now: i64 = 1_700_000_000_000;
+    const day = std.time.ms_per_day;
+
+    const old_green = Oid.ofBytes("old-green");
+    var a = sample(old_green, .full, cmd, .green);
+    a.ms = now - 100 * day;
+    try record(&store, a);
+
+    const new_green = Oid.ofBytes("new-green");
+    var b = sample(new_green, .full, cmd, .green);
+    b.ms = now - 3 * day;
+    try record(&store, b);
+
+    const old_red = Oid.ofBytes("old-red");
+    var c = sample(old_red, .full, cmd, .red);
+    c.ms = now - 100 * day;
+    try record(&store, c);
+
+    // A green with no timestamp cannot be shown to be outside the window.
+    const undated = Oid.ofBytes("undated");
+    var d = sample(undated, .full, cmd, .green);
+    d.ms = 0;
+    try record(&store, d);
+
+    try trim(&store, alloc, now, .{ .retain_s = 90 * 24 * 60 * 60 });
+
+    try testing.expect((try lookup(&store, alloc, .{ .tree = old_green, .tier = .full, .command = cmd })) == null);
+    try testing.expect((try lookup(&store, alloc, .{ .tree = new_green, .tier = .full, .command = cmd })) != null);
+    // A red is a fact about the code, not a measurement that goes off.
+    try testing.expect((try lookup(&store, alloc, .{ .tree = old_red, .tier = .full, .command = cmd })) != null);
+    try testing.expect((try lookup(&store, alloc, .{ .tree = undated, .tier = .full, .command = cmd })) != null);
+}
+
+test "the count cap keeps the newest verdicts and preserves their order" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const cmd = commandHash("make");
+    const now: i64 = 1_700_000_000_000;
+
+    // Reds, so nothing but the cap can decide what goes.
+    for (0..50) |i| {
+        const body = try std.fmt.allocPrint(alloc, "tree-{d}", .{i});
+        defer alloc.free(body);
+        var v = sample(Oid.ofBytes(body), .fast, cmd, .red);
+        v.ms = now;
+        try record(&store, v);
+    }
+
+    try trim(&store, alloc, now, .{ .max = 10 });
+
+    const all = try readAll(&store, alloc);
+    defer alloc.free(all);
+    try testing.expectEqual(@as(usize, 10), all.len);
+    for (all, 40..) |v, i| {
+        const body = try std.fmt.allocPrint(alloc, "tree-{d}", .{i});
+        defer alloc.free(body);
+        try testing.expect(v.tree.eql(Oid.ofBytes(body)));
+    }
+}
+
+test "a sweep that can reclaim nothing leaves the log alone" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const cmd = commandHash("make");
+    const now: i64 = 1_700_000_000_000;
+    for (0..5) |i| {
+        const body = try std.fmt.allocPrint(alloc, "tree-{d}", .{i});
+        defer alloc.free(body);
+        var v = sample(Oid.ofBytes(body), .fast, cmd, .green);
+        v.ms = now;
+        try record(&store, v);
+    }
+
+    const before = try applog.readAll(&store, alloc, log_path);
+    defer alloc.free(before);
+    try trim(&store, alloc, now, .{});
+    const after = try applog.readAll(&store, alloc, log_path);
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "verdicts.retain configures the window" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try testing.expectEqual(@as(i64, 90 * 24 * 60 * 60), settings(&store, alloc).retain_s);
+    try config.set(&store, "verdicts.retain", "7d");
+    try testing.expectEqual(@as(i64, 7 * 24 * 60 * 60), settings(&store, alloc).retain_s);
+}
+
+test "recording sweeps the log without anyone asking it to" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const tree = Oid.ofBytes("tree-auto");
+    const cmd = commandHash("zig build test");
+    const now = nowMillis(io);
+
+    // One key, answered over and over: every record but the last is superseded,
+    // so a sweep that fires at all collapses the log to a single line.
+    var i: usize = 0;
+    while (i < 4 * sweep_interval and logLength(&store) < 2 * sweep_floor) : (i += 1) {
+        var v = sample(tree, .full, cmd, .green);
+        v.ms = now;
+        v.exit_code = @intCast(i);
+        try record(&store, v);
+    }
+
+    const all = try readAll(&store, alloc);
+    defer alloc.free(all);
+    try testing.expect(all.len < i);
+
+    // And the answer the log exists to give is the one it still gives.
+    const got = (try lookup(&store, alloc, .{ .tree = tree, .tier = .full, .command = cmd })).?;
+    try testing.expectEqual(@as(i32, @intCast(i - 1)), got.exit_code);
 }

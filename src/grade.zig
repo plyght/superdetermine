@@ -8,6 +8,8 @@ const warrant = @import("warrant.zig");
 const readset = @import("readset.zig");
 const tracer = @import("tracer.zig");
 const workspace = @import("workspace.zig");
+const config = @import("config.zig");
+const mesh = @import("mesh.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 const Moment = moment.Moment;
@@ -101,6 +103,124 @@ pub fn missReason(
     return try alloc.dupe(u8, path);
 }
 
+// --- letting one peer do the work ---
+
+/// Whether a peer that loses the claim is willing to wait at all.
+///
+/// On by default. The cost of being wrong in the on direction is bounded — a
+/// deferring peer waits, then grades anyway — while the cost of being wrong in
+/// the off direction is paid continuously by every machine in the room, which is
+/// the case the mesh exists for. A user who would rather burn the CPU than ever
+/// wait sets `mesh.grade-claim off` and gets exactly the old path back.
+pub fn claimEnabled(store: *Store, alloc: std.mem.Allocator) bool {
+    if (config.get(store, alloc, "mesh.grade-claim")) |maybe| {
+        if (maybe) |v| {
+            defer alloc.free(v);
+            return mesh.boolOf(v);
+        }
+    } else |_| {}
+    return true;
+}
+
+/// Polling interval while waiting for a peer's verdict to land. Short enough
+/// that the wait is not what anyone notices for a fast check, and a verdict log
+/// read is a few kilobytes.
+const claim_poll_ms: i64 = 100;
+
+/// Slack over the check's own run time, covering the peer's clone, the gossip
+/// hop, and the poll interval on this side.
+const claim_slack_ms: i64 = 2_000;
+
+/// How long to wait for the claim holder before grading anyway.
+///
+/// This is deliberately derived from the check rather than picked: a suite that
+/// takes ten minutes and a typecheck that takes two hundred milliseconds are not
+/// the same wait, and one constant cannot be right for both. `observed_ms` is
+/// what this check actually took last time the log saw it run, doubled because a
+/// peer that is grading is a peer whose machine is busy, plus slack for the hop.
+///
+/// Two bounds. Underneath, `observed_ms` of zero — no run of this check has ever
+/// been recorded here — returns no wait at all: nothing is known about how long
+/// to expect, and the asymmetry is that a duplicated grade costs CPU while a
+/// grade that never happens costs the product its whole reason to exist. Above,
+/// the check's own timeout, because past that the holder has either produced a
+/// verdict or been killed, and there is nothing further to wait for.
+pub fn deferralMs(observed_ms: u32, timeout_ms: i64) i64 {
+    if (observed_ms == 0) return 0;
+    var wait: i64 = @as(i64, observed_ms) * 2 + claim_slack_ms;
+    if (timeout_ms > 0 and wait > timeout_ms + claim_slack_ms) {
+        wait = timeout_ms + claim_slack_ms;
+    }
+    return wait;
+}
+
+/// The longest this check has been seen to take, over the recent log.
+///
+/// The longest rather than the typical one, because being wrong here is
+/// asymmetric in the same direction as everything else: a wait that is too long
+/// costs nothing while the holder is healthy — the verdict arrives and ends the
+/// wait early — and a wait that is too short costs a duplicated run of exactly
+/// the suite this is trying not to run twice.
+fn observedRunMs(store: *Store, alloc: std.mem.Allocator, tier: verdict.Tier, command: Oid) u32 {
+    const all = verdict.readAll(store, alloc) catch return 0;
+    defer alloc.free(all);
+
+    var longest: u32 = 0;
+    var seen: usize = 0;
+    var i = all.len;
+    while (i > 0 and seen < 32) {
+        i -= 1;
+        const v = all[i];
+        if (v.tier != tier) continue;
+        if (!v.command.eql(command)) continue;
+        if (v.duration_ms == 0) continue;
+        seen += 1;
+        if (v.duration_ms > longest) longest = v.duration_ms;
+    }
+    return longest;
+}
+
+/// Wait for the peer that this job ranks highest, if that peer is not us.
+///
+/// Returns the verdict that arrived, or null meaning "grade it yourself". Null
+/// is the answer for every degraded shape there is: no mesh, no peers, a roster
+/// too old to believe, this peer holding the claim, an unknown run time, or the
+/// wait having run out with nothing to show for it. That list is the design.
+/// Peers can disagree about who is in the room — A sees three, B sees two — and
+/// nothing here tries to repair that, because the worst a disagreement can do is
+/// make two peers grade, which is precisely what happens today; the one state
+/// that must never occur is nobody grading, and a bounded wait that always ends
+/// in a real run is what rules it out.
+fn awaitClaimant(ctx: Context, key: verdict.Key) !?verdict.Verdict {
+    const alloc = ctx.alloc;
+    const io = ctx.store.io;
+    if (!claimEnabled(ctx.store, alloc)) return null;
+
+    const roster = mesh.readRoster(ctx.store, alloc, nowMillis(io)) orelse return null;
+    defer roster.deinit(alloc);
+    // Alone in the room is the same thing as no room at all.
+    if (roster.peers.len < 2) return null;
+
+    const job = mesh.Job.fromKey(key);
+    if (mesh.claims(job, roster.me, roster.peers)) return null;
+
+    const wait = deferralMs(
+        observedRunMs(ctx.store, alloc, key.tier, key.command),
+        ctx.set.timeoutMs(key.tier),
+    );
+    if (wait <= 0) return null;
+
+    const deadline = nowMillis(io) + wait;
+    while (nowMillis(io) < deadline) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(claim_poll_ms), .awake) catch {};
+        const now = nowMillis(io);
+        if (try verdict.lookupFresh(ctx.store, alloc, key, now, ctx.set.fresh_ms)) |landed| {
+            return landed;
+        }
+    }
+    return null;
+}
+
 /// The verdict for a state, running the check only if it must.
 ///
 /// Three layers of avoidance, in increasing cost order:
@@ -108,7 +228,9 @@ pub fn missReason(
 ///      inside the freshness window, so a tree is never graded twice, ever;
 ///   2. an unchanged read-set relative to an already-graded neighbour, in which
 ///      case that verdict is carried over and recorded against this tree;
-///   3. an actual run.
+///   3. a peer in the mesh that this job ranks above us, in which case its
+///      verdict is worth a bounded wait rather than a second identical run;
+///   4. an actual run.
 pub fn gradeState(
     ctx: Context,
     m: Moment,
@@ -121,9 +243,18 @@ pub fn gradeState(
     defer inputs.deinit(alloc);
     const inputs_oid = try checks.storeInputs(ctx.store, inputs);
 
-    const now = nowMillis(ctx.store.io);
+    var now = nowMillis(ctx.store.io);
     const key = cacheKey(ctx, m.full_tree, tier, inputs_oid);
     if (try verdict.lookupFresh(ctx.store, alloc, key, now, ctx.set.fresh_ms)) |cached| return cached;
+
+    // Layer 1b: the same question one step further out. Layer 1 asked whether
+    // the answer already exists; this asks whether somebody is already getting
+    // it. It sits after the cache lookup and not before, so a peer that holds
+    // the verdict never waits for a single millisecond.
+    if (try awaitClaimant(ctx, key)) |shared| return shared;
+    // A wait that ended in nothing still consumed wall clock, and everything
+    // below dates a run against `now`.
+    now = nowMillis(ctx.store.io);
 
     const entries = try moment.entriesOf(ctx.store, m);
     defer workspace.freeTreeEntries(alloc, entries);
@@ -1313,4 +1444,119 @@ test "the warrant on a change with no attribution is unknown, not fabricated" {
     try testing.expectEqual(verdict.Result.green, v.result);
     try testing.expectEqual(verdict.Independence.unknown, v.independence);
     try testing.expectEqual(verdict.Discrimination.unknown, v.discrimination);
+}
+
+test "the wait scales with how long the check takes" {
+    // Nothing known about the check means no wait: a duplicated run is cheaper
+    // than a grade that might never happen.
+    try testing.expectEqual(@as(i64, 0), deferralMs(0, 15 * std.time.ms_per_min));
+
+    // A fast check is waited on briefly, a slow one for longer.
+    const quick = deferralMs(200, 15 * std.time.ms_per_min);
+    const slow = deferralMs(60_000, 15 * std.time.ms_per_min);
+    try testing.expect(quick < slow);
+    try testing.expect(quick >= 2_000);
+
+    // Never past the point where the holder must have finished or been killed.
+    try testing.expect(deferralMs(60_000, 1_000) <= 1_000 + 2_000);
+}
+
+/// A peer id this repo's peer would rank below, for the job `key` names.
+fn losingSelf(key: verdict.Key, them: mesh.PeerId) mesh.PeerId {
+    const job = mesh.Job.fromKey(key);
+    var me: mesh.PeerId = [_]u8{0} ** mesh.peer_id_len;
+    var i: u8 = 1;
+    while (i < 255) : (i += 1) {
+        me = [_]u8{i} ** mesh.peer_id_len;
+        if (!mesh.claims(job, me, &.{ me, them })) return me;
+    }
+    return me;
+}
+
+test "a peer that loses the claim grades anyway when the verdict never arrives" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{
+        .enabled = true,
+        .full = "exit 0",
+        // Caps the wait, so the test spends seconds rather than minutes proving
+        // that the deferral ends in a real run.
+        .timeout_full_ms = 500,
+    };
+    const ctx = f.ctx(alloc, set);
+
+    // A first run so the log knows what this check costs; without that there is
+    // nothing to derive a wait from and the peer never defers at all.
+    const first = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(first.branch);
+    _ = try gradeState(ctx, first, .full);
+
+    const m = try snap(&f, alloc, "a.txt", "two");
+    defer alloc.free(m.branch);
+
+    const key = keyFor(ctx, m.full_tree, .full);
+    const them: mesh.PeerId = [_]u8{0xab} ** mesh.peer_id_len;
+    const me = losingSelf(key, them);
+    const started = nowMillis(f.store.io);
+    try mesh.writeRoster(&f.store, alloc, me, &.{them}, started);
+
+    // The claim holder produces nothing, so the wait runs out and this peer
+    // does the work rather than leaving the tree ungraded forever.
+    const v = try gradeState(ctx, m, .full);
+    try testing.expectEqual(verdict.Result.green, v.result);
+    try testing.expect(nowMillis(f.store.io) - started >= 1_000);
+}
+
+test "a peer that already holds the verdict never waits" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{ .enabled = true, .full = "exit 0" };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+    _ = try gradeState(ctx, m, .full);
+
+    // Losing the claim is irrelevant once the answer is in hand.
+    const key = keyFor(ctx, m.full_tree, .full);
+    const them: mesh.PeerId = [_]u8{0xab} ** mesh.peer_id_len;
+    const me = losingSelf(key, them);
+    const started = nowMillis(f.store.io);
+    try mesh.writeRoster(&f.store, alloc, me, &.{them}, started);
+
+    _ = try gradeState(ctx, m, .full);
+    try testing.expect(nowMillis(f.store.io) - started < 1_000);
+}
+
+test "with no mesh there is nothing to defer to" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+
+    const set = checks.Settings{ .enabled = true, .full = "exit 0" };
+    const ctx = f.ctx(alloc, set);
+
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+    _ = try gradeState(ctx, m, .full);
+
+    const key = keyFor(ctx, m.full_tree, .full);
+    // No roster at all: the old path, exactly.
+    try testing.expect((try awaitClaimant(ctx, key)) == null);
+
+    // A room of one is the same thing.
+    const me: mesh.PeerId = [_]u8{3} ** mesh.peer_id_len;
+    try mesh.writeRoster(&f.store, alloc, me, &.{}, nowMillis(f.store.io));
+    try testing.expect((try awaitClaimant(ctx, key)) == null);
+
+    // And so is the toggle being off, even with a peer that outranks us.
+    const them: mesh.PeerId = [_]u8{0xab} ** mesh.peer_id_len;
+    const loser = losingSelf(key, them);
+    try mesh.writeRoster(&f.store, alloc, loser, &.{them}, nowMillis(f.store.io));
+    try config.set(&f.store, "mesh.grade-claim", "off");
+    try testing.expect((try awaitClaimant(ctx, key)) == null);
 }

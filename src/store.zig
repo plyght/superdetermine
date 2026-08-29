@@ -1,7 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const cdc = @import("cdc.zig");
+const config = @import("config.zig");
 const Oid = oid.Oid;
 
 /// The on-disk content-addressed store, rooted at `.sdt/`.
@@ -35,11 +37,48 @@ fn tempName(io: std.Io, buf: []u8) ![]const u8 {
     }) catch unreachable;
 }
 
+/// How hard a write works to still be there after the power goes out.
+///
+/// A rename is atomic, so a reader never sees half an object — but atomic is
+/// not durable. Until the file's bytes and the directory entry naming them have
+/// both reached the disk, a crash can take either one, and the object is gone
+/// or, worse, present and empty. `strict` pays for the barriers; `fast` trades
+/// them for throughput on a machine where losing the last few seconds of
+/// captures is acceptable.
+pub const Durability = enum { strict, fast };
+
+/// How far down a flush has to push before it returns.
+///
+/// Darwin's `fsync` only hands the write to the drive and returns; the drive is
+/// free to keep it in its own volatile cache, so a power loss can still take it.
+/// `F_FULLFSYNC` is the call that asks the drive to empty that cache, and is the
+/// only barrier a power loss respects there — at roughly sixty times the cost,
+/// measured, because it drains the whole device queue and not just this file.
+///
+/// That price is also the reason the two levels are worth separating. Draining
+/// the device queue drains everything already in it, so an `ordered` flush per
+/// object followed by one `full` flush at the moment a name is published makes
+/// every object that name reaches durable too, for one barrier instead of one
+/// per object. Elsewhere `fsync` is already the full barrier and the two levels
+/// are the same call.
+pub const Barrier = enum { ordered, full };
+
+/// Push a file's bytes out of the caches `barrier` covers.
+pub fn syncFile(io: std.Io, file: std.Io.File, barrier: Barrier) !void {
+    if (barrier == .full and builtin.os.tag == .macos) {
+        // Refused on some filesystems (network mounts, some VM shares), where
+        // the plain fsync below is the best available.
+        if (std.c.fcntl(file.handle, std.c.F.FULLFSYNC, @as(c_int, 0)) != -1) return;
+    }
+    try file.sync(io);
+}
+
 pub const Store = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     root: std.Io.Dir, // handle to the `.sdt` directory
     gear: ?cdc.GearTable = null,
+    durability: Durability = .strict,
 
     pub const Error = error{
         NotARepo,
@@ -71,7 +110,41 @@ pub const Store = struct {
         const root = dir.openDir(io, dir_name, .{}) catch return Error.NotARepo;
         var s: Store = .{ .io = io, .alloc = alloc, .root = root };
         s.gear = loadGear(io, root);
+        s.durability = loadDurability(&s, alloc);
         return s;
+    }
+
+    fn loadDurability(self: *Store, alloc: std.mem.Allocator) Durability {
+        var out: Durability = .strict;
+        if (config.get(self, alloc, "store.durability")) |maybe| {
+            if (maybe) |v| {
+                defer alloc.free(v);
+                out = std.meta.stringToEnum(Durability, v) orelse out;
+            }
+        } else |_| {}
+        return out;
+    }
+
+    /// Flush the directory entry itself, so a crash cannot lose a name that a
+    /// just-completed rename put there.
+    fn syncDir(self: *Store, sub_path: []const u8, barrier: Barrier) !void {
+        if (self.durability == .fast) return;
+        var dir = try self.root.openDir(self.io, sub_path, .{});
+        defer dir.close(self.io);
+        try syncFile(self.io, .{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, barrier);
+    }
+
+    /// Write the staging copy of an atomic write. Under `strict` the bytes are
+    /// on the disk before the rename that publishes them, so the name and the
+    /// content can never land out of order.
+    fn writeStaged(self: *Store, sub_path: []const u8, content: []const u8, barrier: Barrier) !void {
+        if (self.durability == .fast) {
+            return self.root.writeFile(self.io, .{ .sub_path = sub_path, .data = content });
+        }
+        var file = try self.root.createFile(self.io, sub_path, .{});
+        defer file.close(self.io);
+        try file.writePositionalAll(self.io, content, 0);
+        try syncFile(self.io, file, barrier);
     }
 
     fn loadGear(io: std.Io, root: std.Io.Dir) cdc.GearTable {
@@ -126,9 +199,10 @@ pub const Store = struct {
         const o = Oid.ofBytes(content);
         if (self.has(o)) return o;
         var buf: [80]u8 = undefined;
+        var shardbuf: [32]u8 = undefined;
         var hex: [Oid.len * 2]u8 = undefined;
         _ = o.toHex(&hex);
-        const shard = std.fmt.bufPrint(&buf, "objects/{s}", .{hex[0..2]}) catch unreachable;
+        const shard = std.fmt.bufPrint(&shardbuf, "objects/{s}", .{hex[0..2]}) catch unreachable;
         try self.root.createDirPath(self.io, shard);
 
         var namebuf: [64]u8 = undefined;
@@ -139,9 +213,14 @@ pub const Store = struct {
         errdefer self.root.deleteFile(self.io, tp) catch {};
         // Stage beside the destination, then rename: a reader in another
         // process sees the object whole or not at all, never truncated.
-        try self.root.writeFile(self.io, .{ .sub_path = tp, .data = content });
+        // An object is written far more often than a name is published, and an
+        // object nothing names yet is not worth a device-cache flush of its
+        // own: the `full` barrier taken when a ref or a log record finally
+        // names it covers every object written before it.
+        try self.writeStaged(tp, content, .ordered);
         const p = objectPath(o, &buf);
         try self.root.rename(tp, self.root, p, self.io);
+        try self.syncDir(shard, .ordered);
         return o;
     }
 
@@ -217,8 +296,12 @@ pub const Store = struct {
         var namebuf: [64]u8 = undefined;
         const tp = try tempName(self.io, &namebuf);
         errdefer self.root.deleteFile(self.io, tp) catch {};
-        try self.root.writeFile(self.io, .{ .sub_path = tp, .data = data });
+        try self.writeStaged(tp, data, .full);
         try self.root.rename(tp, self.root, sub_path, self.io);
+        // A ref naming objects that did not survive the crash is the one loss
+        // nothing can repair, so publishing a name is where the full barrier is
+        // spent: it lands the objects and the name that reaches them together.
+        try self.syncDir(std.fs.path.dirname(sub_path) orelse ".", .full);
     }
 
     /// Read the branch name HEAD points at. Caller frees. Errors InvalidRef if
@@ -528,4 +611,72 @@ test "refs and HEAD" {
     try testing.expect(store.refExists("main"));
     const got = try store.readRef("main");
     try testing.expect(got.eql(o));
+}
+
+test "an object round-trips under both durability modes" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    for ([_]Durability{ .strict, .fast }) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var store = try Store.init(io, alloc, tmp.dir);
+        defer store.deinit();
+        store.durability = mode;
+
+        const small = try store.writeRaw("a short object");
+        const data = try alloc.alloc(u8, 1024 * 1024 + 7);
+        defer alloc.free(data);
+        var prng = std.Random.DefaultPrng.init(7);
+        prng.random().bytes(data);
+        const big = try store.writeRaw(data);
+
+        const got_small = try store.readRaw(small);
+        defer alloc.free(got_small);
+        try testing.expectEqualStrings("a short object", got_small);
+
+        const got_big = try store.readRaw(big);
+        defer alloc.free(got_big);
+        try testing.expectEqualSlices(u8, data, got_big);
+        try testing.expect(Oid.ofBytes(got_big).eql(big));
+
+        var hex: [Oid.len * 2]u8 = undefined;
+        _ = big.toHex(&hex);
+        var sbuf: [32]u8 = undefined;
+        const shard = try std.fmt.bufPrint(&sbuf, "objects/{s}", .{hex[0..2]});
+        try testing.expectEqual(@as(usize, 0), try shardEntryCount(io, store.root, shard, tmp_prefix));
+
+        const o = Oid.ofBytes("a change");
+        try store.updateRef("main", o);
+        try testing.expect((try store.readRef("main")).eql(o));
+    }
+}
+
+test "durability is read from config and defaults to strict" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    try testing.expectEqual(Durability.strict, store.durability);
+
+    try config.set(&store, "store.durability", "fast");
+    store.deinit();
+
+    var fast = try Store.open(io, alloc, tmp.dir);
+    try testing.expectEqual(Durability.fast, fast.durability);
+    try config.set(&fast, "store.durability", "strict");
+    fast.deinit();
+
+    var strict = try Store.open(io, alloc, tmp.dir);
+    try testing.expectEqual(Durability.strict, strict.durability);
+    // A value this version does not know is not a reason to stop being durable.
+    try config.set(&strict, "store.durability", "whenever");
+    strict.deinit();
+
+    var unknown = try Store.open(io, alloc, tmp.dir);
+    defer unknown.deinit();
+    try testing.expectEqual(Durability.strict, unknown.durability);
 }
