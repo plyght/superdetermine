@@ -2008,7 +2008,7 @@ fn mirrorRewriteToGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s
     // only when every commit on the git branch is one sdt exported.
     switch (git.colocatedState(s, ".", null)) {
         .rewritten => {
-            git.syncColocatedForced(s, ".", null, true) catch |e| {
+            git.syncColocatedRewrite(s, ".", null) catch |e| {
                 try w.print("{s}{s}{s} could not mirror into .git: {s}\n", .{
                     ui.on(.yellow), ui.warn, ui.off(), @errorName(e),
                 });
@@ -3109,9 +3109,9 @@ fn restoreAt(
 
     const applied = try rewind.apply(&s, work, entries, momentSettings(&s, alloc), files);
     try w.print("{s}{s}{s} restored {d} path{s} from {s}@{s}{s}", .{
-        ui.on(.green),  ui.check,      ui.off(),
-        applied.changed, if (applied.changed == 1) "" else "s",
-        ui.on(.cyan),   id_hex[0..12], ui.off(),
+        ui.on(.green),   ui.check,                              ui.off(),
+        applied.changed, if (applied.changed == 1) "" else "s", ui.on(.cyan),
+        id_hex[0..12],   ui.off(),
     });
     if (resolved.verdict) |v| {
         try w.print(" {s}({s} {s}){s}", .{ ui.on(.dim), v.result.label(), v.tier.label(), ui.off() });
