@@ -115,6 +115,7 @@ pub fn publish(
     remote: []const u8,
     branch: []const u8,
     repository_path: []const u8,
+    projection_message: []const u8,
     commit_signature: apricot.git_forge.Signature,
     timestamp: i64,
 ) !Published {
@@ -129,6 +130,7 @@ pub fn publish(
         captured.encoded.bytes,
         captured.encoded.root,
         captured.projection,
+        projection_message,
         commit_signature,
         timestamp,
     );

@@ -5177,7 +5177,11 @@ fn cmdPush(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         defer alloc.free(repository_path);
         const author = try config.author(&s, alloc);
         defer alloc.free(author);
-        const published = apricot_bridge.publish(alloc, io, url, branch, repository_path, apricot_bridge.signature(author), nowSeconds(io)) catch |e| {
+        const local_branch = try s.headBranch();
+        defer alloc.free(local_branch);
+        const change = try s.readChange(try s.readRef(local_branch));
+        defer object.freeChange(alloc, change);
+        const published = apricot_bridge.publish(alloc, io, url, branch, repository_path, change.message, apricot_bridge.signature(author), nowSeconds(io)) catch |e| {
             try reportApricotFailure(w, "push to", remote_name, e);
             return;
         };
