@@ -1,4 +1,251 @@
-ng (init) the repo if absent. Into a fresh repo
+e(
+    store: *Store,
+    repo: ?*c.git_repository,
+    tree: object.Tree,
+    sess: ?*lfs.Session,
+    cache: ?*BlobCache,
+) !?*c.git_tree {
+    const alloc = store.alloc;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const root = try ExportNode.newDir(aa);
+
+    // `.gitattributes` travels in the tree itself, so each exported change gets
+    // the LFS rules that were in force at that point in history.
+    var attrs = try lfs.attributesFromTree(store, tree);
+    defer attrs.deinit();
+
+    for (tree.entries) |e| {
+        var blob_oid: c.git_oid = undefined;
+        var reused = false;
+        if (cache) |bc| {
+            if (bc.get(e.blob)) |hit| {
+                const usable = switch (hit.kind) {
+                    .plain => sess == null or !attrs.isLfs(e.path),
+                    .pointer => true,
+                    .cleaned => sess != null and attrs.isLfs(e.path),
+                };
+                if (usable) {
+                    if (sess) |s| {
+                        if (hit.kind != .plain) s.markPending(&hit.lfs_oid_hex, hit.lfs_size) catch {};
+                    }
+                    blob_oid = hit.git_oid;
+                    reused = true;
+                }
+            }
+        }
+
+        if (!reused) {
+            const content = try store.readFileContent(e.blob);
+            defer alloc.free(content);
+
+            // Git LFS clean: a tracked path is committed to git as a pointer, with
+            // the real bytes landing in the destination repo's LFS cache (and queued
+            // for upload on push).
+            var pointer: ?[]u8 = null;
+            defer if (pointer) |p| alloc.free(p);
+            var kind: BlobCache.Kind = .plain;
+            var lfs_oid_hex: [64]u8 = [_]u8{0} ** 64;
+            var lfs_size: u64 = 0;
+            if (sess) |s| {
+                if (lfs.parsePointer(content)) |existing| {
+                    s.markPending(&existing.oid_hex, existing.size) catch {};
+                    kind = .pointer;
+                    lfs_oid_hex = existing.oid_hex;
+                    lfs_size = existing.size;
+                } else if (attrs.isLfs(e.path)) {
+                    const hex = try s.writeObject(content);
+                    s.markPending(&hex, content.len) catch {};
+                    pointer = try lfs.pointerForContent(alloc, content);
+                    kind = .cleaned;
+                    lfs_oid_hex = hex;
+                    lfs_size = content.len;
+                }
+            }
+            const payload: []const u8 = pointer orelse content;
+
+            try check(c.git_blob_create_from_buffer(&blob_oid, repo, payload.ptr, payload.len));
+            exported_blobs += 1;
+            if (cache) |bc| try bc.put(alloc, e.blob, .{
+                .git_oid = blob_oid,
+                .kind = kind,
+                .lfs_oid_hex = lfs_oid_hex,
+                .lfs_size = lfs_size,
+            });
+        }
+
+        exported_files += 1;
+        if (live_progress) |p| p.update(.exporting, exported_files, null);
+
+        var cur = root;
+        var comp_it = std.mem.splitScalar(u8, e.path, '/');
+        var comp = comp_it.next() orelse continue;
+        while (comp_it.peek() != null) : (comp = comp_it.next().?) {
+            if (comp.len == 0) continue;
+            const gop = try cur.children.getOrPut(aa, comp);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try aa.dupe(u8, comp);
+                gop.value_ptr.* = try ExportNode.newDir(aa);
+            }
+            cur = gop.value_ptr.*;
+        }
+        const gop = try cur.children.getOrPut(aa, comp);
+        gop.key_ptr.* = try aa.dupe(u8, comp);
+        const leaf = try aa.create(ExportNode);
+        leaf.* = .{ .is_dir = false, .children = .{}, .blob_oid = blob_oid, .filemode = gitFilemode(e.mode) };
+        gop.value_ptr.* = leaf;
+    }
+
+    var git_tree_oid = try writeExportTree(repo, root);
+    var git_tree: ?*c.git_tree = null;
+    try check(c.git_tree_lookup(&git_tree, repo, &git_tree_oid));
+    return git_tree;
+}
+
+/// Collect the ancestors of `tip` (inclusive) into `out` in oldest-first order
+/// (a change appears after all its parents). `seen` dedups shared ancestors.
+fn collectChain(store: *Store, o: Oid, out: *std.ArrayList(Oid), seen: *std.StringHashMapUnmanaged(void), alloc: std.mem.Allocator) !void {
+    var hbuf: [64]u8 = undefined;
+    const hx = o.toHex(&hbuf);
+    if (seen.contains(hx)) return;
+    try seen.put(alloc, try alloc.dupe(u8, hx), {});
+    const change = try store.readChange(o);
+    defer object.freeChange(alloc, change);
+    for (change.parents) |p| try collectChain(store, p, out, seen, alloc);
+    try out.append(alloc, o);
+}
+
+/// Export a single gr change as a git commit (parents already exported/mapped).
+/// Reuses the mapped git commit if it still exists in `repo`. Root changes (no
+/// gr parents) chain onto `graft` if provided (used to fast-forward onto an
+/// existing branch tip). Returns the git commit id and records it in the map.
+fn exportChange(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gr: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session, cache: ?*BlobCache, fresh: bool) !c.git_oid {
+    if (!fresh) {
+        if (map.lookupGit(gr)) |existing| {
+            var commit: ?*c.git_commit = null;
+            if (c.git_commit_lookup(&commit, repo, &existing) == 0) {
+                c.git_commit_free(commit);
+                return existing;
+            }
+        }
+    }
+
+    const alloc = store.alloc;
+    const change = try store.readChange(gr);
+    defer object.freeChange(alloc, change);
+    const tree = try store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+
+    const git_tree = try buildGitTree(store, repo, tree, sess, cache);
+    defer c.git_tree_free(git_tree);
+
+    const parsed = splitAuthor(change.author);
+    const name_z = try alloc.dupeZ(u8, parsed.name);
+    defer alloc.free(name_z);
+    const email_z = try alloc.dupeZ(u8, parsed.email);
+    defer alloc.free(email_z);
+    var sig: ?*c.git_signature = null;
+    try check(c.git_signature_new(&sig, name_z.ptr, email_z.ptr, @intCast(change.timestamp), @intCast(change.tz_offset_min)));
+    defer c.git_signature_free(sig);
+    const msg_z = try alloc.dupeZ(u8, change.message);
+    defer alloc.free(msg_z);
+
+    var parent_commits: std.ArrayList(?*const c.git_commit) = .empty;
+    defer {
+        for (parent_commits.items) |pc| c.git_commit_free(@constCast(pc));
+        parent_commits.deinit(alloc);
+    }
+    if (change.parents.len == 0) {
+        if (graft) |g| {
+            var pc: ?*c.git_commit = null;
+            if (c.git_commit_lookup(&pc, repo, g) == 0) try parent_commits.append(alloc, pc);
+        }
+    } else {
+        for (change.parents) |p| {
+            if (map.lookupGit(p)) |goid| {
+                var pc: ?*c.git_commit = null;
+                var gcopy = goid;
+                if (c.git_commit_lookup(&pc, repo, &gcopy) == 0) try parent_commits.append(alloc, pc);
+            }
+        }
+    }
+
+    var commit_oid: c.git_oid = undefined;
+    const pn: usize = parent_commits.items.len;
+    if (pn == 0) {
+        try check(c.git_commit_create(&commit_oid, repo, null, sig, sig, null, msg_z.ptr, git_tree, 0, null));
+    } else {
+        try check(c.git_commit_create(&commit_oid, repo, null, sig, sig, null, msg_z.ptr, git_tree, @intCast(pn), parent_commits.items.ptr));
+    }
+    const ghex = gitOidHex(&commit_oid);
+    if (fresh) try map.insertLatest(&ghex, commit_oid, gr) else try map.insert(&ghex, commit_oid, gr);
+    return commit_oid;
+}
+
+/// Export the full history reachable from `tip` into `repo`, oldest-first.
+/// Returns the git commit id of the tip.
+fn exportChain(store: *Store, repo: ?*c.git_repository, map: *Gitmap, tip: Oid, graft: ?*const c.git_oid, sess: ?*lfs.Session, fresh: bool) !c.git_oid {
+    const alloc = store.alloc;
+    var out: std.ArrayList(Oid) = .empty;
+    defer out.deinit(alloc);
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        seen.deinit(alloc);
+    }
+    try collectChain(store, tip, &out, &seen, alloc);
+    var cache: BlobCache = .{};
+    defer cache.deinit(alloc);
+    var last: c.git_oid = undefined;
+    for (out.items) |o| last = try exportChange(store, repo, map, o, graft, sess, &cache, fresh);
+    return last;
+}
+
+/// Pick the git branch that superdetermine branch `branch` mirrors onto, in the
+/// dest repo `repo`. Caller frees.
+///   - if `git_branch` is non-null, that branch is used verbatim;
+///   - else if the dest repo already has a branch of the same name, that one is
+///     used, so work on `feature` lands on git's `feature` and never on whatever
+///     git happens to have checked out;
+///   - else the dest repo's HEAD branch shorthand, unless that shorthand names
+///     some OTHER superdetermine branch, in which case it is that branch's
+///     mirror and must not be written to. This is what keeps the common
+///     colocated case (sdt on `main`, git on `master`, no sdt `master`) updating
+///     `master` as before;
+///   - else it falls back to the superdetermine branch name.
+fn resolveTargetBranch(
+    store: *Store,
+    repo: ?*c.git_repository,
+    git_branch: ?[]const u8,
+    branch: []const u8,
+) ![]u8 {
+    const alloc = store.alloc;
+    if (git_branch) |gb| return alloc.dupe(u8, gb);
+
+    var same_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrintZ(&same_buf, "refs/heads/{s}", .{branch})) |same_ref| {
+        var same_oid: c.git_oid = undefined;
+        if (c.git_reference_name_to_id(&same_oid, repo, same_ref.ptr) == 0) {
+            return alloc.dupe(u8, branch);
+        }
+    } else |_| {}
+
+    var head_ref: ?*c.git_reference = null;
+    if (c.git_repository_head_detached(repo) == 0 and c.git_repository_head(&head_ref, repo) == 0) {
+        defer c.git_reference_free(head_ref);
+        const short = c.git_reference_shorthand(head_ref);
+        if (short != null) {
+            const name = std.mem.span(short);
+            if (!store.refExists(name)) return alloc.dupe(u8, name);
+        }
+    }
+    return alloc.dupe(u8, branch);
+}
+
+/// Export the superdetermine store's HEAD branch (FULL history) into a git repo at
+/// `dest_git_repo_path`, creating (init) the repo if absent. Into a fresh repo
 /// this reproduces the whole branch history losslessly (git assigns new SHAs).
 pub fn exportHead(store: *Store, dest_git_repo_path: []const u8) !void {
     try exportHeadTo(store, dest_git_repo_path, null);
@@ -96326,221 +96573,4 @@ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
 SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
 INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-POSSIBILITY OF SUCH DAMAGE.
------------------------------------------------------------------------------
-*/
-
-
-/* This module contains the external function pcre_fullinfo(), which returns
-information about a compiled pattern. */
-
-
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
-
-#include "pcre_internal.h"
-
-
-/*************************************************
-*        Return info about compiled pattern      *
-*************************************************/
-
-/* This is a newer "info" function which has an extensible interface so
-that additional items can be added compatibly.
-
-Arguments:
-  argument_re      points to compiled code
-  extra_data       points extra data, or NULL
-  what             what information is required
-  where            where to put the information
-
-Returns:           0 if data returned, negative on error
-*/
-
-#if defined COMPILE_PCRE8
-PCRE_EXP_DEFN int PCRE_CALL_CONVENTION
-pcre_fullinfo(const pcre *argument_re, const pcre_extra *extra_data,
-  int what, void *where)
-#elif defined COMPILE_PCRE16
-PCRE_EXP_DEFN int PCRE_CALL_CONVENTION
-pcre16_fullinfo(const pcre16 *argument_re, const pcre16_extra *extra_data,
-  int what, void *where)
-#elif defined COMPILE_PCRE32
-PCRE_EXP_DEFN int PCRE_CALL_CONVENTION
-pcre32_fullinfo(const pcre32 *argument_re, const pcre32_extra *extra_data,
-  int what, void *where)
-#endif
-{
-const REAL_PCRE *re = (const REAL_PCRE *)argument_re;
-const pcre_study_data *study = NULL;
-
-if (re == NULL || where == NULL) return PCRE_ERROR_NULL;
-
-if (extra_data != NULL && (extra_data->flags & PCRE_EXTRA_STUDY_DATA) != 0)
-  study = (const pcre_study_data *)extra_data->study_data;
-
-/* Check that the first field in the block is the magic number. If it is not,
-return with PCRE_ERROR_BADMAGIC. However, if the magic number is equal to
-REVERSED_MAGIC_NUMBER we return with PCRE_ERROR_BADENDIANNESS, which
-means that the pattern is likely compiled with different endianness. */
-
-if (re->magic_number != MAGIC_NUMBER)
-  return re->magic_number == REVERSED_MAGIC_NUMBER?
-    PCRE_ERROR_BADENDIANNESS:PCRE_ERROR_BADMAGIC;
-
-/* Check that this pattern was compiled in the correct bit mode */
-
-if ((re->flags & PCRE_MODE) == 0) return PCRE_ERROR_BADMODE;
-
-switch (what)
-  {
-  case PCRE_INFO_OPTIONS:
-  *((unsigned long int *)where) = re->options & PUBLIC_COMPILE_OPTIONS;
-  break;
-
-  case PCRE_INFO_SIZE:
-  *((size_t *)where) = re->size;
-  break;
-
-  case PCRE_INFO_STUDYSIZE:
-  *((size_t *)where) = (study == NULL)? 0 : study->size;
-  break;
-
-  case PCRE_INFO_JITSIZE:
-#ifdef SUPPORT_JIT
-  *((size_t *)where) =
-      (extra_data != NULL &&
-      (extra_data->flags & PCRE_EXTRA_EXECUTABLE_JIT) != 0 &&
-      extra_data->executable_jit != NULL)?
-    PRIV(jit_get_size)(extra_data->executable_jit) : 0;
-#else
-  *((size_t *)where) = 0;
-#endif
-  break;
-
-  case PCRE_INFO_CAPTURECOUNT:
-  *((int *)where) = re->top_bracket;
-  break;
-
-  case PCRE_INFO_BACKREFMAX:
-  *((int *)where) = re->top_backref;
-  break;
-
-  case PCRE_INFO_FIRSTBYTE:
-  *((int *)where) =
-    ((re->flags & PCRE_FIRSTSET) != 0)? (int)re->first_char :
-    ((re->flags & PCRE_STARTLINE) != 0)? -1 : -2;
-  break;
-
-  case PCRE_INFO_FIRSTCHARACTER:
-    *((pcre_uint32 *)where) =
-      (re->flags & PCRE_FIRSTSET) != 0 ? re->first_char : 0;
-    break;
-
-  case PCRE_INFO_FIRSTCHARACTERFLAGS:
-    *((int *)where) =
-      ((re->flags & PCRE_FIRSTSET) != 0) ? 1 :
-      ((re->flags & PCRE_STARTLINE) != 0) ? 2 : 0;
-    break;
-
-  /* Make sure we pass back the pointer to the bit vector in the external
-  block, not the internal copy (with flipped integer fields). */
-
-  case PCRE_INFO_FIRSTTABLE:
-  *((const pcre_uint8 **)where) =
-    (study != NULL && (study->flags & PCRE_STUDY_MAPPED) != 0)?
-      ((const pcre_study_data *)extra_data->study_data)->start_bits : NULL;
-  break;
-
-  case PCRE_INFO_MINLENGTH:
-  *((int *)where) =
-    (study != NULL && (study->flags & PCRE_STUDY_MINLEN) != 0)?
-      (int)(study->minlength) : -1;
-  break;
-
-  case PCRE_INFO_JIT:
-  *((int *)where) = extra_data != NULL &&
-                    (extra_data->flags & PCRE_EXTRA_EXECUTABLE_JIT) != 0 &&
-                    extra_data->executable_jit != NULL;
-  break;
-
-  case PCRE_INFO_LASTLITERAL:
-  *((int *)where) =
-    ((re->flags & PCRE_REQCHSET) != 0)? (int)re->req_char : -1;
-  break;
-
-  case PCRE_INFO_REQUIREDCHAR:
-    *((pcre_uint32 *)where) =
-      ((re->flags & PCRE_REQCHSET) != 0) ? re->req_char : 0;
-    break;
-
-  case PCRE_INFO_REQUIREDCHARFLAGS:
-    *((int *)where) =
-      ((re->flags & PCRE_REQCHSET) != 0);
-    break;
-
-  case PCRE_INFO_NAMEENTRYSIZE:
-  *((int *)where) = re->name_entry_size;
-  break;
-
-  case PCRE_INFO_NAMECOUNT:
-  *((int *)where) = re->name_count;
-  break;
-
-  case PCRE_INFO_NAMETABLE:
-  *((const pcre_uchar **)where) = (const pcre_uchar *)re + re->name_table_offset;
-  break;
-
-  case PCRE_INFO_DEFAULT_TABLES:
-  *((const pcre_uint8 **)where) = (const pcre_uint8 *)(PRIV(default_tables));
-  break;
-
-  /* From release 8.00 this will always return TRUE because NOPARTIAL is
-  no longer ever set (the restrictions have been removed). */
-
-  case PCRE_INFO_OKPARTIAL:
-  *((int *)where) = (re->flags & PCRE_NOPARTIAL) == 0;
-  break;
-
-  case PCRE_INFO_JCHANGED:
-  *((int *)where) = (re->flags & PCRE_JCHANGED) != 0;
-  break;
-
-  case PCRE_INFO_HASCRORLF:
-  *((int *)where) = (re->flags & PCRE_HASCRORLF) != 0;
-  break;
-
-  case PCRE_INFO_MAXLOOKBEHIND:
-  *((int *)where) = re->max_lookbehind;
-  break;
-
-  case PCRE_INFO_MATCHLIMIT:
-  if ((re->flags & PCRE_MLSET) == 0) return PCRE_ERROR_UNSET;
-  *((pcre_uint32 *)where) = re->limit_match;
-  break;
-
-  case PCRE_INFO_RECURSIONLIMIT:
-  if ((re->flags & PCRE_RLSET) == 0) return PCRE_ERROR_UNSET;
-  *((pcre_uint32 *)where) = re->limit_recursion;
-  break;
-
-  case PCRE_INFO_MATCH_EMPTY:
-  *((int *)where) = (re->flags & PCRE_MATCH_EMPTY) != 0;
-  break;
-
-  default: return PCRE_ERROR_BADOPTION;
-  }
-
-return 0;
-}
-
-/* End of pcre_fullinfo.c */
-N   ╓  -       .sdt/objects/5a/e8dd7872f13faf9faccbc72ca4d3d868cbd61a75c1a5fb01989f2916d746e1B       Z   ?ыБ7ГN▒U~─|х┐1[g╕k╕\Сыj>Ц5k╓XN   ╓  )       .sdt/objects/5a/e9d459a81e42e3a2d9e5ed528f1d03f400a7618774377aee2079d6c6c3e7038187117062b750eed4f93fd7e899f17b52ce554d
-N   ╓  &      .sdt/objects/5a/f15dabf7941b752083e6b1985e702c44f1c7524311cf7516ba7383c7864b6cЦMIDX      /*prefer_smalЦtim    eoutSRP-DЪЪЪЪЪЪЪЪЪ                                  E     )  ллллллллллллллллллллл                     ВЪ                                                                                                E @   )  ллллллллллллллллллллл                                                                                                                                            E     )  ллллллллллллллллллллл                                                      E     )  ллллллллллллллллллллл  ЪЦ
-ее                                                                      E     )  ллллллдлллллллллллллл                                                                                                                                                                                       E     )  ллллллллллллллллллллл                        '''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''    {{{{{{{{{{{{{{{{                                                         E     )  ллллллллллллллллллллл                            N   ╓  -       .sdt/objects/5a/f7b35c0a2f3baa6c82639b3a8215495df6f1e8493691447fd14134f123f104B      k   ⌡mtJ7<┬,а@©┘ЭS`R╦R║ЪЭ≈√ё² ъП├7N   ╓  -       .sdt/objects/5a/fb234511705047539bf315f2f7e22d266b232284e2621104f600103cffb866B          Е∙█4bi;?ю9ktХ.C><IQ~─C	╛w°&6оЯN   ╓  -       .sdt/objects/5a/fffce8520249d72adfd8fc9aab6bbfa2bdf26640e7f763baa1eab1ff7170ecB       D   ZM\y─~FZZ5╚хeБx\│░┬Y≤#Л┴╪▀ё я   М          .sdt/objects/5bN   ╓  -       .sdt/objects/5b/0039bf9eae030cf3a53805db3d47a81ea71571f74088f563608d56efdc1a0eB       ÷   3КF≈RЮ(ЦvUЕСт_&pmЯБWе└R ^╣7╣N   ╓  -       .sdt/objects/5b/010b31ec1b1931d133c4a39be4ae0930a70a778102a86e70ca43d8d0ef0ed6B      F╩   НУГ$x©Х÷⌠ЩуИ└щ▌у╪nФO█О┴йСo▓vФ{ЮN   ╓        .sdt/objects/5b/09e70cbde9e5b20cff965423f9b0c5f797e9959ed9f9269f7668b46effde47    CGPH OIDF       8OIDL             8CDAT      d                                                                                                                    v                                                            
-   
-   1            Й                                                       =                                                      Еj╓╖эХ\Ж8tИ└q÷Oщ#÷QE/╕_МС ОДс╩n$ъMO_ДTwP╬4c╝?y[+CS╪н:Rzп╓ВЖDдx г&j+ЮLWу╕aF▒Й≥╫п{ ▄┴ЯыГMдЭФBЛ^Ь╕YИ╦ъ>─дыЖ1d<qh┤█▄╨т>├vvъ`h÷ГцчУФ┴   p          Ь*▌╢к Х█5Щь▓├!ZqSЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪЪ                                                                                      ъУ█┼fт┐.ti(└1▄м       ╗q\√|ъ║yN   ╓  ·
-      .sdt/objects/5b/0c6dca792480e5a9445af0546e69424268ddfab8cca1257082ae114b12607d<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1037.5 400" fill="none">
-  <path fill="currentColor" fill-rule="evenodd" d="M200,20Q270.2,129.8 380,200Q270.2,270.2 200,380Q129.8,270.2 20,200Q129.8,129.8 200,20ZM200,344L201.5,332.4L199.8,326.3L198.2,321.1L196.9,316.4L196,312.1L195.4,308.2L195.1,304.4L195.1,300.9L195.3,297.4L195.6,294.1L196.1,290.6L196.8,287.2L197.6,283.6L198.6,279.9L199.8,276.1L201.2,272.1L202.7,267.9L204.4,263.6L206.2,259.2L208.2,254.6L210.3,249.9L212.6,245L215,240L217.5,234.9L220,229.7L222.6,224.4L225.3,219L227.9,213.4L230.6,207.8L233.3,202.1L235.9,196.3L238.4,190.4L240.9,184.5L243.3,178.4L245.5,172.3L247.6,166L249.4,159.7L251.1,153.3L252.5,146.8L253.6,140.3L254.5,133.6L254.9,126.9L254.9,120.2L254.5,113.4L253.6,106.6L252.2,99.9L250.2,93.2L247.6,86.8L244.3,80.6L240.5,74.7L236.1,69.2L231,64.1L225.3,59.6L218.9,55.8L211.7,53.1L200,56L200,56L198.5,67.6L200.2,73.7L201.8,78.9L203.1,83.6L204,87.9L204.6,91.8L204.9,95.6L204.9,99.1L204.7,102.6L204.4,105.9L203.9,109.4L203.2,112.8L202.4,116.4L201.4,120.1L200.2,123.9L198.8,127.9L197.3,132.1L195.6,136.4L193.8,140.8L191.8,145.4L189.7,150.1L187.4,155L185,160L182.5,165.1L180,170.3L177.4,175.6L174.7,181L172.1,186.6L169.4,192.2L166.7,197
+ARI

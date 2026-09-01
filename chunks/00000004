@@ -1,4 +1,318 @@
-id = [_]u8{1} ** 16,
+ 8;
+        if (pos + len > bytes.len) return Error.BadBundle;
+        const payload = bytes[pos..][0..len];
+        pos += len;
+
+        if (root_record == null) {
+            root_record = payload;
+            continue;
+        }
+        if (payload.len < name_raw_len) return Error.BadBundle;
+        try map.put(payload[0..name_raw_len].*, payload[name_raw_len..]);
+    }
+
+    const root = root_record orelse return Error.BadBundle;
+    const root_text = try openRecord(alloc, rootKey(prk), root_aad, root);
+    defer alloc.free(root_text);
+    const refs = try parseRoot(alloc, root_text);
+    defer freeRefs(alloc, refs);
+
+    const src = BundleSource{ .prk = prk, .nk = nameKey(prk), .map = &map };
+    try importGraph(st, alloc, src, refs);
+}
+
+pub fn readBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    s: ShareKey,
+    in_path: []const u8,
+) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, in_path, alloc, .unlimited);
+    defer alloc.free(bytes);
+    try importBundle(st, alloc, s, bytes);
+}
+
+fn buildRequest(alloc: std.mem.Allocator, host: []const u8, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: gr-share/1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        .{ path, host },
+    );
+}
+
+const Authority = struct {
+    host: []const u8,
+    port: u16,
+    prefix: []const u8,
+    tls: bool,
+};
+
+fn splitAuthority(base: []const u8) !Authority {
+    var tls = false;
+    var rest = base;
+    if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest["http://".len..];
+    } else if (std.mem.startsWith(u8, rest, "https://")) {
+        rest = rest["https://".len..];
+        tls = true;
+    } else return Error.UnsupportedScheme;
+
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const authority = rest[0..slash];
+    const prefix = rest[slash..];
+    if (authority.len == 0) return Error.BadUrl;
+
+    var host = authority;
+    var port: u16 = if (tls) 443 else 80;
+    if (authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return Error.BadUrl;
+        host = authority[1..close];
+        const tail = authority[close + 1 ..];
+        if (tail.len > 1 and tail[0] == ':') {
+            port = std.fmt.parseInt(u16, tail[1..], 10) catch return Error.BadUrl;
+        }
+    } else if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+        port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return Error.BadUrl;
+    }
+    if (host.len == 0) return Error.BadUrl;
+    return .{ .host = host, .port = port, .prefix = prefix, .tls = tls };
+}
+
+fn contentLengthOf(line: []const u8) ?usize {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) return null;
+    return std.fmt.parseInt(usize, std.mem.trim(u8, line[colon + 1 ..], " \t\r"), 10) catch null;
+}
+
+fn plainGet(io: std.Io, alloc: std.mem.Allocator, a: Authority, path: []const u8) ![]u8 {
+    var address = net.IpAddress.parse(a.host, a.port) catch
+        try net.IpAddress.resolve(io, a.host, a.port);
+    const stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+
+    const rbuf = try alloc.alloc(u8, 16 * 1024);
+    defer alloc.free(rbuf);
+    const wbuf = try alloc.alloc(u8, 4096);
+    defer alloc.free(wbuf);
+
+    var sr = stream.reader(io, rbuf);
+    var sw = stream.writer(io, wbuf);
+
+    const request = try buildRequest(alloc, a.host, path);
+    defer alloc.free(request);
+    try sw.interface.writeAll(request);
+    try sw.interface.flush();
+
+    const r = &sr.interface;
+    const status = try r.takeDelimiterInclusive('\n');
+    if (std.mem.indexOf(u8, status, " 200") == null) return Error.HttpStatus;
+
+    var length: ?usize = null;
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        if (trimmed.len == 0) break;
+        if (contentLengthOf(trimmed)) |n| length = n;
+    }
+    const n = length orelse return Error.HttpProtocol;
+    return r.readAlloc(alloc, n);
+}
+
+fn tlsGet(io: std.Io, alloc: std.mem.Allocator, url: []const u8) ![]u8 {
+    var client: std.http.Client = .{ .allocator = alloc, .io = io };
+    defer client.deinit();
+
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    defer body.deinit();
+
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &body.writer,
+    });
+    if (result.status != .ok) return Error.HttpStatus;
+    return body.toOwnedSlice();
+}
+
+fn httpGet(io: std.Io, alloc: std.mem.Allocator, base: []const u8, path: []const u8) ![]u8 {
+    const a = try splitAuthority(base);
+    if (a.tls) {
+        const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, path[a.prefix.len..] });
+        defer alloc.free(url);
+        return tlsGet(io, alloc, url);
+    }
+    return plainGet(io, alloc, a, path);
+}
+
+const HttpSource = struct {
+    io: std.Io,
+    base: []const u8,
+    id: []const u8,
+    prefix: []const u8,
+    prk: Prk,
+    nk: [32]u8,
+
+    fn fetch(self: HttpSource, alloc: std.mem.Allocator, o: Oid) ![]u8 {
+        var namebuf: [name_len]u8 = undefined;
+        const raw_name = blindedRaw(self.nk, o);
+        _ = b64.Encoder.encode(&namebuf, &raw_name);
+
+        const path = try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}{s}/{s}/{s}",
+            .{ self.prefix, path_segment, self.id, objects_leaf, namebuf },
+        );
+        defer alloc.free(path);
+
+        const record = try httpGet(self.io, alloc, self.base, path);
+        defer alloc.free(record);
+        return openObject(alloc, self.prk, o, record);
+    }
+};
+
+pub fn fetchHttp(st: *Store, alloc: std.mem.Allocator, io: std.Io, url: []const u8) !void {
+    const parsed = try parseUrl(alloc, url);
+    defer parsed.deinit(alloc);
+
+    const a = try splitAuthority(parsed.base);
+    const prk = prkOf(parsed.key);
+
+    const root_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}{s}{s}/{s}",
+        .{ a.prefix, path_segment, parsed.id, root_leaf },
+    );
+    defer alloc.free(root_path);
+
+    const root_record = try httpGet(io, alloc, parsed.base, root_path);
+    defer alloc.free(root_record);
+
+    const root_text = try openRecord(alloc, rootKey(prk), root_aad, root_record);
+    defer alloc.free(root_text);
+    const refs = try parseRoot(alloc, root_text);
+    defer freeRefs(alloc, refs);
+
+    const src = HttpSource{
+        .io = io,
+        .base = parsed.base,
+        .id = parsed.id,
+        .prefix = a.prefix,
+        .prk = prk,
+        .nk = nameKey(prk),
+    };
+    try importGraph(st, alloc, src, refs);
+}
+
+fn safeName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn requestSubPath(target: []const u8, buf: []u8) ![]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    const path = target[0..q];
+    if (!std.mem.startsWith(u8, path, path_segment)) return Error.BadPath;
+
+    var it = std.mem.splitScalar(u8, path[path_segment.len..], '/');
+    const id = it.next() orelse return Error.BadPath;
+    if (id.len != id_len or !isHexLower(id)) return Error.BadPath;
+
+    const leaf = it.next() orelse return Error.BadPath;
+    if (std.mem.eql(u8, leaf, root_leaf)) {
+        if (it.next() != null) return Error.BadPath;
+        return rootSubPath(id, buf);
+    }
+    if (!std.mem.eql(u8, leaf, objects_leaf)) return Error.BadPath;
+    const name = it.next() orelse return Error.BadPath;
+    if (it.next() != null) return Error.BadPath;
+    if (!safeName(name)) return Error.BadPath;
+    return objectSubPath(id, name, buf);
+}
+
+fn serveConn(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, stream: net.Stream) void {
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    const r = &sr.interface;
+    const w = &sw.interface;
+
+    const line = r.takeDelimiterInclusive('\n') catch return;
+    const request = std.mem.trimEnd(u8, line, "\r\n");
+    while (true) {
+        const header = r.takeDelimiterInclusive('\n') catch break;
+        if (std.mem.trimEnd(u8, header, "\r\n").len == 0) break;
+    }
+
+    var it = std.mem.tokenizeAny(u8, request, " ");
+    const method = it.next() orelse return;
+    const target = it.next() orelse return;
+    if (!std.mem.eql(u8, method, "GET")) {
+        respondStatus(w, "405 Method Not Allowed");
+        return;
+    }
+
+    var pathbuf: [96]u8 = undefined;
+    const sub = requestSubPath(target, &pathbuf) catch {
+        respondStatus(w, "404 Not Found");
+        return;
+    };
+    const body = dir.readFileAlloc(io, sub, alloc, .unlimited) catch {
+        respondStatus(w, "404 Not Found");
+        return;
+    };
+    defer alloc.free(body);
+
+    w.print(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body.len},
+    ) catch return;
+    w.writeAll(body) catch return;
+    w.flush() catch return;
+}
+
+fn respondStatus(w: *std.Io.Writer, status: []const u8) void {
+    w.print("HTTP/1.1 {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status}) catch return;
+    w.flush() catch return;
+}
+
+pub fn serveDir(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, port: u16) !void {
+    var address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(port) };
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    while (true) {
+        const stream = try server.accept(io);
+        serveConn(io, alloc, dir, stream);
+        stream.close(io);
+    }
+}
+
+// --- tests ---
+
+const testing = std.testing;
+
+fn seedRepo(st: *Store) !Oid {
+    const a_blob = try st.writeFileContent("fn main() void {}\n" ** 64);
+    const b_blob = try st.writeFileContent("pub const x = 42;\n" ** 64);
+    const env_blob = try st.writeFileContent("API_KEY=gr1:AAAA\n");
+
+    var entries = [_]object.TreeEntry{
+        .{ .mode = .regular, .path = ".env.sealed", .blob = env_blob },
+        .{ .mode = .regular, .path = "src/lib.zig", .blob = b_blob },
+        .{ .mode = .regular, .path = "src/main.zig", .blob = a_blob },
+    };
+    std.mem.sort(object.TreeEntry, &entries, {}, object.Tree.lessThan);
+    const tree_oid = try st.writeTree(.{ .entries = &entries });
+
+    const first = try st.writeChange(.{
+        .tree = tree_oid,
+        .parents = &[_]Oid{},
+        .change_id = [_]u8{1} ** 16,
         .timestamp = 1_700_000_000,
         .tz_offset_min = 0,
         .author = "Tester <t@example.com>",
@@ -34960,7 +35274,8 @@ foreach(WARNING ${WARNINGS})
 	message(WARNING ${WARNING})
 endforeach()
 N   §  -       .sdt/objects/82/5dc6c1fffb56a42f268cde5dcba80e3e94abcc97419bbd0bc82e41d9273f47B      z   8jÆ y#ûh7¬dd“è“ﬂÆ∑¨J˜n˛sHÁ{å†N   §  %       .sdt/objects/82/65b3efba4abec1425eb00e55311eb35aaed16e3cad1e4d88576aad41037a6exK …OR02f…»,V ¢ƒ<Ö¸úÖ§¢ƒº‰E. ú∂	¿N   §  Á      .sdt/objects/82/6794f8c7c3bf02f9736f1d9ee691cc3fbffc7b4430e0a367ecbf1ede55b70f ˇ CGPH{	          ÔÔ      CGPH OIÖ=v=q™ﬂ	ßïñ…tlN~ÏÁ«ØÑÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔççëççççççççççÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔ`ÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔ=v=q™ﬂ	ßïñ…tlN~ÏÁ«ØÑñˇÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔ=v=q™ﬂ	ßïÔÔÔÔÔÔÔÔÔ=v=q™ﬂ	ßïñ…tlN~ÏÁ«ØÑñˇÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔØÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔ=v=q™ﬂ	ßïñ…tlN~ÏÁ«ØÑñˇÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔÔˇÔÔÔGGGGGGGGGGGGGGGGGGGGGG  N   §  -       .sdt/objects/82/6a9a787a5c214e46c7cd52fe1336253992d4d4c14ff0da44f0d8218a770601B          ]3KBûıÃeæ¨5 í¥j∂~∫*‰`π˘h¡è+N   §  8       .sdt/objects/82/82f889eec96753a3f02ae005ed78675b5241ed20d68ae710a2603ca6303e9bx+)JMU0∂d040031Q–s˜âIÀœOJ,bhXÒœ_ )'`ÛíølQn,ª˛Ã7¯ aæìN   §         .sdt/objects/82/835d424a2781bd4360a8b6e7c2b2fb0f1a141a34a1b9168215dbaaf84e474fYo
-N   §  ¶       .sdt/objects/82/8de4ce00f36365b14fc7f7a2a16b2f51a253921b433dd140afca161c0f6009#!/bin/bash -e
+N   §  œ       .sdt/objects/82/899b1b30da6c48b2162baf6dcfef813d9e7d90a03f19ee082a6ea76945d8bdV master    cohesive-workflows   Å—ˆ˙‘˛Ht¬˙W(≥ÚTE´®∂t[öÂ+˜Ï* from-git   »n€P:bìHX°ÁZÉ,$%±∑;m‚DÃ¢§ master   Å—ˆ˙‘˛Ht¬˙W(≥ÚTE´®∂t[öÂ+˜Ï* 
+sdt-remote   §1@m¥aÇ\ S'˛h!à˜ ¡æQkÌi?™÷*~N   §  ¶       .sdt/objects/82/8de4ce00f36365b14fc7f7a2a16b2f51a253921b433dd140afca161c0f6009#!/bin/bash -e
 
 . "$(dirname "$0")/benchmark_helpers.sh"
 
@@ -96951,7 +97266,9 @@ int git_tag__parse_raw(void *tag, const char *data, size_t size, git_oid_t oid_t
 
 #endif
 N   §  -       .sdt/objects/90/cb2f69e9ccff3f38fdeb5ecda976fdcaee5b447708d17fac2524fb957e0bcfB      B   ;Äd¿b˛UùÅ!ÿtDR-©èë(˜Ò‘êé∏‹?Uµ2ˇN   §  -       .sdt/objects/90/d4129ea6c1899b711dc450fbb8a3a14549ae4e51050f4cd05ff3bd2bb2b71aB      ¡   Û>‘hJéZFQÈ	ƒp&!Ab7ÚEH£V∫Ë¢›Tt-N   §  D      .sdt/objects/90/d959b73736a7f4a6b34038a4eaf61e93374d9b281a04d7563be4ce5f3225c2ˇˇˇ%CGP=v=q™ﬂ	ßïñ…tlN~Ï÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷÷Á«ØÑñF»T*%æısq·öûHP™ä&≈∫≥ÖÍót;Ê®wDyüÑñF»Tg«ÿÌT^;mˇ˝»På∫9òCú             ≤ıN   §  -       .sdt/objects/90/dd4d50a27aef3a94a98b7b0b8b821bed59552bdf8a4c0cb77db695f8a7a109B      è   D8˝xf÷Ö–ÊïÑ˜Lﬂ˙ƒ!ë∑c≤®ØkÌ≤8€W—N   §  õ       .sdt/objects/90/df4ad2e0b5ef91528568add95a98751eebac1a1ad4438b8ff946bb86e4d3e2    CGPH OIDFIPGC    OÄ 8 ˇˇˇˇˇˇ          Ä                            CGPH OIDF       8OIDL      ∏CDAT      d    ˇˇˇˇˇˇˇˇˇ   '           N   §         .sdt/objects/90/df9df6fea06bf3649ac8e0bbfe910f63d67381a4e3cb5e1d8e30b253d88d56nothing here
-N   §  -       .sdt/objects/90/e00471b60c8bd7d94be4607b9caeb1f2399b729865b702ece5b6f41c04053aB      u   « ¡0⁄\›˝ä"F;j≈3ΩB\ÌgS ≤áÌV™ÒÒﬁN   §  :       .sdt/objects/90/e60401947a41427dc6f7993d3e314f9ee0694dbea827977d9ef51e6fe46901xK …OR01a(…»,Ê¢îÃ"˝¥ÃúTCΩíä.ç‰åƒºÙ‘ÖÃ<Öî¥¯‚ÃîTCM. ¿ì‚N   §  -       .sdt/objects/90/fb6576022c058949e0e6aa181d9333b7b0e6f770049808ba3692e5bc848da5B      |   Ì%*=ïVëÑÙ_ÌÁΩÜˆ3…ª¥AyRÜÂœMWïŸ   Ì          .sdt/objects/91N   §  -       .sdt/objects/91/18e2951f53261cc87892c01fb870ea737929650a8f9bfa713e4a788a955606B       Ñ   <H≥¶·u¸©·!û÷´[ò’ßöÿ“üxhç<XN   §  ós      .sdt/objects/91/1ae24a8e24a61a13b8459c5cbc994853cc8cb199b7a5ff4e357d47918fcdf1/*
+N   §  -       .sdt/objects/90/e00471b60c8bd7d94be4607b9caeb1f2399b729865b702ece5b6f41c04053aB      u   « ¡0⁄\›˝ä"F;j≈3ΩB\ÌgS ≤áÌV™ÒÒﬁN   §  :       .sdt/objects/90/e60401947a41427dc6f7993d3e314f9ee0694dbea827977d9ef51e6fe46901xK …OR01a(…»,Ê¢îÃ"˝¥ÃúTCΩíä.ç‰åƒºÙ‘ÖÃ<Öî¥¯‚ÃîTCM. ¿ì‚N   §  a       .sdt/objects/90/fb29c8a8fa66644fbc4b145005b9c12730929b54ef39f860a89f2c58f41792O   ,kÄˇ‹ƒ‚YﬂBE+/†…+±∑.˘ÓDA
+kVV·{∆˛cTpî≈∆'rÛÕ–_2∑ì¡Y.‰}ƒﬁ/œ”≠ snapshot    jó
+   masterN   §  -       .sdt/objects/90/fb6576022c058949e0e6aa181d9333b7b0e6f770049808ba3692e5bc848da5B      |   Ì%*=ïVëÑÙ_ÌÁΩÜˆ3…ª¥AyRÜÂœMWïŸ   Ì          .sdt/objects/91N   §  -       .sdt/objects/91/18e2951f53261cc87892c01fb870ea737929650a8f9bfa713e4a788a955606B       Ñ   <H≥¶·u¸©·!û÷´[ò’ßöÿ“üxhç<XN   §  ós      .sdt/objects/91/1ae24a8e24a61a13b8459c5cbc994853cc8cb199b7a5ff4e357d47918fcdf1/*
  * Copyright (C) 2007 Francois Gouget
  *
  * This library is free software; you can redistribute it and/or
@@ -106087,222 +106404,4 @@ int git_hashsig_create_fromfile(
 			break;
 		}
 
-		error = hashsig_add_hashes(sig, buf, buflen, &prog);
-	}
-
-	p_close(fd);
-
-	if (!error)
-		error = hashsig_finalize_hashes(sig);
-
-	if (!error)
-		*out = sig;
-	else
-		git_hashsig_free(sig);
-
-	return error;
-}
-
-void git_hashsig_free(git_hashsig *sig)
-{
-	git__free(sig);
-}
-
-static int hashsig_heap_compare(const hashsig_heap *a, const hashsig_heap *b)
-{
-	int matches = 0, i, j, cmp;
-
-	GIT_ASSERT_WITH_RETVAL(a->cmp == b->cmp, 0);
-
-	/* hash heaps are sorted - just look for overlap vs total */
-
-	for (i = 0, j = 0; i < a->size && j < b->size; ) {
-		cmp = a->cmp(&a->values[i], &b->values[j], NULL);
-
-		if (cmp < 0)
-			++i;
-		else if (cmp > 0)
-			++j;
-		else {
-			++i; ++j; ++matches;
-		}
-	}
-
-	return HASHSIG_SCALE * (matches * 2) / (a->size + b->size);
-}
-
-int git_hashsig_compare(const git_hashsig *a, const git_hashsig *b)
-{
-	/* if we have no elements in either file then each file is either
-	 * empty or blank.  if we're ignoring whitespace then the files are
-	 * similar, otherwise they're dissimilar.
-	 */
-	if (a->mins.size == 0 && b->mins.size == 0) {
-		if ((!a->lines && !b->lines) ||
-			(a->opt & GIT_HASHSIG_IGNORE_WHITESPACE))
-			return HASHSIG_SCALE;
-		else
-			return 0;
-	}
-
-	/* if we have fewer than the maximum number of elements, then just use
-	 * one array since the two arrays will be the same
-	 */
-	if (a->mins.size < HASHSIG_HEAP_SIZE) {
-		return hashsig_heap_compare(&a->mins, &b->mins);
-	} else {
-		int mins, maxs;
-
-		if ((mins = hashsig_heap_compare(&a->mins, &b->mins)) < 0)
-			return mins;
-		if ((maxs = hashsig_heap_compare(&a->maxs, &b->maxs)) < 0)
-			return maxs;
-
-		return (mins + maxs) / 2;
-	}
-}
-N   §  Ä       .sdt/objects/95/c0730182f4bcb5c9516dcef0b0487bde1ad4d640a3fc05f73f7ff50b08f853C”T˚2ôÑ&e∫◊Xø·zÔ,!'Çy/ƒ‘Úö^   @*ïñé®h(lY€å+˚˙ÈÿÏ∂>è÷≈¨T«Œ›ê@Ùöó¸($òÀ:ˇ    jI˘d     plyght <plyght@peril.lol>    N   §  -       .sdt/objects/95/c39a530f0e4d1409a02f49ef196a9af8d6e5a7eaffd7da8e3780bd994e0f9eB       *   â¯ ~Nœµá¡≠U\Öc÷ÂOcÆ‹ƒà®ˇ“q—[hN   §  :2     .sdt/objects/95/c6ec4fce9b9af3d4df563443addd390977fea7d41307f6f09fe31a6cc143ccconst std = @import("std");
-const oid = @import("oid.zig");
-const cdc = @import("cdc.zig");
-const object = @import("object.zig");
-const store = @import("store.zig");
-const workspace = @import("workspace.zig");
-const oplog = @import("oplog.zig");
-const opdag = @import("opdag.zig");
-const git = @import("git.zig");
-const diff = @import("diff.zig");
-const branches = @import("branches.zig");
-const config = @import("config.zig");
-const merge = @import("merge.zig");
-const replay = @import("replay.zig");
-const history = @import("history.zig");
-const watch = @import("watch.zig");
-const moment = @import("moment.zig");
-const verdict = @import("verdict.zig");
-const revspec = @import("revspec.zig");
-const checks = @import("checks.zig");
-const readset = @import("readset.zig");
-const warrant = @import("warrant.zig");
-const tracer = @import("tracer.zig");
-const grade = @import("grade.zig");
-const sched = @import("sched.zig");
-const rewind = @import("rewind.zig");
-const freshness = @import("freshness.zig");
-const fork = @import("fork.zig");
-const recap = @import("recap.zig");
-const flow = @import("flow.zig");
-const superpose = @import("superpose.zig");
-const hook = @import("hook.zig");
-const live = @import("live.zig");
-const net = @import("net.zig");
-const ignore = @import("ignore.zig");
-const provenance = @import("provenance.zig");
-const attribution = @import("attribution.zig");
-const agentscan = @import("agentscan.zig");
-const update = @import("update.zig");
-const gc = @import("gc.zig");
-const blame = @import("blame.zig");
-const completions = @import("completions.zig");
-const absorb = @import("absorb.zig");
-const lfs = @import("lfs.zig");
-const attest = @import("attest.zig");
-const proc = @import("proc.zig");
-const seal = @import("seal.zig");
-const keyring = @import("keyring.zig");
-const share = @import("share.zig");
-const wormhole = @import("wormhole.zig");
-const ui = @import("ui.zig");
-const discovery = @import("discovery.zig");
-const ipnet = std.Io.net;
-
-const Oid = oid.Oid;
-const Store = store.Store;
-
-const version = @import("build_options").version;
-
-const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
-const Section = struct { title: []const u8, entries: []const Entry };
-
-const sections = [_]Section{
-    .{ .title = "the everyday loop", .entries = &.{
-        .{ .name = "save", .alias = "sv", .args = "[-m msg]", .desc = "checkpoint the working tree" },
-        .{ .name = "status", .alias = "st", .desc = "what changed since the last save" },
-        .{ .name = "diff", .alias = "d", .desc = "line-level diff vs the last save" },
-        .{ .name = "log", .alias = "l", .desc = "the change history" },
-        .{ .name = "describe", .alias = "desc", .args = "-m msg [--at]", .desc = "name or rename any change" },
-    } },
-    .{ .title = "moving around", .entries = &.{
-        .{ .name = "new", .alias = "n", .args = "<name>", .desc = "branch off here and switch to it" },
-        .{ .name = "switch", .alias = "sw", .args = "<name>", .desc = "move to another branch (auto-saves)" },
-        .{ .name = "branch", .alias = "b", .args = "[-d name]", .desc = "list branches, or delete one" },
-        .{ .name = "work", .alias = "wt", .args = "<dir>", .desc = "instant copy-on-write worktree" },
-        .{ .name = "restore", .alias = "rs", .args = "<file>", .desc = "discard local edits to one file" },
-        .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
-        .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
-        .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
-        .{ .name = "absorb", .alias = "ab", .args = "[-- <paths>]", .desc = "fold edits into the changes they belong to" },
-    } },
-    .{ .title = "reshaping history", .entries = &.{
-        .{ .name = "point", .alias = "pt", .args = "<ref>", .desc = "move this branch's tip to any ref" },
-        .{ .name = "rebase", .alias = "rb", .args = "<ref>", .desc = "replay this branch onto a new base" },
-        .{ .name = "amend", .alias = "am", .args = "[--at ref]", .desc = "fold working edits into a named change" },
-        .{ .name = "squash", .alias = "sq", .args = "[n] [--at] [-m]", .desc = "collapse adjacent changes into one" },
-        .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths> | --hunk p:n", .desc = "split one change in two, by path or hunk" },
-        .{ .name = "drop", .alias = "dr", .args = "[ref]", .desc = "remove a change, keep its edits in the tree" },
-        .{ .name = "reorder", .alias = "ro", .args = "<order...>", .desc = "reorder the last changes, 1 = oldest" },
-    } },
-    .{ .title = "who wrote this", .entries = &.{
-        .{ .name = "blame", .alias = "bl", .args = "<file>", .desc = "per-line authorship, incl. agent/prompt" },
-        .{ .name = "provenance", .alias = "prov", .desc = "which agent/prompt produced each change" },
-        .{ .name = "why", .args = "<file>", .desc = "who last authored a file" },
-    } },
-    .{ .title = "undo is never scary", .entries = &.{
-        .{ .name = "undo", .alias = "u", .desc = "revert the last operation, whole repo" },
-        .{ .name = "redo", .alias = "r", .desc = "reapply what you just undid" },
-    } },
-    .{ .title = "history that knows what worked", .entries = &.{
-        .{ .name = "green", .alias = "gn", .desc = "rewind to the last state that passed" },
-        .{ .name = "back", .alias = "bk", .args = "[n]", .desc = "rewind n moments, default 1" },
-        .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
-        .{ .name = "moments", .alias = "mo", .args = "[-n N]", .desc = "captured states and their verdicts" },
-        .{ .name = "grade", .alias = "gd", .args = "[git-ref]", .desc = "grade now, or any git ref; --on automates" },
-        .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
-        .{ .name = "recap", .alias = "rc", .args = "[@ref..]", .desc = "green and red spans, and what thrashed" },
-    } },
-    .{ .title = "conflicts that halt nothing", .entries = &.{
-        .{ .name = "super", .alias = "sp", .args = "[path]", .desc = "paths holding more than one version" },
-        .{ .name = "collapse", .alias = "cp", .args = "<path> <A|--greenest>", .desc = "keep one; nothing is deleted" },
-        .{ .name = "note", .args = "<f>:<n> <text>", .desc = "annotate a line for whoever has it next" },
-        .{ .name = "notes", .desc = "every annotation recorded here" },
-    } },
-    .{ .title = "secrets you can actually commit", .entries = &.{
-        .{ .name = "seal", .alias = "sl", .args = "<path>", .desc = "seal a .env-style file" },
-        .{ .name = "unseal", .alias = "us", .desc = "write the plaintext back out" },
-        .{ .name = "key", .alias = "k", .args = "<cmd>", .desc = "new | show | add | remove | list" },
-        .{ .name = "rotate", .alias = "rot", .desc = "new repo key, re-wrapped to every member" },
-    } },
-    .{ .title = "handing a repo to someone", .entries = &.{
-        .{ .name = "send", .alias = "snd", .desc = "peer-to-peer on this network, via a code" },
-        .{ .name = "send --file", .args = "<f>", .desc = "one sealed file, no network at all" },
-        .{ .name = "send --link", .args = "<dir>", .desc = "static files you upload anywhere" },
-        .{ .name = "get", .alias = "g", .args = "<code|url|file>", .desc = "the other side of all three" },
-        .{ .name = "relay", .alias = "rv", .desc = "run a meeting point for internet transfers" },
-    } },
-    .{ .title = "distributed (no forced server)", .entries = &.{
-        .{ .name = "serve", .alias = "srv", .args = "[port]", .desc = "share this repo's objects over TCP" },
-        .{ .name = "serve --link", .args = "<dir>", .desc = "host a `send --link` export over HTTP" },
-        .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
-        .{ .name = "watch", .desc = "experimental: auto-save on every change" },
-        .{ .name = "hook", .args = "[install [--write <path>]]", .desc = "tell a coding agent whether its work passed" },
-    } },
-    .{ .title = "git, side by side", .entries = &.{
-        .{ .name = "clone", .alias = "cl", .args = "<src> [dir]", .desc = "a git repo, a share URL, or a bundle" },
-        .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
-        .{ .name = "export", .args = "<repo> [--force]", .desc = "write superdetermine HEAD out as git commits" },
-        .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
-        .{ .name = "push", .alias = "ps", .args = "[remote] [branch] [--require-green]", .desc = "uses your existing git credentials" },
-        .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
-        .{ .name = "attest", .alias = "at", .args = "[ref] [--dry-run]", .desc = "post the warrant as a GitHub commit status" },
-        .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
-    } },
-    .{ .title 
+		error =

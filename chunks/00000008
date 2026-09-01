@@ -1,4 +1,370 @@
-ting.expectEqualStrings("a\n", seen_msgs.items[2]);
+ee(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    const feature_tip = try commitOnto(repo, "refs/heads/feature", "feature.txt", "git feature\n", "git feature\n", &main_tip, 1_600_000_100);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocated(&store, git_repo.abs);
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+
+    var feature_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&feature_after, repo, "refs/heads/feature"));
+    try testing.expect(c.git_oid_cmp(&feature_after, &feature_tip) != 0);
+    try testing.expect(c.git_graph_descendant_of(repo, &feature_after, &feature_tip) == 1);
+}
+
+test "the mirror creates the sdt branch rather than writing git's checked-out one" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocated(&store, git_repo.abs);
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+    try testing.expectEqual(@as(usize, 1), try countCommitsFrom(repo, "refs/heads/main"));
+
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/feature"));
+}
+
+test "an explicit branch beats both the sdt branch and git's HEAD" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    const feature_tip = try commitOnto(repo, "refs/heads/feature", "feature.txt", "git feature\n", "git feature\n", &main_tip, 1_600_000_100);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocatedTo(&store, git_repo.abs, "release");
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+    var feature_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&feature_after, repo, "refs/heads/feature"));
+    try testing.expect(c.git_oid_cmp(&feature_after, &feature_tip) == 0);
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/release"));
+}
+
+test "the resolved branch still repairs a grafted chain when forced" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const git_repo = try initGitOnMain(io, alloc, &tmp.dir, "gitrepo");
+    defer alloc.free(git_repo.abs);
+    defer c.git_repository_free(git_repo.repo);
+    const repo = git_repo.repo;
+    const main_tip = git_repo.tip;
+
+    _ = try commitOnto(repo, "refs/heads/feature", "feature.txt", "git feature\n", "git feature\n", &main_tip, 1_600_000_100);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreOnFeature(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try syncColocated(&store, git_repo.abs);
+    try testing.expectEqual(@as(usize, 4), try countCommitsFrom(repo, "refs/heads/feature"));
+
+    try syncColocatedForced(&store, git_repo.abs, null, true);
+    try testing.expectEqual(@as(usize, 2), try countCommitsFrom(repo, "refs/heads/feature"));
+
+    var main_after: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_after, repo, "refs/heads/main"));
+    try testing.expect(c.git_oid_cmp(&main_after, &main_tip) == 0);
+}
+
+/// Commit `content` at `file_name` onto `branch_ref`, chaining onto `parent` if
+/// non-null. Returns the new commit oid. `ts` sets a deterministic time.
+fn commitOnto(
+    repo: ?*c.git_repository,
+    branch_ref: [*c]const u8,
+    file_name: [*c]const u8,
+    content: []const u8,
+    message: [*c]const u8,
+    parent: ?*const c.git_oid,
+    ts: c.git_time_t,
+) !c.git_oid {
+    var bld: ?*c.git_treebuilder = null;
+    try check(c.git_treebuilder_new(&bld, repo, null));
+    defer c.git_treebuilder_free(bld);
+    var blob_oid: c.git_oid = undefined;
+    try check(c.git_blob_create_from_buffer(&blob_oid, repo, content.ptr, content.len));
+    try check(c.git_treebuilder_insert(null, bld, file_name, &blob_oid, c.GIT_FILEMODE_BLOB));
+    var tree_oid: c.git_oid = undefined;
+    try check(c.git_treebuilder_write(&tree_oid, bld));
+    var gtree: ?*c.git_tree = null;
+    try check(c.git_tree_lookup(&gtree, repo, &tree_oid));
+    defer c.git_tree_free(gtree);
+    var sig: ?*c.git_signature = null;
+    try check(c.git_signature_new(&sig, "Auth", "auth@example.com", ts, 0));
+    defer c.git_signature_free(sig);
+    var commit_oid: c.git_oid = undefined;
+    if (parent) |p| {
+        var pc: ?*c.git_commit = null;
+        try check(c.git_commit_lookup(&pc, repo, p));
+        defer c.git_commit_free(pc);
+        var parents = [_]?*const c.git_commit{pc};
+        try check(c.git_commit_create(&commit_oid, repo, branch_ref, sig, sig, null, message, gtree, 1, &parents));
+    } else {
+        try check(c.git_commit_create(&commit_oid, repo, branch_ref, sig, sig, null, message, gtree, 0, null));
+    }
+    return commit_oid;
+}
+
+test "importHead brings full history with parent chain" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src");
+    const abs = try tmp.dir.realPathFileAlloc(io, "src", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    const c1 = try commitOnto(repo, "refs/heads/master", "f.txt", "one\n", "c1\n", null, 1_600_000_001);
+    const c2 = try commitOnto(repo, "refs/heads/master", "f.txt", "two\n", "c2\n", &c1, 1_600_000_002);
+    _ = try commitOnto(repo, "refs/heads/master", "f.txt", "three\n", "c3\n", &c2, 1_600_000_003);
+    try check(c.git_repository_set_head(repo, "refs/heads/master"));
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const tip = try importHead(&store, abs);
+
+    // Walk gr change parents from the tip back to the root, collecting messages.
+    var msgs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (msgs.items) |m| alloc.free(m);
+        msgs.deinit(alloc);
+    }
+    var cur = tip;
+    while (true) {
+        const ch = try store.readChange(cur);
+        try msgs.append(alloc, try alloc.dupe(u8, ch.message));
+        const has_parent = ch.parents.len == 1;
+        const next = if (has_parent) ch.parents[0] else Oid.zero();
+        object.freeChange(alloc, ch);
+        if (!has_parent) break;
+        cur = next;
+    }
+    try testing.expectEqual(@as(usize, 3), msgs.items.len);
+    // msgs is newest->oldest; verify oldest->newest ordering.
+    try testing.expectEqualStrings("c3\n", msgs.items[0]);
+    try testing.expectEqualStrings("c2\n", msgs.items[1]);
+    try testing.expectEqualStrings("c1\n", msgs.items[2]);
+}
+
+test "importAll brings all branches and tags with history" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src");
+    const abs = try tmp.dir.realPathFileAlloc(io, "src", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+
+    // master: two commits; feature branches off m1 with its own commit.
+    const m1 = try commitOnto(repo, "refs/heads/master", "f.txt", "m1\n", "m1\n", null, 1_600_000_001);
+    const m2 = try commitOnto(repo, "refs/heads/master", "f.txt", "m2\n", "m2\n", &m1, 1_600_000_002);
+    _ = try commitOnto(repo, "refs/heads/feature", "g.txt", "feat\n", "feat\n", &m1, 1_600_000_003);
+    try check(c.git_repository_set_head(repo, "refs/heads/master"));
+
+    // Tag v1 on master tip (lightweight).
+    var m2_commit: ?*c.git_object = null;
+    try check(c.git_object_lookup(&m2_commit, repo, &m2, c.GIT_OBJECT_COMMIT));
+    defer c.git_object_free(m2_commit);
+    var tag_ref: ?*c.git_reference = null;
+    try check(c.git_reference_create(&tag_ref, repo, "refs/tags/v1", &m2, 0, null));
+    c.git_reference_free(tag_ref);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    try importAll(&store, abs, null);
+
+    try testing.expect(store.refExists("master"));
+    try testing.expect(store.refExists("feature"));
+
+    // feature's tip change parent is the branch point (m1's gr change).
+    const feat_tip = try store.readRef("feature");
+    const feat = try store.readChange(feat_tip);
+    defer object.freeChange(alloc, feat);
+    try testing.expectEqual(@as(usize, 1), feat.parents.len);
+    const branch_point = feat.parents[0];
+    const bp = try store.readChange(branch_point);
+    defer object.freeChange(alloc, bp);
+    try testing.expectEqualStrings("m1\n", bp.message);
+
+    // Tag ref exists on disk pointing at the master-tip gr change.
+    const master_tip = try store.readRef("master");
+    const tag_data = try store.root.readFileAlloc(io, "refs/tags/v1", alloc, .unlimited);
+    defer alloc.free(tag_data);
+    const trimmed = std.mem.trim(u8, tag_data, "\n \t\r");
+    const tag_oid = try Oid.fromHex(trimmed);
+    try testing.expect(tag_oid.eql(master_tip));
+}
+
+test "exportAll writes full history and multiple branches into fresh repo" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    // Build a 3-change linear history on the HEAD branch (main).
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+
+    var prev: ?Oid = null;
+    const msgs = [_][]const u8{ "a\n", "b\n", "c\n" };
+    var last: Oid = undefined;
+    for (msgs, 0..) |m, i| {
+        var namebuf: [16]u8 = undefined;
+        const fname = try std.fmt.bufPrint(&namebuf, "f{d}.txt", .{i});
+        const blob = try store.writeFileContent(m);
+        const entries = [_]object.TreeEntry{.{ .mode = .regular, .path = fname, .blob = blob }};
+        const tree_oid = try store.writeTree(.{ .entries = &entries });
+        const parents: []const Oid = if (prev) |p| &[_]Oid{p} else &[_]Oid{};
+        const change = object.Change{
+            .tree = tree_oid,
+            .parents = parents,
+            .change_id = [_]u8{@intCast(i)} ** 16,
+            .timestamp = 1_700_000_000 + @as(i64, @intCast(i)),
+            .tz_offset_min = 0,
+            .author = "X <x@example.com>",
+            .message = m,
+        };
+        const coid = try store.writeChange(change);
+        try store.updateRef(branch, coid);
+        prev = coid;
+        last = coid;
+    }
+    // Second branch: point "side" at the root change ("a"), found by walking back.
+    var walk_oid = last;
+    while (true) {
+        const ch = try store.readChange(walk_oid);
+        const has = ch.parents.len == 1;
+        const nxt = if (has) ch.parents[0] else Oid.zero();
+        object.freeChange(alloc, ch);
+        if (!has) break;
+        walk_oid = nxt;
+    }
+    try store.updateRef("side", walk_oid);
+
+    // Export everything into a fresh git repo.
+    try tmp.dir.createDirPath(io, "gitout");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitout", alloc);
+    defer alloc.free(abs);
+    try exportAll(&store, abs);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, abs.ptr));
+    defer c.git_repository_free(repo);
+
+    // main has 3 commits in order c (tip) -> b -> a.
+    var main_tip: c.git_oid = undefined;
+    var main_ref_buf: [64]u8 = undefined;
+    const main_ref = try std.fmt.bufPrintZ(&main_ref_buf, "refs/heads/{s}", .{branch});
+    try check(c.git_reference_name_to_id(&main_tip, repo, main_ref.ptr));
+
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, repo));
+    defer c.git_revwalk_free(walk);
+    _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL);
+    try check(c.git_revwalk_push(walk, &main_tip));
+
+    var seen_msgs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen_msgs.items) |mm| alloc.free(mm);
+        seen_msgs.deinit(alloc);
+    }
+    var woid: c.git_oid = undefined;
+    while (c.git_revwalk_next(&woid, walk) == 0) {
+        var cm: ?*c.git_commit = null;
+        try check(c.git_commit_lookup(&cm, repo, &woid));
+        defer c.git_commit_free(cm);
+        try seen_msgs.append(alloc, try alloc.dupe(u8, std.mem.span(c.git_commit_message(cm))));
+    }
+    try testing.expectEqual(@as(usize, 3), seen_msgs.items.len);
+    // Topological (default newest-first): c, b, a.
+    try testing.expectEqualStrings("c\n", seen_msgs.items[0]);
+    try testing.expectEqualStrings("b\n", seen_msgs.items[1]);
+    try testing.expectEqualStrings("a\n", seen_msgs.items[2]);
 
     // The second branch exists.
     var side_tip: c.git_oid = undefined;
@@ -100558,103 +100924,4 @@ r&b&0p@~ĞöZé7]jô6àÒ xP +Ğõ0ÿ`ø§ë n$°à4PŠ+a ÉN`‘eF}O`á :`
 ‡gMPÆ´~†KZd.›az4> g`‘?ÿ`
 è€6ĞYÿ Ğã s@ÉéÉ0ouUÓ ¯ÀC€Ø(VÌç|ıFÿ o0hCĞá †° ï˜ ?™Ñ†~²5Y¶‚ú<°Ì Ç  Ãpù÷xÂ @hè =ğØ	€oÀãÀrI—ÿP3”ö
 @08ğ†Äà°À?@U°…æ?`U 80ß0c R0Ö‘ÀD@—7ğ™Î.°ßsÅô^r 7rbLZ	§q*§sJ§ƒó›0ÜÅ¸›0Ğ+øàJ»üàP q8 
-ËÁÃPĞ6îá  p”Ô€q+¹íìV˜P ‚Ğò—Ó0ÿp Ïá°pÿó@»p-6''93˜0»@°àĞÂÀß Â >?c ó cĞ/‘(ğğKEàh¶!QÖxmã`	T!»`Íd€ß n…›á"à®ïz¥øˆA™Åÿ¢@móM ;ÓÀ ¨£F`óPÖÀ|á0Ô‚ pÀ*á* ê ÁpNá°(¡.îP `ú€Çâ ¿)ÄÀÎîÑd ºĞZú00â¡‹ñ*P÷°ÜP1A@Î°x íc#€±3ÇÊ@¹ırBĞÿ
-ø°Ö vÀ *&‹ îÀÄĞ	ƒL y*sê°B 0DÄÂPğ BĞnĞ¯ ]kK¨L-ñ"c4»P6÷¦ÿ‘¦!ø”[!oZ§•k¹—‹¹™Ë  pÉÀâ[˜ÃDğ·ĞğáÀÊ`H`¹bÖ`
-	@y‹ĞÍğâ L |{0 ğ` ‹C­J. õÁ»Ô  NK¤ ÿ Ö* GC@É € dâà¶»ĞÀap H£ôÆp´	x±EÔúĞÓğÜ@
-ÁÀe€ “:œ¹ ÿÜ°@¶Ø8P
-Ğ€o} ¿Fr¦§U´úÖÀ
-E¢À4€ ¡ v±»ºˆYµH@@âà]Á¢†À¼Ê 
-×  { )p¯÷„ ¡@¨XÁÁp¬FrìºÌ 
-"`
-àÀ ÃFj
-à O€Iß@£`ºàŒ/ğ
-Ì°9ñÌ0ÂDàÖ`ĞÀÀÜP÷ªÆ”Ğª*A=Ğ
-Ô Æe¢°É`ãğÒ@80£ÁŸûÓĞ
-Mà (AY^ÀlœĞš^¾âáÅšåÓ”lêLÒ¦ò”š«Ê«ÌÊ­üÿƒ$@˜8Ğ=€ 0}rñWRÀ(X(`(° ­z˜¾• â À]ğ¤ø3BÈ }Ç<KÖÕ„<@<0 a À °]0l#±¬j°Œ `<p )0Çz @Ì?³¬º%‹¡;ÈTH*ğÿÌïLÌ„tıl‘´ÔtéS ƒ0øÈÄXÅÜ°“\` Â€§³4 ¡òıìÏ(Àº“Jé)±kÈSP µ¢’ĞHÈ©ä ğ]°xÏR	ƒdi&p 9± ß’Ğ}0P0 	ĞªÆâÁL›p 4eĞ<] è¬}ÿĞğ ñ,ÕÏ` .PÌQH–.ğCà ÀV} ` ğÏ&r†0 P @
-Ã„¦ÅìqA­`’+Å’Ê®ÌØíØM€‡ğ0Ûô”D¦ÌA 3† “ıÖb™ıq$0Ùb¥ ’ —€šÍL”û9¡€Û$iµ­¦‚ƒ‚UõÑ§- ?àÓÀ/°Ñ’Áº}`BÙïèÙ¥  0ÙĞÚElr„­Ü2ÙÉİÙËŒ ğ' ÚA=ŞÛ&V¸ !Èî @Ù›‹Ş 6!0u­°¬™İİıÜò­ÜåÓ²û=¹ÿÙNànà"²Û¾Ø†UÔ O2 "0òpà0)ƒ†à® ğ
-ú0¶üÊ	Îá%nâ'â)•†8P	¯°¯İ€p6=@Ú–á‰­âQÄ ñ­ƒ9¾ãCNäEnä+wËÖíİR‰ K."bCfr6,çäæã I¾XIÎØèhÙ´å\.±‹ÅäGnægæ'î. Âÿ"W (°æØ+ rÎÕıíßJ^çØKK¢.pçbçMç’*y¾7rè ¢èkŞæRèèÑôç“.Mî²æknéiîéŸêt*ä²¼p
-%€Û"à¨îÿÚà$şİ0P¹ ~Pjx,ºpc‡ç‘î¸À>°®â" º@O¨!PeÀ8œ­è & " æªÎêé"i²®E–ˆ@ÓÉ`
-·é»ëX.  P+°O°& äÿ]í.°A7 €¼°2à>V+ĞíÒ>ÀÛ+¿ ÎÎÄ@ÔÀ\ùê¯ñM( ®ï®ş+ â`,õâÎ|¡á2ê÷kLc±§P Ûœ{p¹ğf¥ıòŞ>cÕĞ¬¤·ï²0÷@Çm!ç	íğ
-œåÙ£î3ÿ
-ÂP\¾)OËçó"ß!`àPò 
-0(PŒÍ í’á9ã%Ğ¨ó– >ÛïŞ  ÷àó, ·~ â¢ŒÖ°ãz!(@ëí6°Ú?P£ì0g€ñÏùïùy_É ŠÓŞİÊ-i`† °î ªì"Ê×mŞåñ™qÜ2˜ç…Ù
-< ã¿º	pÜ™Á÷úıx’ììO àÏZôº¿Úç G? bní›ïà	ë`
-e1õµyÛ²ğÍapãrT³BŞ ´áÖOrÎP­`)Üÿdi§LÄ‡	şbáB$F„Ñâ„	-nTèaÅ:uÓ„¡ƒ7Ç†Šn´øĞåË.xRGÌÇ—Zéóc`aC˜A6¨¤.Ù
-?:ú£qél¸ Ø¼2@›nåÚÕëW°aÅ%[ÖìY´iÕ®eÛÖí[¸qåÎİ
-Ã·vğ*¹ğ@â!ËŠ0îĞw¡‡6¬h(­à%±¡ƒF–-!zø×a0ç(;şG1âÄT".PjŸ£@'ô ACCŒ+?`HŒz¥ÊÒÀ#"FYøC…'ÒÀ…aĞÛeâÏ/yN¸F,y”„ğ­Qğ?ê¿SVõ´ÿÎ”½ı÷<X´Â6¦C·Br±TùrpÓ+¸Óã³Ó+³Ì:ê@ RöA$6BHH +
-:È/ïÚûg6 “Ãà
-ôlÁÌ4sa”uªYA^Ö‡÷ü0±Áú næÉBÒ‰'Ÿhp¶ò¦©g NÛ-:…SR¡§¢šê!¸*+¦èsL2Ë4óL4ÓTsM6ÛtÓ«1ÎY‡F\/Åõ:€¡iÊIgœXVà€„\(dt¸‘dqJÉšoÊY'œoÄQŠ
-ğl‰ë8Aki`„DÈ‚›rşáfƒş¡€‘o
-	Qÿhœh€Ö`&Rv(-g“F¸`‰\¾áÆšNpH"øøq±ÆúÒ”¢€x¥œrÎ™¦*ˆbšl$ápXQ6!p &rÆyeÎ"j`Š`¸=‡˜-àà:yAÀ€1Ğ!fŠ<Z#DÇ!†‡z5Û¨ªLÔÙ%˜Œº:pTÑI'˜,ğà&ÒùF¿ù¦—@ØÀš$§Re–HJ0OV6¸üòÀ@¾Åq-¤5ÆÉÅ>(AorQáZ\åhFœrzı&J
-°h u¦Aµˆ¤¾Õ¾q¿0 "xÓÅœLûÀk$y%œÿu¨‘#hM?Xœu ùÀÀå©óZÈHF—'À`"Í¸Â@r¬áá„„ğ‚tÔ!%™yüøP°9"Eg;|r¡pP1Ù#NÀ©$·˜(˜#p†À	<¬¥•qÖáfşq`b„Aj yğ`„q G*b€yÀ|s|òË7ÿ|ôÓW}öƒ"`ĞaÇĞÏøGo¬Yç&$Ì{€G;BÆ(G]€Ù¥ÄáŒ&P kÿ¸@r¶qCÌ0 ©¦ĞPŠéğC
-HĞ€WÀë’‚G.Šp\ƒWáÈ†8,ÑÁ
-æ"^ëÈ…–e‚7¨£ß@Ôÿ:ÒƒûáéyÄ€G¢¾V ãb‡üÒÑ«D$%&É{‡8ØÁÃôÅr°<:W,à_¬¸Ç"àvŒƒ¸àÁ(jø©wRÉÄ‰tüïkğH†à +âàFB¦Q
->R,Ë`,Dğ™ãë¸Ù7ˆ„¤ ï0#:6x†„t@‘‡8Ö±r´C0<¾áŒ¨ ë°„°–+gDŠ“5¤„Æ–u0Ã—)AÖÑn¸Cƒ¸š^0v”ƒëG)~°t@±xÇ8ØÁ­v Â˜…£:Ğ!ãó˜Ü4å€.LÃŒÓàƒ@¬ÿE¢­4 òPƒ
-²'0£•Iû;z‚ BìPG9Ş?,àWĞÇ4
-ğ!D¥¼ûÀš< ‰I– Ü9×1b’c¸3æ€3ìC>Áp %ª|/|Zi_QzT¤&U©KeêZ˜)¼ !ÓÔ~ĞŠy˜/(‚:0çğÄ
-|°Mq i3PÁ.ØQ	Ô (ÀZD }@ƒ.pÁDá€¸K–+ Á&ÖqK °ğƒøğud!S&¨L¡I``|IH	\`ƒ>Ì£‡  ¬¡W¼€Ó0¢ş‰' ú8˜T ‡ÿD0 O˜Æ;!ÓttAŒ¨aƒ0Á¢SˆÙ ‚QWa*XD`ìBğ‡"*€˜HBÃÁpğºbbé¨Ç0Ğ`ì €äĞÛ!		
-j`„>¡¡3`EjP\v4Â5`]Ğˆp C°A+øŠ
-|€(ˆD=Ğñ
-Ô 	v` ’qNP !êXìy-Ô …õ@D
-6k-ÄlÖÍ:‚¡ÚH„ğÎ#:ÀQO;dƒgp@8ÇéáFxÖi€€¦òib`FáÆ;Ö $+ƒ` Çş¾ÑŠ'à=î#ÔÂğ'Øÿí8Ø?N±x¨pØ&' ƒJì¨ Ä!5\àµSH…,Œ#MÀ ©P‰qÌ£"PC5ŞÑ‡ÌT6…áöa\/{Û³A÷Ò%ğ‰¯©³¦u­m}k\çZ-¹ "º6!(k A„^a ŸĞUXOÀ8Ó¬v¤õz‘L!e¬] °˜)8&5\v@ê‡0P¨®¹@(°‚f<‰Ã)À(ôˆ| Dâ¬ƒh}H*À#+8·DæZ¬Q€	àc’¾MÀq±öØ ƒ<¦Ñ ¸@R’ÃÆp½¸ d8WÎ½˜€Sÿ×i‡5´ÙÙ|ÈPóHFà€ôª÷èÆl
-è®`%è’
-È°PüCÁÙ ¦0œûŸĞ„n­è¢»PÃÂğŠw£	Ø°$tÚ€sƒÀ &@ƒÅ ‚F¬#*x±•=0 Sì£Ğwpr¼ƒX«=PG:”„ƒX€2æax" ¾ph8cqa´c *``şñxœ£]ŠÕ_€À0C0¾aáB¹H’ÑFĞ+"HÆ>ÖĞ Du-@%ô‘Œ:!• •!a Šwäâ 5 E;r!K‘XÁ,]‰rˆƒooÿ…„À€3„ƒÔ3tª{úS©5ÖDÕuıíüç_ÿlºˆ3Hò
-¬Y€DĞåI@@»È #è( ¸h3ĞvH„Ğ ¹˜eH‡BX'Óx"˜q¸•„à†vè‚@¡uH­0 g·àh{ó!€ò Ø#­°yp6(•tŠÓËxnXÂÑäq —0|°´s/B‡s8u`|è@€DH‡d áˆbã¶—:†0hÒ¸€,ĞJPØºKòà¡›8€F%# €nøšÒ	»Ò +P†r´Ùˆ
-Ø@à‹ÿ( a˜wJ9™Â4` °€HĞV€ßè 8‡ršqƒø€ºJ¸,|û¿3pâyB ‡vƒX kĞ( €€\˜J0à (?C8 €J"àHtğ„v  †w˜ƒXD	Áx‚«PPX Ú‹h‚tø XÄ„¨2`€8€Ø‡0 J¨‡uÈB-Ä‡q  /¨h( øšzêxX‚Ëø>uàP*€¼kÈ•l˜†)¨ ö÷[5îÁWó¬ ¿ı;I”LI•\I•ŒDb`vh…ğF<ÁÁ5p¼&ú…ÿà€hÀixÀRi“Àjk›t€+°q˜ƒyÛÁoh2@kh80”ğ  }˜ÁR¨A{êˆÜA€ƒg#•B„»°q2€Š8äÈ†0¨€œÂ(”sjC@„F@C @ N@±» –°X¨‡o€†y…˜3Øax‡y(‡ihÇ`€X pBG(X¸‰(„t8Pä[z…>x…z†BğùPÄÌhDş€Äİ›ÄV(ÂlIƒØ 0H Sø(Ìğ€ëhA0¢îSÅU¤È{£GÌø;eºpê[ÿl Àlªƒ_ä†zÆyd…yXÆf¼‡B€Æ¿°‘„x¥x±Ñƒ‡‘F¸œÚ…m¢¹0 ,6#
-è…u x±š‡.€ ‘L£Ø„}†>8NIà"Ø 
-‚l‡1¨¥o¸…¨ ÉH-Î€ÈV?<~@„‹¤)›âHS†ô)-!ï¹
-20I–,R#=R$MÒò!¨ƒphvøí¼–TR`‚E‡BĞ¨'Ğiğ¡x‚ì‹	¬¶ >Â“
-‚a@CX€á87qÊpˆøvÀ@¡v„ğJ°K AD°AÜy-€»Åoÿ3¸,B–ˆj‡Á›İø‡&\¿4y ÂBi‡wZ¾â« Øƒp€(¸•÷QEëh…{ˆ„1ÀI€S5Ø$ør¼ìÁ€Wà…`0ƒ«ŠYaèÃ¨„vĞ €FØ^‚°Nø`ÈÍZì“08MFt+@Ğ½İã~@(UÛ:U0I˜‡S(İp‚yø†òÈ…:¤Rî|EQÊ²\Ïw‡ui p€ €}‚[1F}¸Àê€À@€Óüô¼¨Ii‡5À ‡z ÑÀ“@ #jyhA/ØX’ü„t@Ø\¥ˆdÿÀà…z¸GKà‡QX€ã«@	¯wàPX‡VØ€Œ `Y'Èˆ„¸4uˆ ğÃ¼³QôkXCèƒ}ğHUó©í1‚ Ùğq•RR·}[¸[¹%‹á†u 1ƒZÅX€à[Ø…v8¶üA#Ğ¨W`	¬€Ã”x šLŠ…}È…b «Ú!€=5!\âS?Ô°|J TCMX€°ƒE È€Tux…Â‹KM¡ Ø…}à„ ÍÀØÔ¾\PuÀÙƒ‹d€˜º¢ "€†z8`€é£ ˜½C}°æA°ŞÿH :Ó"ğ‡-d„Ğ dı#K¼‚ €Rà‡Mh€ ~   #p†yØÖˆè KI€paÄVXKZ è‹È…z`…8¿|ûSh×w×¿À @Ár@‡ÈW<Iˆ}õN ¹ )h†oŞ °Käƒp øyHHx 8  ~ ¼`Æš¯Ì)á@°FB€:BPŠàc€‡y°†>ğ	™u	0eíFÍ ËFø à³ÔA6FĞ‡`(>€
-øÓTb6m2¼sK…u X3«ÅZ­İ‹Ä§jH‡>  Ğ:-[ÿˆ6M,q€¥-€ã.[LÎdMŞäü³«XŸiğL8&€bˆ„9`IË­ÁãxP†>–i4½€>8tÈ…Nàƒ0ª+€ƒu@^øƒBàÚ`N E)„i`b(>å„?ıÊÑÄ²,Ô³¼€!ˆCØièƒÄ¤ è„y ‡Wh–!Â	Z€F0£VàCp†R(€ˆãËNıT“iyøS€g%YTÍ…wø†Q˜Npùì@„ÀWĞ)h€ gà„9 ÈB§ı‡À€äI8Ó()OÈ´d(„Qwğƒ0€EØn >p=w †ÿySØgR7XNéƒŠÊO˜à€	°‚2â…BàRà†ûìx×èt	0wP­+9áß'ÈGhxI`q¶„z•„BH†w †  9Ht >à…wàCr²ì‚F‰)á¸‚{H‡V0|ğ\¢Ò2p]0ƒ"pÇÍœ ¨
-ÅC‚0ÑaEøP0eø‡wP aÀ‡d0> eˆïÜ °wH”Xø†{ˆ—øã¬¥HAF€èXè¨Q§w@µ018ØgV/ˆ™TbDáSPÎâdènéî£2HcÒ¸…#†}øxÿ`‡W ³xnĞù9ou4õ^‡y‡t°	¢RPßAou¨gPà…ïF‡}˜#8Õ(?PøÓ˜~pÒ-€WàN8 {ò Xãvx}˜‡/ h…z˜‡yà…ƒ£ªÑ€ „v¨‡MúX€
-˜‚p8‡1èT~“à„øN‡ı"@‰€n“‡®Ñşs•8^›}ˆ…Ø?'v€c°Şi€vĞ‡Ş].©Q€‡pø"y¨N0  $ ğwÈ&š9n•&FŸ†)õa€o³ÈÜ 48ot(‡yà‡H Ç@Oÿà‡WÎ…0DÈ Ğj!¹¼J âÎ»nØ‡z8@€ à æîe‚eú O‡&Ú‡tPèq2WDX€êjÏJÀáu VÀ*#èu
-8½­D(›Vyxg/â‡Øòîl‚ÅYGà‡yx…Ö¦?Xix A€P¨‡\Ñ¸<QÈ·Àƒ»¥Dkà‡f¨S,Ád¨‡z‡P¸$…@!x¨jœ nƒ?x„Ox29iøRP(ÎËŒªF‚7 „Nƒ)‚š`‚7ï‚/p5N‚/ 2ø‚¶ NQ+XKè„7ÿ`‚ÿ !0Fè„.¨ÈL&H"@™±‚4èe3l‚4 x•@!82ø‡.Py2°‚ÔÓ¬©Ï>02á•b•¸€˜;è„Jx  §ğ/øÓªN/”£í; …J0.p‘¬ !ğ‚= …D0¶G 'xz?/!(ƒE ;ø‚!P´Iù.ºJ%"è/˜‚EX„2˜ÈŒ!°ƒMH(€‚¨ÏÓH(˜ú•g(‚,Pù.¨‚‹…Æÿÿø‡œo‚‚_ˆİw8‡-ùdC¶9~ÌêzİO‰ª6ıà!è2XN (€{LÿÂ/èƒP€ƒ)pû 4ø&˜xÍ8è@Ø2Uôz¡¹ pÕØ ø q€€SâÁ‚ÿ.ùW)Q/d~pøçE“3‰Jùù‚dCA8È|â 
-Üğ­Ia`!]˜¸ğ°É›;Ô ³hÑ”*dªp4ˆÂ	™.dš 0ØÒ((1WB*u*ÕªV¯bÍªu+×®^¿‚+v,Ù²fÏ¢M«v-Û¶ÿ>4	–,—vÚÍ›— 
-V¼Àğo‰Ğ(é ÂJ<xà  ^‚{~ø‡áE`Æ74pñ¢Á…Ì!.ü¯‚ƒ…í¢ØÀ€°j‚&ÿÎÍ„
-;ˆàÅN×‹‘z+uğÆ
-¿…=d¨àÁ®‡Åµ;4ø€cÅá‘/8AcÅÁ/<úü$ü®€ñÁÁÕy#§¯=ØA+TP€}¾ ‚·]0eïñ×€gÿäZn”yğ@/Ğ€Aô‡P+í$Ó ÕPÊ+¤¬Ø")±Àñ
-à}¸ 	}MÖše·và]F¤·}ğãAxeÈ­¤Âhÿ€`ßqF.YYU%0!1+˜UP.ô×šj\&¸lXC€C]´ÁŒÛlq@.ĞG_T·Vã`aRà[‹ÿ2Ú¨£B©¤“RZ©¥—’5L¡TJ*Õ¢P‰J¨YÖTªRyÕ©V}0C:Âğ’L;òXa^­®äAªrå+°Qù:ª©y«ß”¼Ä±|•:³Vİ­Uàğ
-1ğ¬C†yÑ>õ[®>üÈÒƒ¡QMËÒ°PùÊ–§6šUÃNœ`ÕtVvd­UöVÖ¯˜\°Á#œ°Â3Üp¥~]àğÂ¸@L8ëŒ3ŒĞ)±¯.ë±TüÀË8ÆÔáÁ‰o¹ †u¼suLñ”È”VWš«üz•óÍ?´ĞC]´ÑG#
-L¤qFLLğ¬ÇS²Ë³Ğ*ÿ@ÑEÎä0ğµØ, Ví†5ÂIW‰6ÛoÃ·ÜsÓ]·È(T°ÀIqå¶ÁLV	°yÁH½•Õd-¾øÇUÏ{UuDìÁá‹âøÀ³œÀ±çC~WÈd¡àÀßXU@9„ ~°zGn·í·ã»î»ó^PWìQDP!hvâmïê·£Ë*xAj Ç"D:Ÿí¼XT3Î=V¸à…F`P‚ht°òãg9`€\¡`½r•1¿³›—Y4‚"_L+(ˆ‚¤P—Ù¬`w BïèÀB0‚L‹ö r P¤C ˆp`9¸ÿà}R\×ÒÔ-à]É#¡÷7
-Xc4ğÎ  ˆ*”àx)áWZ–Ña¥@è…58A(€cP¿¢2kÓÊ†à2 `_Ìk•	 ø­ÈòHÇ:Dá Ä¯°†)RĞƒi€"œ ëhÇ;â1mÑKB9µıc ¯àÇ"@laÄ>5: ¤Ôª$1#„> b+ Ì
-½Iµ©êX‡Fòp"X
-¹ÅyUòXURÛkj§<”SÜÕJ6`n´#8Ã<Ğ•ñ1€t¡Wbµqp!Wğ WØ€6ÿ¯ìÚ
-r!0ğ*–AÁÁ}¼â*\¦A(ÖxCOXG=l0‚Úé1ŸúÜ'?ûÉ;»t€è>´Ô  ¦ØG"P‚
-€éPp ğm›$(A:&”Àò€@1Jf  ',0ƒn¨crÈ¢”¶È—¼t£BAt”@)äQ	`kÛ²w€|uq€jNx × 6ÿHa^ ÓöÔ’#´\HÚ\r¯ŠÒXG+Px”ƒÈtBŸê’>• "ÅgA²X 4Cd(Àéø:U ô!˜+°¨ê,S¯vä pÿÆ:ÆğÓyÇªSq bçñ
-hQ"N¨NY–ŒuCçG)ëÏ×Â6¶²íÁH°9"’@„V†˜9p‚aÈÅ<Ú /HâåÈ(Ñˆ1@À¯$V †Fdâˆ(B”(6†FH¢’@˜À÷İ-4`XÁw¯@˜˜ ÿÄ?È !- ê˜5zĞ ÑiTEàƒ$8!	;ˆ`T” ï?Ê‘9V …8m0$	@0òcSú@	†À‡Hp"spAb>T‚¾†˜h=À@øÁxá%ı`“ù¡âıƒP‚Zú0*¨ú`O„Av‚ÿ¢´E_Nƒ­ \	¡ûñ –„`àï"ÂÀÿ ï«BDBÙ@+Q‰:˜@}RqÀuycx¢…˜n„&€X|àA$ò‚[ƒ­óİƒ
-mC8a(•ír Dx´yá°‡A,bdÆÿ@­jY;Ú¢:Õª^5«ÏRRd£ğĞÇ>ö¨`ê 57²áB€û`Ç:ØÁy¨Ãî+ 
-nÌCõà bB+(cäÚ‡8ñ‚
-  ü0Å Fp'X#k¨@>pŠuğƒÖÓ°,„ÖÛvÔ£.Àêtÿá 'c×ğØ8˜ ÿ¬&ü£\£ª yÛØóZ:İ
-Açø‡<ş‘¼|hÇ>ä±}‹x8àŒÀ ‹h‡0pXçÚ<XÑ„ô›*`0ë±eŒƒûèD	ø½,_f»æ>4s"| 
-¯p‡>L®(üƒS˜†>êAëox{]9@ôvğh†
-ä•äBÿÇ<Ò‘ˆ§n`
-Î0»>Úq
-üªn¸Ü§“ŒAe×Ç?¦a‡âòÒ™Öbšğz˜|NP•¦1gÈÓü°kZíú×Ã>öªAØR ‚½Hƒ
-H:‡qÿ¤ÃhÆ<ØÑĞ
-x±(7JQ‰E¤¡Ó½‘FIŠDT¢oPÁ@†XÀ‚‰xE:ÂQ‡Öå¬¬@ô1¨ŠúGañn¼ÀÉxƒ8à¡0ÔÇôM„!ğÃ44#œÂ+ADüÃ+ÈÃ4üC'ÄÇy@ Â"$;C',„hóx€øÁ>@ƒø‰,w ‚0ˆÂ"üƒ0ÈC0àÀÀ0ìääÂ>8ÂT€ğÂ>C%DB2Èƒ)hrhHnäÆ4À$)4ƒ>$C+ˆƒ3LÁÙXÂ)èÁ4)œ¼ğ=(C(0B'€ƒ€ÿäÂ+0Â?ÄB:ˆƒ0ÀFMÅĞ 't7 C,D‚%è{TÀ%ğB;P(,„R ´Â>0#€8´(0@¬l'ÀT+"£†ü‚),B#ä;üƒ,ˆæ}Ö¾„  ğƒ4 Šk¨@"œÂ ˜ œ‚)ÔÀ¾ÈŞ0c1ã€ ƒ8`ÀoÀßHÀ9‚ €@[CáM \8$ƒ€˜ÔtuÀü”  ˜ hIAÀÁ.ìC&À\ÒõÁÔ@$Èƒ. Á8¨)ˆÀ
-Á7Èü	”€ ´:HİHßtm B=Äÿ À ¸€•á€:üCÄ:ô (¼ƒ$ Õõ ót ˆÂ<ì‚F yÀFĞ@ `À
-„A8¼Ã`@4B:$C0@ØŠ %Èƒ5ÔAˆ@!Ì3ğÀ2ÉxÁdåVnüCp5ÀÀ(Ü`pÜaÚÔe@nÀ À]xÀœÃ:„€ dy@ğ€;¦€ğÂ?DÂlT	0ØJ`@€$C9d]"€ßp°Õb­
-ì_;pÃ@øA=HÃ[Ò`]Bf‘¸Øt¦<Aƒ>¬Å‘€+jšcØ@)ÔC.Ğ¤0Æ @R©S@‘ÜÒÿ1gqçq*¸¬Ã;pÂŒ`?t€
-äB=RaÓ84ôÙôQG¤<x‚sŠ€••ÀApB+ä5Ôƒ' äš>´B @5„ƒXY1åB€¶Â8ÈC)¨@„A3´C=Bï1Õ˜üC!ìƒ5ğ<’€œıüÃÆ¹	˜<ttÀ…²€ÀìC6ô\hŒ˜Â.ü:ÀPb5Èƒ€$¨/Ø\dÂ„¶Â.´1°8ØZ†
-Œ3(Ã4C”ƒ"Xƒ2ØÀ(èC @.¤nSKRID‚:0+e•HıÃÿz¶§şCkJ‚œ€èÊ} (Ã9œ“ù5‚:ĞÅLØÁ>ƒ@0ASšÀ¨×
-8: A
-è
-@Ì(äB+|C=À“Ê&,‚ÀfC…¶¨qLr²j«ºê«RÊT )Hƒ>Ì'ˆ	 1ÔÃ  
- )0”!‘€œw‚gıPMx‚|îÃ8ˆ…İÏeÃ1|*}’€¼A=A=(t	:LÃ4P5$C2PÂÂF äB9ÌÃ0,ÁR‘im< C8ğƒ<$ƒèŠ±Ì5}h'ĞÀŒ%¡²PÀ˜L¿2Ã¸+
-¬A:èÃ9XCÿ3,gÈ á,ÀB¢ (èÃ7LC5¤k2ğÂPUı €XCÌr4Èì4 Á€ƒ3Ø (ÔÃ|i:Ô¢¦euÀ+¬C,Ì‘P@Ïƒ2ˆC=ÌiÎê)Ÿú©kÀ*]@@¡ê?ÔÂ ¼‡0_`@¤Ã: Áq5ìÃ:pC3”Ã?„j^¸b¢ Á¾–œ3ØA£­*¬náîá†Å ¤)C9,İtÀ ƒ>ŒAK-À+èCCAˆ±C2€'-1	r À ”Á)ğB:ğ(à RÅ>('E+ğƒ'¼eXA2ˆ"‚<´B^Ä•BÿHÌI^t œÖ<„Â(Š÷” ˜@"Ä‚2È:Œü<|C™AÁÂ'ÀÀäË½’ié|  Ä‚3À;¬•‘Q.üÁ\Á8ÌƒÂ8ÃœÖ@Œì>˜¯HA8è+Í€QüC4Å?@7,@+¨ƒDæĞ:OŒÂ:è‚ˆŞ“¢—2XÁrBtÌ§ä©2¨CŸŞ@!¬C.ğ@#©¡ò/@I@:pÈz9ƒ:´íeÃ¼2‚0A2ìÃİZš!àÃgKé€  ä‚3ÈÃ:œA’â’q›ñá>Æ ÿÂ:XC½@0ìÌğj!mîˆ4|\ ®jc)1P@è?ÌA €Ã>Ğ.Ö¥€!Ğƒº~ƒPA¼ƒ8¬€Ø@€ ”B:ÈÃ1A&'aG\  §([Å<Œ\@¨ı°q;˜Ì†ª¾™°ò øÀiå‚Düƒ*b€]ÖA9¼ÈñV0”Ã.dØx‚ 7€„´Û½‡°ÉağG87 é,Ïú,˜í˜ÖDÈ:€ƒ@ z À@€0ğƒ@#7­$ÀCE«Ã'YÅÖ‚:ƒÄŒ!€èC0¨ ›|Aÿ=XÃ DÉz­-T@ĞÆ?pƒ>Á @ÀíkâÒP&/à€R0çséÛôMãt1‚@„ÁH:XƒÍ )¼ƒ0\€B9Àƒ"­xÁ1¨Ã(´Ö+qÌôôOó1Á 2?d‚(u9ÌgøÑŒÁú®ƒ34Àt Ë;ÄÂ „ €š] Ò7¼İ`Õƒò…L0\p´BìTÃ?p‚<A2 ÃJ0ÀPZÃTµˆ1
-v<a·;ôÂ?¨
-±]AUCö< Á}€.ØŞ<ğAÔÀÈÁ8ˆC!<¬7‹çÚˆ]ÿœX°>àÄÂ9p0;·3€> BgGè UµJÂüÃ(˜µ?‹öêAĞ\iû@ç\È8ˆƒ!TõÌpC:€n“Â<ÃP‡È‚^][êpCÏ2ô. ¨Ò´^8Âp€`Ag_A*æğö«äô„Sx…ûÓl‚>dC­[%@î<ÎYC2Œ<ÔC#í™y‚<¼Ã78C#0)ó|ÀTÂ=ˆ‡·'à   %”ƒ<(C3ŒÃ:ì( 5	T@ˆëİ+üÕ]<ÁIpƒ.0Ã;èC ¦0Ã±™B6	÷\À4í?ğ´Q ÆÈkÿ0P:|q$h1Yƒ0ğÙt] µîÃ4ì‚5Ì7¬Á¹@0¼Í­÷±i„ €Dí9”Z†`#°ƒ;¨,7ìÃ0­xN‰oOÁ70CmŞ ôÂ:¬³NPB6¸ß˜ïÃP€lBİ*ƒ2„;Ì#Ùv€v´
-¨:Ìƒ8LÃ+<êU\€—fƒ, ¨  1Pƒ>Xƒ 	ˆÀÈk8LC,#´Â:À“5Œƒ¬Ëlz DB=¼C:ğ‚,Àƒûåù<XCgFM[x½Ûû½Ó‘ıƒ3€‚p¦Â/€8Ä/0Ã’æ,,830ƒ(lĞÿ6y@YÃ?œÂÔÇu†Æ¿Â+LÃ ,@	›€ˆùL$A| Ãbçl/¨@ÌG$¬Ö7Áu9¿`Ë"Lƒ5$‘.øÁ[„‚3$‘)8ƒ0Ì€AÀğ‚3Lƒ3|ÁDøFÍ@"(ƒ5˜ì/a»W80'3|„àÄ+hüD»Ÿ4ÂÏƒC58Ã"È7rSßöÂ+°@"LÃ@(CÄ¸'Q$Â0 ½5ClÀu‚ÂØ[CÈOƒlä€€(ÃÃ÷îÀáÃOÃ´ÔàÀ&P80şĞ»Ga| lÂ0@ü0£Ì@,Œ}5pê4|ÿjäEXA,0Ã4ôÂ0 ø<ĞOÃ/ ‚ï¦%¾CôKÿíT@ÀÀÀ€psA”€À A@=&l¬º;€Ä˜òõÛ€ö·DÀLÁ
-@oª¿›8ÀøW€¥‰ÿ@Pø·bË@üû€ÁZºrjT| qqà¿‹3şó€ A‘)"ş10qñÃ®ˆ0°ĞbÆ^(pÅÀ;1z`€`ÈÈ<üGÁ@‘' ÿğ‘ÄÇ4ptÒG—LòäÙÑë@ Á` „
-P@áu'T¸è±…‚?x1eE”èx,	•ÿĞ÷ë¿^2nb !|2cÊºM|ØÁîÍM7ä|\iã%>üê²°Ü°ˆy÷öıxpáÃ‰7~yråË™7wşztéÓ©W·~{víÛ­_ìpƒQÄ6ôk^üáïzïğû<Ø§å3zh’ˆÒï{Øp¡¨Ä.„ø„3 (xŠ71B,²ñ(àï0«{°B‘s1÷4n®Ç ‹ †ó>Ş,ìè» ûAÓãÆm¼ÇuÜ‘Ç}üÈ …$n£”†dÎH@€¨èFü°º” L¬·$Ì2D0¹)¯üÌ0Åÿ“Ì2Í<Í4Õ\ËÙn„z‹sL7E|’G/ß,SÏÇöüĞ@”ĞBMÎƒ±³³?ELÔöNŒÔÑÅë:µÄ3GMƒ³
-SCí‘Ë;=ÕTU]•ÕV¥ƒáLlÓÀS’±T€a
-ŸKéƒY•“†ba0AØf€ÁT¨Ô·¹ÓsÆ«µtTK–ÑíVÔ-Ûâ¶WÓn]=İtÕ]—İ QÆLüÖÉİDô`\Ğ 1Ş f¤û }ù]„œYxEÀ”iœ©f±5·:z±½Pcø0†PZKõ”9’É-×ŞvU^™å–]ÿ”ÎÃb>ÎÚ9Ç…ğLn.Ä@@€~ì@ £8H„S!:xá2š¹8"Àgy¼À€é:pA˜qÎÑ§+=ù9(Sştm¶Ã½sgmÛ¦Uíq9¶ûâøĞ~™ï¾ışp©hpâèDaqäıx¹/B ‘q¦™¢¢G8z¥»vn>Æ±†¦–ó8–L-08ŒH©³¹İ›çjçokß†»cİŸ®í¸»ıd‰ùä•_şoH:LJ@0¡#¬—µëµ‘ Ã2Z'œ,’^{ë‡s$YÏÛòN„Ù‡D_„ Ù‡”¥«4ÿ-'â2Y;	Ár±D,è)xŞA:’¤ ÁB®BfÀã
-ÁjŸ)`w‚ñˆS›ÚR­Fø;Ş­ÏqY:azÜ¤BöÍ„ û
-§\*z•Ğ†Ò›§Ç<şˆA4”¸Ñ€bÖ¨ÂHĞôÂ›È:à17€‰ ‡:Ú±f¬añ€‘vŒ£è(GÎ¢â‚_˜qÂÂ^~S)ğâ‹(P\pH¨!ã¸BÿQ&üíÆ.ê‘?¦‘€àXÇ?À±‰
-| i‡06²-¾bØÈŞÀqœA Ã4zQŠtüc”ÚˆĞÿ‹jx<;‡3`¢‚\pÜ‰L¡Dœ@g D[QÈL¼±OZÎŒP¥‰©)2xê#Ü|7Â6ó†Ââ8ÉYNs	¸Â8ÜÁ-®£^h 	8°^´£‰G;,! &àÆ8àÁ9Äs€Ç?¬1uü#|A€4à	*:ƒ	ñMœ y¨ã™€Ô÷M€  ¼Ğ#VÀP ¼Ç8¸‘u¼ƒùGşÑt€ƒé(Q\0ÉÈÓ‡µ´b’pH°€:q’ãø7ÜĞ 
-,aß80Ğƒ€R @rjÀ3èbÿÖ£‰êIÁåL“z†ÕÔ+†ìµWeÒî¯Ùk	ë*Ár„‡=<çbÛXÇB§ ÉXG.lĞ€]¬ƒò¤ç
-<94@Sè‚pğ†,XÏ¤˜‡0¼öƒ-vâ0 DWğÀ¤FÀ€±;t ZÁ  Õtã(
-4I@)X£a Êå(Ñi„Á |(‡<rš(L£­8æŒQëH<Pq°£:#Á ^40 #røÆ<^!‚'ƒ¦0ÀW§qJ²šõh%Á@°VxLá¨<y+"äjMŞU›~,3éúBŞ‰0…âÄkŞŒrØîÿƒÕÈ‡å¶»Ç¾Æ1~lƒÅ!øRÀÜpÇ0‚z>ÍHI	ŞR‚¯`rğÄ<”¡Óyˆƒ0Wƒpã£Æx¼b)’Q
-T`X ƒå°Æ(ÀÜ§â£8 ONÁH, ¦±ĞGş0†zpƒhPCÄ‘5` |h3D€J #8¥b
-ğ
-y˜¢¸ˆU¿‘>`†ØG.@$„u¬àÁYÓÚàz!X6Å?(¼Üka3Å%¶ëŠOˆëjr³›(Îaİvá¼êĞÄÆNö\fØâ[ËÚÑ–v9wô€¤˜Fêz\OaÔãÓãÿ3JÀ‘s¬³ÌĞéV ½¢ƒ*ù;Ğ­.ÖƒP˜ ˆ€…°
+ËÁÃPĞ6îá  p”Ô€q+¹íìV˜P ‚Ğò—Ó0ÿp Ïá°pÿó@»p-6''93˜0»@°àĞÂÀß Â >?c ó cĞ/‘(ğğKEàh¶!QÖxmã`	T!»`Íd€ß n…›á"à®ïz¥øˆA™Åÿ¢@móM ;ÓÀ ¨£F`óPÖÀ|á0Ô‚ pÀ*á* ê ÁpNá°(¡.îP `ú€Çâ ¿)ÄÀÎîÑd ºĞZú00â¡
