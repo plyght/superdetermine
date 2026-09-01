@@ -1,4 +1,208 @@
-.red;
+\"{s}\",\"hollow\":{s}", .{
+            v.discrimination.label(), if (v.isHollow()) "true" else "false",
+        });
+        try w.print(",\"status\":\"{s}\",\"outcome\":\"{s}\"}}\n", .{
+            @tagName(grade.statusOf(v)), v.outcome.label(),
+        });
+        return (grade.Report{ .status = grade.statusOf(v), .v = v, .tier = tier, .ran = 1 }).exitCode();
+    }
+
+    const colour: ui.Color = if (v.result == .green) .green else .red;
+    try w.print("{s}{s}{s} {s}{s}{s} in {s}\n", .{
+        ui.on(colour), if (v.result == .green) ui.check else ui.cross, ui.off(),
+        ui.on(.bold),  shown,                                          ui.off(),
+        git_repo,
+    });
+    try warrant.render(w, change_hex, v);
+    if (v.result == .red) {
+        try w.print("  exit {d} after {d}ms\n", .{ v.exit_code, v.duration_ms });
+    }
+    if (v.isHollow()) {
+        try ui.hint(w, "green, but the warrant says this green proves little");
+    } else if (v.independence == .unknown and v.discrimination == .unknown) {
+        try ui.hint(w, "no attribution for these commits, so the warrant is unknown rather than clean");
+    }
+    return (grade.Report{ .status = grade.statusOf(v), .v = v, .tier = tier, .ran = 1 }).exitCode();
+}
+
+// Resolve a revision to the full git sha the remote knows it by. `lookupGitRef`
+// answers in sdt ids and `branchTipHex` only takes a branch name, so the git
+// side of the question is asked of git.
+fn gitShaOf(alloc: std.mem.Allocator, repo_path: []const u8, spec: []const u8) !?[]u8 {
+    const peeled = try std.fmt.allocPrint(alloc, "{s}^{{commit}}", .{spec});
+    defer alloc.free(peeled);
+    const out = proc.capture(
+        alloc,
+        &.{ "git", "-C", repo_path, "rev-parse", "--verify", "--quiet", peeled },
+        "",
+    ) catch return null;
+    defer out.deinit(alloc);
+    if (!out.ok()) return null;
+    const sha = std.mem.trim(u8, out.stdout, " \t\r\n");
+    if (!attest.isFullSha(sha)) return null;
+    return try alloc.dupe(u8, sha);
+}
+
+/// Tell a git host what this tree's warrant says. The status is a label, not a
+/// gate: whoever configures branch protection decides what to do with it, and
+/// a hollow green posts as a success that says out loud that it is hollow.
+/// Nothing here runs unless the user typed `sdt attest`.
+fn cmdAttest(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !u8 {
+    var s = (try openRepo(io, alloc, w)) orelse return 0;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const repo_abs = try work.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(repo_abs);
+
+    var git_ref: []const u8 = "HEAD";
+    var remote_name: []const u8 = "origin";
+    var tier: verdict.Tier = .full;
+    var dry_run = false;
+    var as_json = false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--dry-run")) {
+            dry_run = true;
+        } else if (eq(a, "--json")) {
+            as_json = true;
+        } else if (eq(a, "--fast")) {
+            tier = .fast;
+        } else if (eq(a, "--full")) {
+            tier = .full;
+        } else if (eq(a, "--remote")) {
+            i += 1;
+            if (i < rest.len) remote_name = rest[i];
+        } else if (a.len != 0 and a[0] != '-') {
+            git_ref = a;
+        }
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    if (!set.has(tier)) {
+        try w.print("{s}{s}{s} no {s} check configured, so there is nothing to attest to\n", .{
+            ui.on(.red), ui.cross, ui.off(), tier.label(),
+        });
+        try ui.hint(w, "set one with `sdt config check \"zig build test\"`");
+        return grade.exit_no_check;
+    }
+
+    const sha = (try gitShaOf(alloc, repo_abs, git_ref)) orelse {
+        try w.print("{s}{s}{s} could not resolve {s}{s}{s} to a git commit here\n", .{
+            ui.on(.red),  ui.cross, ui.off(),
+            ui.on(.bold), git_ref,  ui.off(),
+        });
+        try ui.hint(w, "a status attaches to a git sha, so the change has to exist in .git first");
+        return grade.exit_ungraded;
+    };
+    defer alloc.free(sha);
+
+    const remote_url = (try resolveRemote(io, alloc, &s, remote_name)) orelse {
+        try w.print("unknown remote '{s}'. pass `--remote <name>`, or set it in git\n", .{remote_name});
+        return grade.exit_ungraded;
+    };
+    defer alloc.free(remote_url);
+
+    const target = (try attest.targetFromRemote(alloc, remote_url)) orelse {
+        try w.print("{s}{s}{s} remote '{s}' is not a hosted repository, so there is nowhere to post\n", .{
+            ui.on(.red), ui.cross, ui.off(), remote_name,
+        });
+        return grade.exit_ungraded;
+    };
+    defer target.deinit(alloc);
+
+    const change_oid = git.importRefChange(&s, repo_abs, git_ref) catch |e| {
+        try w.print("{s}{s}{s} could not read {s}{s}{s} out of git: {s}\n", .{
+            ui.on(.red),   ui.cross, ui.off(),
+            ui.on(.bold),  git_ref,  ui.off(),
+            @errorName(e),
+        });
+        return grade.exit_ungraded;
+    };
+
+    const change = try s.readChange(change_oid);
+    defer object.freeChange(alloc, change);
+
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+    const cached = ix.best(
+        change.tree,
+        verdict.commandHash(set.command(.fast)),
+        verdict.commandHash(set.command(.full)),
+    );
+
+    const v = cached orelse blk: {
+        const rules = warrant.pathRules(&s, alloc);
+        defer rules.deinit(alloc);
+        const ctx = gradeContext(alloc, &s, work, set, rules);
+        break :blk try grade.gradeChange(ctx, change_oid, tier);
+    };
+
+    var desc_buf: [attest.max_description]u8 = undefined;
+    const description = attest.describe(&desc_buf, v);
+    var ctx_buf: [32]u8 = undefined;
+    const context = attest.contextFor(&ctx_buf, v.tier);
+    const state = attest.stateFor(v);
+
+    const url = attest.statusUrl(alloc, target, sha) catch {
+        try w.print("{s}{s}{s} {s} is not a full git sha\n", .{ ui.on(.red), ui.cross, ui.off(), sha });
+        return grade.exit_ungraded;
+    };
+    defer alloc.free(url);
+
+    const exit_result: u8 = if (v.result == .green) grade.exit_green else grade.exit_red;
+
+    if (dry_run) {
+        if (as_json) {
+            try attestJson(w, url, context, state, description, v, null);
+        } else {
+            try w.print("{s}would POST{s} {s}\n", .{ ui.on(.dim), ui.off(), url });
+            try w.print("  {s}{s}{s}  {s}  {s}\n", .{
+                ui.on(.cyan), context, ui.off(), state.label(), description,
+            });
+        }
+        return exit_result;
+    }
+
+    const tok = attest.envToken() orelse {
+        try w.print("{s}{s}{s} no token, so nothing was sent\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "set SDT_GITHUB_TOKEN (or GITHUB_TOKEN) to a token with `repo:status`; `--dry-run` shows what would go");
+        return attest.exit_no_token;
+    };
+    const token = std.mem.span(tok);
+    if (token.len == 0) {
+        try w.print("{s}{s}{s} the token in the environment is empty, so nothing was sent\n", .{
+            ui.on(.red), ui.cross, ui.off(),
+        });
+        return attest.exit_no_token;
+    }
+
+    const body = try attest.buildBody(alloc, state, context, description);
+    defer alloc.free(body);
+
+    const code = attest.post(alloc, url, token, body) catch |e| {
+        try w.print("{s}{s}{s} could not reach {s}: {s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), target.api_base, @errorName(e),
+        });
+        return attest.exit_network;
+    };
+    if (code < 200 or code >= 300) {
+        try w.print("{s}{s}{s} {s} refused the status (HTTP {d})\n", .{
+            ui.on(.red), ui.cross, ui.off(), target.api_base, code,
+        });
+        try ui.hint(w, "the token needs `repo:status` here, and the commit has to be pushed already");
+        return attest.exit_network;
+    }
+
+    if (as_json) {
+        try attestJson(w, url, context, state, description, v, code);
+        return exit_result;
+    }
+
+    const colour: ui.Color = if (v.result == .green) .green else .red;
     try w.print("{s}{s}{s} {s}{s}{s} on {s}{s}{s}\n", .{
         ui.on(colour), if (v.result == .green) ui.check else ui.cross, ui.off(),
         ui.on(.cyan),  context,                                        ui.off(),
@@ -106317,57 +106521,4 @@ R€ÿP€¦qˆDı5¬ œÃ9´‰Aİ¤ƒ5ø@HIá8€Ø@$ì©'p˜n} äBòÈC,ûm‘áŞìŞa€ïƒ'ğc(„
 pğl8xÊ7@8£¦1@HMœ¥kÍ€ÀÁĞˆË8@±ª5Ì/Áqî?ğ«ÿ0«õÅ
 äKAde8 %¼B.œÁÁ ¹´Âğ€E2Ç€ „åÃ"¼á?ØædÁ|ƒ<¼ÂAx‰@ÅÒÀ
 ŒLÊƒ"D&Y€7pN’EM¬C,°İÁbîƒ €öÅBRr‘”4ƒ0 À¦TPÀÜC6„ÁØ€ÈCÀa%Á…ySLÖ:3¤Ä]¼\@ÄŞ<. U\
-‹Ğ¥e,@%¨C,ô@~›ÀB,tÂ ­kQØôÁ€¡‚¸\hª"Í-f©€c	"8Ù&1‹df^#„†ÇD*iš&jª&Å¸f!ğtÿv­ ¤Ààƒz°ÇË½‚	'}à'À  +èƒr@'ÀCn˜ğ/, ‘ÁK‘À@³(’W`@)¸ÍxO–|Á0	¡Œ‡¼qŒAˆ <¨ÃğÎ't‚:è‚C¡¨¾t ØA.0Ã:èƒ5ğÁØ@	,@¼‚3Œƒ>ŒC&„¤ Ê™Ô@M¨ï}ÃT,Ğ@AkĞ Š0Üj şA	ûÀ‚MßäBäMĞ Š$<»‰Ÿ\É"ÄÎ7şéú]AízE)¼,(ÓxB;ä(iÿ¶B’z€€>ªT%Ô©|`€0Õ'¸€. |Ã:4B ÿÀìƒ2 'šª)B~ ­ 7Œƒ¬£èß0AÈi&¬—ú P@ñìiF!%1  /¸ª$ƒ8¬47É‰5à€ĞÑÀ.Ôƒ'HâÅøA8 Ã²Šª4» ÌğC.ˆÀ ø@¤õW°ÑÀ€0ğÙjç‰íùœ Ö¼Ã8\7€8Ï8@@À`ØtDÄüÁ">*o Óğ2HÂ:Hƒ*>b$Nb%Ò
-MÂ<;o@<:B ôç<ŒƒÚ¸Àe9	@6Ôƒ(~Àe] 4À’ÜÁ1kÿòÌØØ€ä;@Cé‰ Ã4¬À­Tô4Œ ŒÁsÁÕ,BŞõ€*sÓÁşü 1œƒp“¯€£ë€ì:@$ÀC, AíÚ1ˆ/œ)Êì'/ ç@,hÓ
-€3±£W´5pƒL‰Í@Xqó-À1l)(Ğ 2@ n @ \Á1pÙ- /Ã@+°/ €ÈìrÃ @$Ö  3àƒ!0À\ğÚ¶mM"5<œ*¯iİ’‚(é §>l6»ÍÛø¨ €3Q@ğƒ2  Útö8¤Q€,´ƒ$èÖ9µ5”ƒØ’ÿÒ€,|Œ*#€µ‰ì4 €í˜‚´­®”ëVÆ Â98ƒÙï)<pÉóµvÃ4€c$õTÀ+¦ñ&¦+wÃ‚¤ l€mpÃ:€‚{û@=0	Óo$´8ÌÃ
-ğg{”Ã€,I]G±Üwl‹>TƒÙ¬€Z¶ï¥À¬Ã1Ä|" Á2Ãr€ÍÚİì‡ ÀÀÍÄB\€Tƒ;C ®ïO Ã; Â8“…R$Ã7ÀÂ­ê…µS2@ğQF ªe#¸«v@pB8è&A¤€¨ğ$>ƒxÁü$Ë™ÏÕ;QÿµC:tARÀ <\7Ì |­a0À-€¦*ÃôAÛˆ	¼;|ƒé–°†ÀXÃ>˜M Ôq¤˜±ê‘8¨òˆ¹M;ÌQ¨ ˜  ˜?D;FÌÌÓ:CØTˆÂJ-DäÙˆgÁ^5 B8ƒ<H…‰§©3ìæ_Û(BªU¼AÀ:Èß²)_ÀDZ2PÂŒÛÈŸ†ªy€	‚<˜B&xdF/XÂ B2¼/¼@03ß…§Ã¨Æ,³ü   è«)O³Ç/Wr:¼‚¼;äLÎ¢Â‚,Â ‚,ƒ÷ €9»L½ÿã»\ Ux‚>LC#ÀÁ ¼Â0¸@QÉA/„‚àZ2¢2 Hƒ;ğÂ"àAœ³
-ºÀ ô%,|2À/DgëDß’°k.Ø,ÁOYƒ<|#à:p¸Àæd¸¼\8`È-½ô7¨(ìğ€ÜÁ,*Ø-¶‚P ğ‚ÃFÂË­4 æÖÎ a Á­T@ÀÂ)ØAt67”,@A2È/øPÂ/œÂ³ğÁ<L(,´WŒ59Nl#¼Yˆ¥8Ôƒ5%Ë`€Ñw‚ìZ&ƒ@ÀdœÅ‚ÈÁ&C"à÷À@'ÔC2pB"ÿ€€asbë	@;ÌÃ(¸äEö7‚;ĞERÀlB.‚H@pSªÁ?~zYzÓÇ™;^5<4ƒnœ);vD9;Ãà_¬ä)2ğdI
-?rÍ›&IPÿDìZ'Í*S§^y1Á€Ï¸t–ÖCWÏ
-CxÕ#Fiºwº
-PÈ¢o\&9¥Ğµ× Ä’º¨ûfªS/?Tà¥¯hÉüÀKgJÎX¯PR¯œ(9™Îµ+Ä>Â…ÒÁ-Ic¬µÛÅHÏ#F ¨Sïµ0Hz¨è×"9…’½Ë%âCƒWí*½ğp Y=2tñÃÿĞ]+=všÃ7E{‚ÉfàCdìÚ¥u†äøùóM§=ppà“N˜‘ñ3e€BaóœIŠÕnİ4…G€À‘NÂÿ@À ŠpÚá¥‘WÂ‘G.˜—}ˆä•uÀQƒVXdn©DœvÁ „’VøĞˆ>pEÂÑÇ™)hLF’>P¡%AäÃH>@¸‘'Šg,²È~ˆDÂğ
-RüƒMÄE#0h€1#e¼ ^äQ†?¼¸à8©ÇšJŞğãgÎÚà\B‘ã^Ø™æ	¼r ‹iŞ¦‘=š¸€K’ôûaú€cÿgpá hæáe?¦ag;^‘‘ûÛ ‡Vè™¦’?º8QÊYCÎÂSÊ™G;$QtHªÀ	^æç|í	qÖ™g^:ôàøæœtØ9gg€Ø€$Æà§š‚Üò ˆqÔQ§}ÔYGœ)°äaˆ¸ €SÔ;À+@C[xÔéØĞ`àg"¥MØ$!”¡§kŞ¨ÀQøi‡;5½(¡±ˆ„Ñ>@`yœaá§–¢UØå—aV¸iŸtÎ9‡Ÿa
-øÇ!rÙÇbuôiÇº’Pç#u™_;ÔÙàXÀ¬‡X„Gÿ[yL‚‘á'zÆ‘C„h;H¡“wôçœEFú‘°¹	;“â¡ñ±Æ
-Àú<@~ì` ƒ@R©ÕIg®°Æ]yÂÙÇš*88“˜v¸™G¡×PAÊ¦YG|Š^g8ˆ‹(*8 ~„à¥-œÙGuˆaÇšB(éPÚe…hCİpÒÁçœDTààŸÂ˜fu>Üy€r}°fŸzÚ±¤$hçÅC`p”±1ÖH‡ŸoÈà(a¡'luÇyÃ<€;ˆCé‡<øqŠ$èÂ8¾7?@€F3ØG: ä– ûàÇ+pà­·ÿtû0]8ÄÁXÀK¿àöÚ±¨`À.EÅ¸“·-hÌgˆ8]8Æ~ÜaAA.øa‰•«a‡>ä¡cÄHÃĞ‡>ê±®zğ£5à@
-^qÕ­£YEñ@!zÈ£ß İ 0ĞƒWèn+¢ô	ƒø¨‡,z°¥à!Ã`ZI6PƒJ¬CÌ«Ï:@Sè.ğ°>ä"Ÿù êÂ–ÜÒœmKÇ :•™=ğƒâ¨_hh€/‹­Ó`È*4QÈf ÕàÇà] LûxÇ:Ò±„è¨d:öA$àñÉXGç¸3˜Àÿg8ˆÌéôAÆqœA ‰€‡3;Jğ£¶ûÇŸt§d´ãğQ€LÑN¬ ^ùÇ×¢ÆH}t¢Œ™@¦Îİ1B/Ñ ĞŒÉHXÔ 0D;`q¼ôEBõÈÅš&­\qúÈÜ‚D¬#3Ğ@Ìdä@á*pÀ’¥Ç!a¨@ËœÖ/h¬	x‰õño¤C÷`Á(yˆlvhhhL`‰v´íJ¤ÛWçF’ê]Oğ¸:P;05œS?üp€ˆ‰”(@±JFqŠÿÈJ¹H¸ J·JÇ7Ş‘yèC4ØRDQnàÿ©@2àQV¸àhÒ¢Ö8¨ÁC¼‚S@ 
-JÒ?œAD¡Áø°‡9Ì±İ˜p‡,–^H(H
-Ì`´İÃ(àìÁl@…©Œjô„:Ì!(JÁæÀ‰VD¢YÀ£Œp‡qpÃhÊP
-T![xÀsá_˜U c)ø0>dÁ[ ôÁ$Ñ
-PÌaû§4ú²á7¶ÈÅÌ€0‡J´bxPCB a5È'{ƒ
-:û A´õ(;¬˜Å8€QL€]Ol·»­íÀî0…†V`ƒdJ†?Àv¶µõÂ®Ànô¡¯øCÿªv¦d Cs`…!ä@C=Ö ;|(rl‡ğ€! ÷Ø Ú[ b×Ë’`G3(À@’Ø€?6ØRêkX€‚g°AÓ>5…>€‚ÆY©ÏDĞ…9ìaSà¡”.’à’ üh„&İ²ÈkÀ(õ!È!À˜Ã‡†d£¸r˜Ü’`Àa mœp4¨`nøOI>p4ÌÁS ,Z@p…F°"cĞï&PC/ôa¯0„`Ï ÀxĞ.w»ğİl`chò+ Qê%WğC¬gä‘2yŒf›ob?At‚HA
-4ƒ-Á|ÿP‡QxbağC ‚ô¦¨Ãê`‡ÖÒˆOà4ºà|@õÀCKRŒa´¤ Ä€"PÛsÀx0½;ÈAÒni@J\[&\fGñ2Y8`¶®@| [ØCDğ¢4tÁáåEóÁV8¸Á‡&÷á
-÷ùÀ¦\å+¯)jûå=ÁF°Ê|( Â¹¼\IÀ#¤ú‘®8Òzˆ`"ä`ĞøS@):1ÈÚ!ğÁ@1
-9ø`y¼€¢ ğëI·BS€wÂ@À>xBõXÊ#À!ÿ+h@Îñõ ‚9# _ÖÏ]°q‘ûÔÁ­ Åä`x€E&øP†4ÿŸİ§mi)@´˜ı²n@æ@èJğü%"8'¬5ğaÉ ÕŸ Jd¤LÀÖhë¬ã¯¦k 
-ëÚ¡æ`áæ ÈeÛ`•xA@íˆ šÁšàeÀÂ!€ fà µJ¢€r*4 `jgæ Ú¶í<*ÀI¢  Ë%åËHÎ ZxPx °Hz$ÖáN‹/dÛ `@—pÉğ pà …C€j@ÿ	ßgœKfÖĞ	Û`äpÜ xÀà	6à 4²@$±‘|€xĞvàª0åñ%P`Cê<ŒÀ§® ¬!
-`‘F\€Öaà®£e< Cq19ñ`PÏ¸    \ñMÄ:Á–BiÄÀpÊå]àL ÅĞgŠpd+€dA À~£Ö¤Çe6 BàT€º°$<À€~Àà®±q±İ¢qğ§Ê…Ğ0bğ 2 µâÑf`†Ñ-xĞ~€
-c$” p xğÿĞÎ‹$Ğ~FàB± ¤xh  æ¨(F . fÀbˆj àgPëŒKÂ ì`ü È–‘¾V	ÿ€Âcp0	ßQF`ññ[6`Amz@
-A I¢›Šğß¢$òÂà¦Á@# µŞnÊÎ G@}f q¹pñ{`
-„Ñ6‡& 1@ªaÆ‘ 9ÀŸòr¸P€ãÀâğĞ@`˜Á®ª\ ô˜ "]F392 1jÀ^áÊ°6„µ1…0+ÿaû7Ñ·Òÿ4¶€1Ñg,1ŞÑU`X°/…P,¯ï0ğòŒpóHâVŞ!JÀQ„P€`ˆ2a (S~à
-®À	¶ÏeÀ_”A
-Ì«¥ÃHB@m³@¥…ê´ÌH@À¢À€ A4Bk³è^3bŠ¶RBË…^ª1P„BŒKf¦ø¡Öèğaä¡Ôa¼%4 õ¤ÅBK‚@4xà
-Ä¶ ıZFÊÚÁD` ô¹*ÀÀÁLaäÂœK?²Àòq24”8´ej
-àll3<`B´$0ˆTC/ÔŸhQ0 îŠDŒ²ÿHŠNF#MáËF3 ‰ !•|F:”NÇ­õ õ~\`
-Œ êğKËTLG`DhPÆNIRõ t	À‰¬á
-àMõˆJG ªH1LR¹ÄÈ p¦ªBJQ*¦ˆtP¯J1£úi>?³zàÑ„Ç¬Ağàö^ÆÌfä¾€²ÎL#ÔT}DgäøÂô#Q ø0éîAkàÀ,;ÂSg­õğ*fœuFÀäap @Í¾@šA’Á2`>;â@<ÆŠ~ŒYv`¿¥@„6avaºÀab)6– JÇ°ÿ¤€Ğ	aYQIÒ 'åë Ş!±„A¾“$6 ùvF*@ _vfi6B?  Pa8…`‰Ğckva+`
-œa
-ÅCg À¡
-´¶ ÚÁÒdFZ¶H4}v@ü€q	±ögÅ–Z· b%–b#6ÀjiÖaÁ‹ŞGÀax!TsNñõ~pàÈ dÆ6pwp	w`€ıVÀ .µ6=àÈà\ C­¦@üÃ61$ğ€äà	
-@dwtI—tƒmì ¤®tYf"É$÷IM`
-ì€D¾7êÀsà ¸‰u1@qÉ¯ÿu‰×e  7qW—p; 	äàPeDÓÖ@Š æl“§’KBfÊµta’A¶³xÅw|ã‹n¶³×-cå+à ’|åw~™v|•~Ç{‹*Ù×øî^S	˜~Áêvw#‹äùñgSà¼ ¯x0kÇvšà,£€5xƒ98f(µƒA8„Ex„%ôƒIø„QXlÉq'»·6W †aY§	4
-w aÁàR¸‡}ø‡8ˆ…xˆ‰¸ˆ˜€GÍÎÀK#Cä¢FdùDaöà,÷ $!zæˆ¹¸‹½ø‹Á8ŒÅxŒÉXpA`	|"® Z˜ÿ	/@q×$EàÄK Oß¡0À  1aâ) ÂğÀ¼ íÎà  ¨ˆĞ @ aD!nÆ¸Œ9¹“=ù“A9”Ey”GwùğD98ëeP€Ö`ü@ºàª ¨	ô`ìà	Üá= ä@¬)lf€m‡¦Àö` À¼ ag@¸Àyı t¢†ÈÀ\Ù¬ #XÖt£Ø@±âff .ü@š`eIyÙ¹İùá9‹ØÀ¡Y„”˜K‚€©öÖ@†åŠæ!Ü…+ àÖàaÀÁ
-†7¦> ”aÿö¡ˆAx¡²şÁ¼` aŠi”á(€²‹ôa’ÎÆ>`¾£¹äá’µÎLaøAæ!|€Xå¹¨ú¨‘:©•z©k³
-Øa˜ Ÿ}¦HTFx!º%’^¡°šöú6 HÁØ!X8(·H*€	†¡’A«çˆÁ£K ØH2X¡œaüö vÁ¬ƒa^g€™
-dšá®/¹Ğ„¸Áú’AtA™z³9»³=û³A›“ÀçaRùP.@Za  @  . QàÆa xA+¸Ô  Ş¡ ÿ~ÁUù`ôA  ~ ³ò3J€Ş:a 
-   à„` à
-¤¡ÆÀ
-€ö!h  È sDá àÖ¡Á D`äá€ C;¿õ{¿ù»¿ıûgoŒÚaŞ ZT  ä¾ p2à	ôÁ Là
-tÛòÃr¡aLQ ø¡Œ›nöÂ!tGdu€	È`L¸AÂ» Z®À#FÁ’_L6dLb¡Êa&ú¿üÉ¡<Ê¥|ÊIb Œ¡Yt!éeÊ tLhí ÀôÁ>üJ2@ ÿàáÃ©š|ü€`¡g&à
-NÓ F¤Å­X? ¤!©Æ«À[¼s-ªf *y½Àô¡¸áÀ¬a˜œÊ-ıÒ1=Ó5}·tØÊLZP f ’¡s"ú.€Ì§a$FÀÒrÉÃ{NA Îaa{2`î<Ï»€’Á¹ P”ÁÂà	¨AÇ` Zaâj „|?÷!ŒÀ>¯``ğ{Ó½ıÛÁ=ÜÅ]/€Ğ¨A#™` †ãJÁ H6o,ê Ö×ü8a.àE<Îy¡Tæ¡¹YœàA6n<Á¡ŒÀÅ"gÂ›Ùùaÿ¸ûTkÈ«]qÕĞp¨zÜA>äE~äIşz­ Ú® ÛáÑ†€	~€® ·Iá@lø`šÀšt@( ä)~ Â×-È'~ÄfàÄ†4àà~á§åê!p Z¡”ı <aQ¶@áæa½ ÄaÁ)…À
-Ò`¸K>îå~îé¾îaBrØáXÀßÃr
-š€¡pzÎà—Ú¡ráØ¡ÆÁ,´˜)l’!úïP"©àa¬A úé£ş¹åa §@ÈH’åuü `
-Œ¡ ¾Á¡Aá 8 ø ñ“áRCÿ í~ø‰¿ø?¿;ÀÔÄš|F(@J!í=ö n0àZa©¸!¸D€F€¦áÑ¹¡
-ßçv ¾áˆ¡eÅKÀ
-¸LJx€–*X! b\#¬I&®±`á!Áa o	ÅYË•àÃ¿;zü2¤È‘$Kš<‰2¥Ê•,[º|	3¦Ì™4kÚ¼‰3§Î<{úü	4¨Ğ¡D‹öüğa\9ujTx@é‡)\T¸€‚cÔd\0X°àc°t8©âƒ0X±{…€c‡@z00¤º.lDq¡À( ,€õŸ€œÿAr Ab£”+[¾Œ9³æÍœ;{ş:´èÑ¤I¨â	 OS†Ck4’â¤ƒ4›Tø Ôî›'AhÀ$ˆØÉ?‚ø@CééÔ«[¿=»öíÜ»{ÿÚÃ…J#À£];vér>¾üùôëÛ¿?¿şıüGS`b
-1Éì"‡ıˆ`‚
-.È`ƒ>¡ƒœ°A…³Eˆa†nÈa‡~"O(L"G#şE¢G#‹$¹hŒ1­ˆbg2z¶bŠ(ŞXb>şdA-ĞG.]@°n¸!¥áŒa
- 6 °H+STà" ÑŠ0}„åÙuè²E	ÿ¶9G¥)NP`“¤pBƒ1}à¦¬¡å+¥ˆ0Ô’¬}´ '­0!M¯} ÂÍµtÁÎL,œ‰”0CÃ¢BnÊi§~ÚQ¦ì“ÈQ°Ä+¦èpV† ğŠ:Óñ‚3û¸QGœ1;íÈË Ÿ‰Ë:€¤.ÓqÑäÁßŒÓ›0aÀC3êäBÁí¨cÂPŒÓn4€1ø¼ñìL!8 N;?Èé’(ØO9ìp³B«ÿ|Ğ„RêÀ3…¦ ŒpÂ
-Û·ä™0j"şÓ â(³fK;§¤Æ¿Ä¤J 0ĞÊ:Ô3ü ‘ë? É>ÿ¼aB¸ …ÌqH¸y¼ó?#Œ ‚.ëbÂÇÿ‚Ë4]< ³Ñ8{ôÁÓ#Dy(=½¶Ô Ã­·êˆPH²0+œûÏ ÄÔÃnG=¯ô3¨C¾¶RÍO¤Ãï…%¸ Â4ìlôÂ†xâš‰ÇczPcŒºˆF8ÊÀV›Äxã…ntAãP0Û|.^şBŞøç0©yª;à×m$¯#ÊÌì£F®P @ÌĞ brá~ûêZEÎXî•=Ú#ßxü´±0¦}GØƒPtsTPõ¼~í±{´ˆÀ§ø¶SïzG¡»ï¶ÿÓpİ­o­$ç»€õRòŒƒR¨ß?Î'¹`°­]ÍËßFT';v>È†<®P‚ÜlÀvx€Â·‘¶¦ÎKŒpœÍ#  €2ö6Åép‡<ì!N<`„VpCáB	6Ò )ğ¢ã …%f ?Œãè@7¸1N
+‹Ğ¥e,@%¨C,ô@~›ÀB,tÂ ­kQØôÁ

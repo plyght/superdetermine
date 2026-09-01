@@ -1,4 +1,7 @@
-sdt grade --once`, or `sdt watch`, to start capturing");
+
+    if (all.len == 0) {
+        try w.writeAll("no moments captured yet\n");
+        try ui.hint(w, "run `sdt grade --once`, or `sdt watch`, to start capturing");
         return;
     }
 
@@ -98481,6 +98484,4 @@ pub fn importAll(store: *Store, git_repo_path: []const u8, progress: ?*Progress)
                 var rbuf: [512]u8 = undefined;
                 const rn = std.fmt.bufPrintZ(&rbuf, "refs/tags/{s}", .{tname}) catch continue;
                 var ref: ?*c.git_reference = null;
-                if (c.git_reference_lookup(&ref, repo, rn.ptr) != 0) continue;
-                defer c.git_reference_free(ref);
-              
+                if (c.git_reference

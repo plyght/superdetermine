@@ -1,4 +1,228 @@
-(tree_raw);
+d) [32]u8 {
+    var ctx: [obj_ctx_prefix.len + 1 + Oid.len]u8 = undefined;
+    @memcpy(ctx[0..obj_ctx_prefix.len], obj_ctx_prefix);
+    ctx[obj_ctx_prefix.len] = 0;
+    @memcpy(ctx[obj_ctx_prefix.len + 1 ..], &o.bytes);
+    var out: [32]u8 = undefined;
+    Hkdf.expand(&out, &ctx, prk);
+    return out;
+}
+
+fn rootKey(prk: Prk) [32]u8 {
+    var out: [32]u8 = undefined;
+    Hkdf.expand(&out, root_ctx, prk);
+    return out;
+}
+
+fn nameKey(prk: Prk) [32]u8 {
+    var out: [32]u8 = undefined;
+    Hkdf.expand(&out, name_ctx, prk);
+    return out;
+}
+
+fn blindedRaw(nk: [32]u8, o: Oid) [name_raw_len]u8 {
+    var digest: [32]u8 = undefined;
+    Blake3.hash(&o.bytes, &digest, .{ .key = nk });
+    return digest[0..name_raw_len].*;
+}
+
+pub fn blindedName(s: ShareKey, o: Oid, buf: *[name_len]u8) []const u8 {
+    const raw = blindedRaw(nameKey(prkOf(s)), o);
+    _ = b64.Encoder.encode(buf, &raw);
+    return buf[0..name_len];
+}
+
+fn sealRecord(
+    alloc: std.mem.Allocator,
+    key: [32]u8,
+    aad: []const u8,
+    plaintext: []const u8,
+) ![]u8 {
+    var digest: [32]u8 = undefined;
+    Blake3.hash(plaintext, &digest, .{ .key = key });
+    const nonce: [Aead.nonce_length]u8 = digest[0..Aead.nonce_length].*;
+
+    const out = try alloc.alloc(u8, Aead.nonce_length + plaintext.len + Aead.tag_length);
+    errdefer alloc.free(out);
+    @memcpy(out[0..Aead.nonce_length], &nonce);
+    var tag: [Aead.tag_length]u8 = undefined;
+    Aead.encrypt(out[Aead.nonce_length..][0..plaintext.len], &tag, plaintext, aad, nonce, key);
+    @memcpy(out[Aead.nonce_length + plaintext.len ..], &tag);
+    return out;
+}
+
+fn openRecord(
+    alloc: std.mem.Allocator,
+    key: [32]u8,
+    aad: []const u8,
+    record: []const u8,
+) ![]u8 {
+    if (record.len < Aead.nonce_length + Aead.tag_length) return Error.BadRecord;
+    const ct_len = record.len - Aead.nonce_length - Aead.tag_length;
+    const nonce: [Aead.nonce_length]u8 = record[0..Aead.nonce_length].*;
+    const tag: [Aead.tag_length]u8 = record[Aead.nonce_length + ct_len ..][0..Aead.tag_length].*;
+
+    const out = try alloc.alloc(u8, ct_len);
+    errdefer alloc.free(out);
+    Aead.decrypt(out, record[Aead.nonce_length..][0..ct_len], tag, aad, nonce, key) catch
+        return Error.BadRecord;
+    return out;
+}
+
+fn sealObject(alloc: std.mem.Allocator, prk: Prk, o: Oid, raw: []const u8) ![]u8 {
+    return sealRecord(alloc, objectKey(prk, o), &o.bytes, raw);
+}
+
+fn openObject(alloc: std.mem.Allocator, prk: Prk, o: Oid, record: []const u8) ![]u8 {
+    const plain = try openRecord(alloc, objectKey(prk, o), &o.bytes, record);
+    errdefer alloc.free(plain);
+    if (!Oid.ofBytes(plain).eql(o)) return Error.HashMismatch;
+    return plain;
+}
+
+pub const Ref = struct {
+    name: []u8,
+    target: Oid,
+};
+
+pub fn freeRefs(alloc: std.mem.Allocator, refs: []Ref) void {
+    for (refs) |r| alloc.free(r.name);
+    alloc.free(refs);
+}
+
+fn refsFor(st: *Store, alloc: std.mem.Allocator, branches: []const []const u8) ![]Ref {
+    var out: std.ArrayList(Ref) = .empty;
+    errdefer {
+        for (out.items) |r| alloc.free(r.name);
+        out.deinit(alloc);
+    }
+    if (branches.len == 0) {
+        const head = try st.headBranch();
+        defer st.alloc.free(head);
+        const target = try st.readRef(head);
+        try out.append(alloc, .{ .name = try alloc.dupe(u8, head), .target = target });
+    } else {
+        for (branches) |b| {
+            const target = try st.readRef(b);
+            try out.append(alloc, .{ .name = try alloc.dupe(u8, b), .target = target });
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn renderRoot(alloc: std.mem.Allocator, refs: []const Ref) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "version 1\n");
+    for (refs) |r| {
+        var hex: [Oid.len * 2]u8 = undefined;
+        try out.print(alloc, "{s} {s}\n", .{ r.name, r.target.toHex(&hex) });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn parseRoot(alloc: std.mem.Allocator, text: []const u8) ![]Ref {
+    var out: std.ArrayList(Ref) = .empty;
+    errdefer {
+        for (out.items) |r| alloc.free(r.name);
+        out.deinit(alloc);
+    }
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        const name = it.next() orelse continue;
+        const value = it.next() orelse return Error.BadRoot;
+        if (std.mem.eql(u8, name, "version") and value.len != Oid.len * 2) continue;
+        const target = Oid.fromHex(value) catch return Error.BadRoot;
+        try out.append(alloc, .{ .name = try alloc.dupe(u8, name), .target = target });
+    }
+    if (out.items.len == 0) return Error.BadRoot;
+    return out.toOwnedSlice(alloc);
+}
+
+const Seen = std.AutoHashMap([32]u8, void);
+
+fn oidLessThan(_: void, a: Oid, b: Oid) bool {
+    return std.mem.lessThan(u8, &a.bytes, &b.bytes);
+}
+
+pub fn collectReachable(st: *Store, alloc: std.mem.Allocator, roots: []const Ref) ![]Oid {
+    var seen = Seen.init(alloc);
+    defer seen.deinit();
+
+    var out: std.ArrayList(Oid) = .empty;
+    errdefer out.deinit(alloc);
+
+    var stack: std.ArrayList(Oid) = .empty;
+    defer stack.deinit(alloc);
+    for (roots) |r| try stack.append(alloc, r.target);
+
+    while (stack.pop()) |o| {
+        if (o.isZero()) continue;
+        if ((try seen.getOrPut(o.bytes)).found_existing) continue;
+        try out.append(alloc, o);
+
+        const change = try st.readChange(o);
+        defer object.freeChange(st.alloc, change);
+        for (change.parents) |p| try stack.append(alloc, p);
+
+        if ((try seen.getOrPut(change.tree.bytes)).found_existing) continue;
+        try out.append(alloc, change.tree);
+
+        const tree = try st.readTree(change.tree);
+        defer object.freeTree(st.alloc, tree);
+        for (tree.entries) |e| {
+            if ((try seen.getOrPut(e.blob.bytes)).found_existing) continue;
+            try out.append(alloc, e.blob);
+
+            const raw = try st.readRaw(e.blob);
+            defer st.alloc.free(raw);
+            const blob = try object.Blob.decode(st.alloc, raw);
+            defer st.alloc.free(blob.chunks);
+            for (blob.chunks) |c| {
+                if ((try seen.getOrPut(c.bytes)).found_existing) continue;
+                try out.append(alloc, c);
+            }
+        }
+    }
+
+    const list = try out.toOwnedSlice(alloc);
+    std.mem.sort(Oid, list, {}, oidLessThan);
+    return list;
+}
+
+fn obtain(st: *Store, alloc: std.mem.Allocator, src: anytype, o: Oid) ![]u8 {
+    if (st.has(o)) return st.readRaw(o);
+    const raw = try src.fetch(alloc, o);
+    errdefer alloc.free(raw);
+    if (!Oid.ofBytes(raw).eql(o)) return Error.HashMismatch;
+    _ = try st.writeRaw(raw);
+    return raw;
+}
+
+fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const Ref) !void {
+    var seen = Seen.init(alloc);
+    defer seen.deinit();
+
+    var stack: std.ArrayList(Oid) = .empty;
+    defer stack.deinit(alloc);
+    for (refs) |r| try stack.append(alloc, r.target);
+
+    while (stack.pop()) |o| {
+        if (o.isZero()) continue;
+        if ((try seen.getOrPut(o.bytes)).found_existing) continue;
+
+        const change_raw = try obtain(st, alloc, src, o);
+        defer alloc.free(change_raw);
+        const change = try object.Change.decode(alloc, change_raw);
+        defer object.freeChange(alloc, change);
+        for (change.parents) |p| try stack.append(alloc, p);
+
+        if ((try seen.getOrPut(change.tree.bytes)).found_existing) continue;
+        const tree_raw = try obtain(st, alloc, src, change.tree);
+        defer alloc.free(tree_raw);
         const tree = try object.Tree.decode(alloc, tree_raw);
         defer object.freeTree(alloc, tree);
 
@@ -106125,198 +106349,4 @@ test "merge preserves the exec bit on an untouched file" {
     try testing.expectEqualStrings("A\nb\nC\n", merged_data);
 }
 
-test "merge takes an exec bit set on one side only" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
-    const script = try store.writeFileContent("#!/bin/sh\n");
-
-    var base_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "run.sh", .blob = script },
-    };
-    const base_tree = try treeOf(&store, &base_entries);
-
-    var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .executable, .path = "run.sh", .blob = script },
-    };
-    const ours_tree = try treeOf(&store, &ours_entries);
-
-    var theirs_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "run.sh", .blob = script },
-    };
-    const theirs_tree = try treeOf(&store, &theirs_entries);
-
-    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
-    defer freeMergeResult(alloc, result);
-
-    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
-    const run = try entryAt(&store, alloc, result.tree, "run.sh");
-    try testing.expectEqual(object.Mode.executable, run.mode);
-}
-
-test "merge reports an exec-vs-regular divergence as a conflict" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
-    const script = try store.writeFileContent("#!/bin/sh\n");
-
-    var base_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
-    };
-    const base_tree = try treeOf(&store, &base_entries);
-
-    var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
-        .{ .mode = .executable, .path = "run.sh", .blob = script },
-    };
-    const ours_tree = try treeOf(&store, &ours_entries);
-
-    var theirs_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
-        .{ .mode = .regular, .path = "run.sh", .blob = script },
-    };
-    const theirs_tree = try treeOf(&store, &theirs_entries);
-
-    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
-    defer freeMergeResult(alloc, result);
-
-    try testing.expectEqual(@as(usize, 1), result.conflicts.len);
-    try testing.expectEqualStrings("run.sh", result.conflicts[0]);
-    const run = try entryAt(&store, alloc, result.tree, "run.sh");
-    try testing.expect(run.blob.eql(script));
-}
-
-test "merge preserves an untouched symlink" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
-    const target = try store.writeFileContent("a/target");
-
-    var base_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = target },
-        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("a\nb\nc\n") },
-    };
-    const base_tree = try treeOf(&store, &base_entries);
-
-    var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = target },
-        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("A\nb\nc\n") },
-    };
-    const ours_tree = try treeOf(&store, &ours_entries);
-
-    var theirs_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = target },
-        .{ .mode = .regular, .path = "f", .blob = try store.writeFileContent("a\nb\nC\n") },
-    };
-    const theirs_tree = try treeOf(&store, &theirs_entries);
-
-    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
-    defer freeMergeResult(alloc, result);
-
-    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
-    const link = try entryAt(&store, alloc, result.tree, "link");
-    try testing.expectEqual(object.Mode.symlink, link.mode);
-    const link_data = try store.readFileContent(link.blob);
-    defer alloc.free(link_data);
-    try testing.expectEqualStrings("a/target", link_data);
-}
-
-test "merge takes a symlink retargeted on one side only" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
-    const old_target = try store.writeFileContent("old/target");
-
-    var base_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = old_target },
-    };
-    const base_tree = try treeOf(&store, &base_entries);
-
-    var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("new/target") },
-    };
-    const ours_tree = try treeOf(&store, &ours_entries);
-
-    var theirs_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = old_target },
-    };
-    const theirs_tree = try treeOf(&store, &theirs_entries);
-
-    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
-    defer freeMergeResult(alloc, result);
-
-    try testing.expectEqual(@as(usize, 0), result.conflicts.len);
-    const link = try entryAt(&store, alloc, result.tree, "link");
-    try testing.expectEqual(object.Mode.symlink, link.mode);
-    const link_data = try store.readFileContent(link.blob);
-    defer alloc.free(link_data);
-    try testing.expectEqualStrings("new/target", link_data);
-}
-
-test "merge conflicts a divergent symlink without writing markers" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
-    var base_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("base/target") },
-    };
-    const base_tree = try treeOf(&store, &base_entries);
-
-    var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("ours/target") },
-    };
-    const ours_tree = try treeOf(&store, &ours_entries);
-
-    var theirs_entries = [_]object.TreeEntry{
-        .{ .mode = .symlink, .path = "link", .blob = try store.writeFileContent("theirs/target") },
-    };
-    const theirs_tree = try treeOf(&store, &theirs_entries);
-
-    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
-    defer freeMergeResult(alloc, result);
-
-    try testing.expectEqual(@as(usize, 1), result.conflicts.len);
-    try testing.expectEqualStrings("link", result.conflicts[0]);
-    const link = try entryAt(&store, alloc, result.tree, "link");
-    try testing.expectEqual(object.Mode.symlink, link.mode);
-    const link_data = try store.readFileContent(link.blob);
-    defer alloc.free(link_data);
-    try testing.expectEqualStrings("theirs/target", link_data);
-    try testing.expect(!hasConflictMarkers(link_data));
-}
-
-test "merge conflicts a symlink against a regular file" {
-    const io = std.testing.io;
-    const alloc = testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
-    var base_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
-    };
-    const base_tree = try treeOf(&store, &base_entries);
-
-    var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = 
+test "merge takes an exec bit set

@@ -1,4 +1,197 @@
-|lt| {
+);
+    try store.updateRef(branch, tip);
+
+    return tip;
+}
+
+/// Import ALL local branches and ALL tags (each with full history) from the git
+/// repo into `store`. Shared ancestry is imported once (deduped via the gitmap).
+/// Creates gr `refs/heads/<name>` for each local branch and `refs/tags/<name>`
+/// for each tag (peeled to its commit). Points gr HEAD at the git repo's HEAD
+/// branch. Lossless in structure/content/metadata (git SHAs are not preserved;
+/// gr re-hashes with its own content-addressed store).
+pub fn importAll(store: *Store, git_repo_path: []const u8) !void {
+    ensureInit();
+    const alloc = store.alloc;
+
+    const path_z = try alloc.dupeZ(u8, git_repo_path);
+    defer alloc.free(path_z);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, path_z.ptr));
+    defer c.git_repository_free(repo);
+
+    var map = try Gitmap.load(store);
+    defer map.deinit();
+
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, repo));
+    defer c.git_revwalk_free(walk);
+    _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL | c.GIT_SORT_REVERSE);
+
+    // Push every local branch tip.
+    {
+        var iter: ?*c.git_branch_iterator = null;
+        try check(c.git_branch_iterator_new(&iter, repo, c.GIT_BRANCH_LOCAL));
+        defer c.git_branch_iterator_free(iter);
+        var ref: ?*c.git_reference = null;
+        var btype: c.git_branch_t = undefined;
+        while (c.git_branch_next(&ref, &btype, iter) == 0) {
+            defer c.git_reference_free(ref);
+            var obj: ?*c.git_object = null;
+            if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) == 0) {
+                defer c.git_object_free(obj);
+                _ = c.git_revwalk_push(walk, c.git_object_id(obj));
+            }
+        }
+    }
+    // Push every tag's target commit.
+    {
+        var tagnames: c.git_strarray = undefined;
+        if (c.git_tag_list(&tagnames, repo) == 0) {
+            defer c.git_strarray_dispose(&tagnames);
+            var i: usize = 0;
+            while (i < tagnames.count) : (i += 1) {
+                var rbuf: [512]u8 = undefined;
+                const rn = std.fmt.bufPrintZ(&rbuf, "refs/tags/{s}", .{std.mem.span(tagnames.strings[i])}) catch continue;
+                var ref: ?*c.git_reference = null;
+                if (c.git_reference_lookup(&ref, repo, rn.ptr) != 0) continue;
+                defer c.git_reference_free(ref);
+                var obj: ?*c.git_object = null;
+                if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) == 0) {
+                    defer c.git_object_free(obj);
+                    _ = c.git_revwalk_push(walk, c.git_object_id(obj));
+                }
+            }
+        }
+    }
+
+    lfs_unresolved = 0;
+    var session = lfsSessionFor(store, repo, null);
+    defer if (session) |*s| {
+        lfs_unresolved = s.unresolved;
+        s.deinit();
+    };
+
+    // Import the whole reachable DAG oldest-first.
+    var woid: c.git_oid = undefined;
+    while (c.git_revwalk_next(&woid, walk) == 0) {
+        _ = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
+    }
+
+    // Create sdt branch refs.
+    {
+        var iter: ?*c.git_branch_iterator = null;
+        try check(c.git_branch_iterator_new(&iter, repo, c.GIT_BRANCH_LOCAL));
+        defer c.git_branch_iterator_free(iter);
+        var ref: ?*c.git_reference = null;
+        var btype: c.git_branch_t = undefined;
+        while (c.git_branch_next(&ref, &btype, iter) == 0) {
+            defer c.git_reference_free(ref);
+            var name_c: [*c]const u8 = null;
+            if (c.git_branch_name(&name_c, ref) != 0) continue;
+            var obj: ?*c.git_object = null;
+            if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) != 0) continue;
+            defer c.git_object_free(obj);
+            const chex = gitOidHex(c.git_object_id(obj));
+            if (map.lookupGr(&chex)) |gr| try store.updateRef(std.mem.span(name_c), gr);
+        }
+    }
+    // Create gr tag refs (lightweight; hex + '\n').
+    {
+        var tagnames: c.git_strarray = undefined;
+        if (c.git_tag_list(&tagnames, repo) == 0) {
+            defer c.git_strarray_dispose(&tagnames);
+            if (tagnames.count > 0) try store.root.createDirPath(store.io, "refs/tags");
+            var i: usize = 0;
+            while (i < tagnames.count) : (i += 1) {
+                const tname = std.mem.span(tagnames.strings[i]);
+                var rbuf: [512]u8 = undefined;
+                const rn = std.fmt.bufPrintZ(&rbuf, "refs/tags/{s}", .{tname}) catch continue;
+                var ref: ?*c.git_reference = null;
+                if (c.git_reference_lookup(&ref, repo, rn.ptr) != 0) continue;
+                defer c.git_reference_free(ref);
+                var obj: ?*c.git_object = null;
+                if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) != 0) continue;
+                defer c.git_object_free(obj);
+                const chex = gitOidHex(c.git_object_id(obj));
+                if (map.lookupGr(&chex)) |gr| {
+                    var pbuf: [512]u8 = undefined;
+                    const pth = std.fmt.bufPrint(&pbuf, "refs/tags/{s}", .{tname}) catch continue;
+                    var hbuf: [65]u8 = undefined;
+                    _ = gr.toHex(hbuf[0..64]);
+                    hbuf[64] = '\n';
+                    try store.root.writeFile(store.io, .{ .sub_path = pth, .data = hbuf[0..65] });
+                }
+            }
+        }
+    }
+
+    // Point gr HEAD at the git repo's HEAD branch so gr commands resolve.
+    {
+        var hr: ?*c.git_reference = null;
+        if (c.git_repository_head(&hr, repo) == 0) {
+            defer c.git_reference_free(hr);
+            const sh = c.git_reference_shorthand(hr);
+            if (sh != null) try store.setHeadBranch(std.mem.span(sh));
+        }
+    }
+
+    try map.save(store);
+}
+
+fn gitFilemode(mode: object.Mode) c.git_filemode_t {
+    return switch (mode) {
+        .executable => c.GIT_FILEMODE_BLOB_EXECUTABLE,
+        .symlink => c.GIT_FILEMODE_LINK,
+        else => c.GIT_FILEMODE_BLOB,
+    };
+}
+
+const ExportNode = struct {
+    is_dir: bool,
+    children: std.StringHashMapUnmanaged(*ExportNode),
+    blob_oid: c.git_oid,
+    filemode: c.git_filemode_t,
+
+    fn newDir(alloc: std.mem.Allocator) !*ExportNode {
+        const n = try alloc.create(ExportNode);
+        n.* = .{ .is_dir = true, .children = .{}, .blob_oid = undefined, .filemode = 0 };
+        return n;
+    }
+};
+
+/// Recursively write an ExportNode directory into `repo`, returning its git tree Oid.
+fn writeExportTree(repo: ?*c.git_repository, node: *ExportNode) !c.git_oid {
+    var bld: ?*c.git_treebuilder = null;
+    try check(c.git_treebuilder_new(&bld, repo, null));
+    defer c.git_treebuilder_free(bld);
+
+    var it = node.children.iterator();
+    while (it.next()) |kv| {
+        const name = kv.key_ptr.*;
+        const child = kv.value_ptr.*;
+        var name_z_buf: [1024]u8 = undefined;
+        if (name.len >= name_z_buf.len) return Error.GitError;
+        @memcpy(name_z_buf[0..name.len], name);
+        name_z_buf[name.len] = 0;
+        const name_z: [*c]const u8 = @ptrCast(&name_z_buf);
+        if (child.is_dir) {
+            var sub = try writeExportTree(repo, child);
+            try check(c.git_treebuilder_insert(null, bld, name_z, &sub, c.GIT_FILEMODE_TREE));
+        } else {
+            try check(c.git_treebuilder_insert(null, bld, name_z, &child.blob_oid, child.filemode));
+        }
+    }
+
+    var out: c.git_oid = undefined;
+    try check(c.git_treebuilder_write(&out, bld));
+    return out;
+}
+
+/// Split "Name <email>" into name/email spans. Falls back to the whole string.
+fn splitAuthor(author: []const u8) struct { name: []const u8, email: []const u8 } {
+    if (std.mem.lastIndexOfScalar(u8, author, '<')) |lt| {
         const gt = std.mem.lastIndexOfScalar(u8, author, '>') orelse author.len;
         const name = std.mem.trim(u8, author[0..lt], " \t");
         const email = if (gt > lt + 1) author[lt + 1 .. gt] else "";
@@ -105424,229 +105617,4 @@ void test_diff_patch__hunks_have_correct_line_numbers(void)
 	cl_assert_equal_i(25, (int)hunk->new_start);
 	cl_assert_equal_i(9, (int)hunk->new_lines);
 
-	cl_assert_equal_i(18, (int)git_patch_num_lines_in_hunk(patch, 1));
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 1, 0));
-	cl_assert_equal_i(GIT_DIFF_LINE_CONTEXT, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("My rulers and their treasure and their unborn populations,\n", actual.ptr);
-	cl_assert_equal_i(31, line->old_lineno);
-	cl_assert_equal_i(25, line->new_lineno);
-	cl_assert_equal_i(-1, line->content_offset);
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 1, 3));
-	cl_assert_equal_i(GIT_DIFF_LINE_DELETION, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("The Daughters of the Palace whom they cherished in my Cities,\n", actual.ptr);
-	cl_assert_equal_i(34, line->old_lineno);
-	cl_assert_equal_i(-1, line->new_lineno);
-	cl_assert_equal_i(1468, line->content_offset);
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 1, 12));
-	cl_assert_equal_i(GIT_DIFF_LINE_ADDITION, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("Another replacement;\n", actual.ptr);
-	cl_assert_equal_i(-1, line->old_lineno);
-	cl_assert_equal_i(28, line->new_lineno);
-	cl_assert_equal_i(1066, line->content_offset);
-
-	git_patch_free(patch);
-	git_diff_free(diff);
-
-	/* Let's check line numbers when there is no newline */
-
-	git_str_rtrim(&old_content);
-	cl_git_rewritefile("renames/songof7cities.txt", old_content.ptr);
-
-	cl_git_pass(git_diff_tree_to_workdir(&diff, g_repo, head, &opt));
-
-	cl_assert_equal_i(1, (int)git_diff_num_deltas(diff));
-
-	cl_git_pass(git_patch_from_diff(&patch, diff, 0));
-	cl_assert((delta = git_patch_get_delta(patch)) != NULL);
-
-	cl_assert_equal_i(GIT_DELTA_MODIFIED, (int)delta->status);
-	cl_assert_equal_i(1, (int)git_patch_num_hunks(patch));
-
-	/* check hunk 0 */
-
-	cl_git_pass(git_patch_get_hunk(&hunk, &hunklen, patch, 0));
-
-	cl_assert_equal_i(6, (int)hunklen);
-
-	cl_assert_equal_i(46, (int)hunk->old_start);
-	cl_assert_equal_i(4, (int)hunk->old_lines);
-	cl_assert_equal_i(46, (int)hunk->new_start);
-	cl_assert_equal_i(4, (int)hunk->new_lines);
-
-	cl_assert_equal_i(6, (int)git_patch_num_lines_in_hunk(patch, 0));
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 0, 1));
-	cl_assert_equal_i(GIT_DIFF_LINE_CONTEXT, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("And the horses and the chariots fleeing from them as of old!\n", actual.ptr);
-	cl_assert_equal_i(47, line->old_lineno);
-	cl_assert_equal_i(47, line->new_lineno);
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 0, 2));
-	cl_assert_equal_i(GIT_DIFF_LINE_CONTEXT, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("\n", actual.ptr);
-	cl_assert_equal_i(48, line->old_lineno);
-	cl_assert_equal_i(48, line->new_lineno);
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 0, 3));
-	cl_assert_equal_i(GIT_DIFF_LINE_DELETION, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("  -- Rudyard Kipling\n", actual.ptr);
-	cl_assert_equal_i(49, line->old_lineno);
-	cl_assert_equal_i(-1, line->new_lineno);
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 0, 4));
-	cl_assert_equal_i(GIT_DIFF_LINE_ADDITION, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("  -- Rudyard Kipling", actual.ptr);
-	cl_assert_equal_i(-1, line->old_lineno);
-	cl_assert_equal_i(49, line->new_lineno);
-
-	cl_git_pass(git_patch_get_line_in_hunk(&line, patch, 0, 5));
-	cl_assert_equal_i(GIT_DIFF_LINE_DEL_EOFNL, (int)line->origin);
-	cl_git_pass(git_str_set(&actual, line->content, line->content_len));
-	cl_assert_equal_s("\n\\ No newline at end of file\n", actual.ptr);
-	cl_assert_equal_i(-1, line->old_lineno);
-	cl_assert_equal_i(49, line->new_lineno);
-
-	git_patch_free(patch);
-	git_diff_free(diff);
-
-	git_str_dispose(&actual);
-	git_str_dispose(&old_content);
-	git_tree_free(head);
-}
-
-static void check_single_patch_stats(
-	git_repository *repo, size_t hunks,
-	size_t adds, size_t dels, size_t ctxt, size_t *sizes,
-	const char *expected)
-{
-	git_diff *diff;
-	git_patch *patch;
-	const git_diff_delta *delta;
-	size_t actual_ctxt, actual_adds, actual_dels;
-
-	cl_git_pass(git_diff_index_to_workdir(&diff, repo, NULL, NULL));
-
-	cl_assert_equal_i(1, (int)git_diff_num_deltas(diff));
-
-	cl_git_pass(git_patch_from_diff(&patch, diff, 0));
-	cl_assert((delta = git_patch_get_delta(patch)) != NULL);
-	cl_assert_equal_i(GIT_DELTA_MODIFIED, (int)delta->status);
-
-	cl_assert_equal_i((int)hunks, (int)git_patch_num_hunks(patch));
-
-	cl_git_pass( git_patch_line_stats(
-		&actual_ctxt, &actual_adds, &actual_dels, patch) );
-
-	cl_assert_equal_sz(ctxt, actual_ctxt);
-	cl_assert_equal_sz(adds, actual_adds);
-	cl_assert_equal_sz(dels, actual_dels);
-
-	if (expected != NULL) {
-		git_buf buf = GIT_BUF_INIT;
-		cl_git_pass(git_patch_to_buf(&buf, patch));
-		cl_assert_equal_s(expected, buf.ptr);
-		git_buf_dispose(&buf);
-
-		cl_assert_equal_sz(
-			strlen(expected), git_patch_size(patch, 1, 1, 1));
-	}
-
-	if (sizes) {
-		if (sizes[0])
-			cl_assert_equal_sz(sizes[0], git_patch_size(patch, 0, 0, 0));
-		if (sizes[1])
-			cl_assert_equal_sz(sizes[1], git_patch_size(patch, 1, 0, 0));
-		if (sizes[2])
-			cl_assert_equal_sz(sizes[2], git_patch_size(patch, 1, 1, 0));
-	}
-
-	/* walk lines in hunk with basic sanity checks */
-	for (; hunks > 0; --hunks) {
-		size_t i, max_i;
-		const git_diff_line *line;
-		int last_new_lineno = -1, last_old_lineno = -1;
-
-		max_i = git_patch_num_lines_in_hunk(patch, hunks - 1);
-
-		for (i = 0; i < max_i; ++i) {
-			int expected = 1;
-
-			cl_git_pass(
-				git_patch_get_line_in_hunk(&line, patch, hunks - 1, i));
-
-			if (line->origin == GIT_DIFF_LINE_ADD_EOFNL ||
-				line->origin == GIT_DIFF_LINE_DEL_EOFNL ||
-				line->origin == GIT_DIFF_LINE_CONTEXT_EOFNL)
-				expected = 0;
-
-			if (line->old_lineno >= 0) {
-				if (last_old_lineno >= 0)
-					cl_assert_equal_i(
-						expected, line->old_lineno - last_old_lineno);
-				last_old_lineno = line->old_lineno;
-			}
-
-			if (line->new_lineno >= 0) {
-				if (last_new_lineno >= 0)
-					cl_assert_equal_i(
-						expected, line->new_lineno - last_new_lineno);
-				last_new_lineno = line->new_lineno;
-			}
-		}
-	}
-
-	git_patch_free(patch);
-	git_diff_free(diff);
-}
-
-void test_diff_patch__line_counts_with_eofnl(void)
-{
-	git_config *cfg;
-	git_str content = GIT_STR_INIT;
-	const char *end;
-	git_index *index;
-	const char *expected =
-		/* below is pasted output of 'git diff' with fn context removed */
-		"diff --git a/songof7cities.txt b/songof7cities.txt\n"
-		"index 378a7d9..3d0154e 100644\n"
-		"--- a/songof7cities.txt\n"
-		"+++ b/songof7cities.txt\n"
-		"@@ -42,7 +42,7 @@ With peoples undefeated of the dark, enduring blood.\n"
-		" \n"
-		" To the sound of trumpets shall their seed restore my Cities\n"
-		" Wealthy and well-weaponed, that once more may I behold\n"
-		"-All the world go softly when it walks before my Cities,\n"
-		"+#All the world go softly when it walks before my Cities,\n"
-		" And the horses and the chariots fleeing from them as of old!\n"
-		" \n"
-		"   -- Rudyard Kipling\n"
-		"\\ No newline at end of file\n";
-	size_t expected_sizes[3] = { 115, 119 + 115 + 114, 119 + 115 + 114 + 71 };
-
-	g_repo = cl_git_sandbox_init("renames");
-
-	cl_git_pass(git_config_new(&cfg));
-	git_repository_set_config(g_repo, cfg);
-	git_config_free(cfg);
-
-	git_repository_reinit_filesystem(g_repo, false);
-
-	cl_git_pass(git_futils_readbuffer(&content, "renames/songof7cities.txt"));
-
-	/* remove first line */
-
-	end = git_str_cstr(&content) + git_str_find(&content, '\n') + 1;
-	git_str_consume(&content, end);
-	cl_git_rewritefile("renames/songof7cities.txt", content.ptr);
-
-	check_single_patch_stats(g_repo, 1, 0, 1, 3, 
+	cl_assert_equal_i(18, (i
