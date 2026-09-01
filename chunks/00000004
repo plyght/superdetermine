@@ -1,4 +1,243 @@
- 8;
+(tree_raw);
+        const tree = try object.Tree.decode(alloc, tree_raw);
+        defer object.freeTree(alloc, tree);
+
+        for (tree.entries) |e| {
+            if ((try seen.getOrPut(e.blob.bytes)).found_existing) continue;
+            const blob_raw = try obtain(st, alloc, src, e.blob);
+            defer alloc.free(blob_raw);
+            const blob = try object.Blob.decode(alloc, blob_raw);
+            defer alloc.free(blob.chunks);
+            for (blob.chunks) |c| {
+                if ((try seen.getOrPut(c.bytes)).found_existing) continue;
+                const chunk = try obtain(st, alloc, src, c);
+                alloc.free(chunk);
+            }
+        }
+    }
+
+    for (refs) |r| try st.updateRef(r.name, r.target);
+}
+
+pub fn encodeUrl(alloc: std.mem.Allocator, base_url: []const u8, s: ShareKey) ![]u8 {
+    const base = std.mem.trimEnd(u8, base_url, "/");
+    var idbuf: [id_len]u8 = undefined;
+    const id = shareId(s, &idbuf);
+    var kbuf: [b64.Encoder.calcSize(key_len)]u8 = undefined;
+    _ = b64.Encoder.encode(&kbuf, &s);
+    return std.fmt.allocPrint(alloc, "{s}{s}{s}#k={s}", .{ base, path_segment, id, kbuf });
+}
+
+pub const ParsedUrl = struct {
+    base: []u8,
+    id: []u8,
+    key: ShareKey,
+
+    pub fn deinit(self: ParsedUrl, alloc: std.mem.Allocator) void {
+        alloc.free(self.base);
+        alloc.free(self.id);
+    }
+};
+
+fn isHexLower(s: []const u8) bool {
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+pub fn parseUrl(alloc: std.mem.Allocator, url: []const u8) !ParsedUrl {
+    const hash = std.mem.indexOfScalar(u8, url, '#') orelse return Error.BadUrl;
+    const link = std.mem.trimEnd(u8, url[0..hash], "/");
+    const fragment = url[hash + 1 ..];
+
+    var key: ShareKey = undefined;
+    var found = false;
+    var parts = std.mem.splitScalar(u8, fragment, '&');
+    while (parts.next()) |part| {
+        if (!std.mem.startsWith(u8, part, "k=")) continue;
+        const body = part[2..];
+        const n = b64.Decoder.calcSizeForSlice(body) catch return Error.BadUrl;
+        if (n != key_len) return Error.BadUrl;
+        b64.Decoder.decode(&key, body) catch return Error.BadUrl;
+        found = true;
+        break;
+    }
+    if (!found) return Error.BadUrl;
+
+    const at = std.mem.lastIndexOf(u8, link, path_segment) orelse return Error.BadUrl;
+    const id = link[at + path_segment.len ..];
+    if (id.len != id_len or !isHexLower(id)) return Error.BadUrl;
+
+    var idbuf: [id_len]u8 = undefined;
+    if (!std.mem.eql(u8, shareId(key, &idbuf), id)) return Error.BadShare;
+
+    const base = try alloc.dupe(u8, link[0..at]);
+    errdefer alloc.free(base);
+    const id_copy = try alloc.dupe(u8, id);
+    return .{ .base = base, .id = id_copy, .key = key };
+}
+
+fn rootSubPath(id: []const u8, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "r/{s}/{s}", .{ id, root_leaf }) catch unreachable;
+}
+
+fn objectSubPath(id: []const u8, name: []const u8, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "r/{s}/{s}/{s}", .{ id, objects_leaf, name }) catch unreachable;
+}
+
+pub fn exportDir(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    s: ShareKey,
+    dest: std.Io.Dir,
+    branches: []const []const u8,
+) !void {
+    const refs = try refsFor(st, alloc, branches);
+    defer freeRefs(alloc, refs);
+
+    const prk = prkOf(s);
+    const nk = nameKey(prk);
+    var idbuf: [id_len]u8 = undefined;
+    const id = shareId(s, &idbuf);
+
+    var dirbuf: [64]u8 = undefined;
+    const objects_dir = std.fmt.bufPrint(&dirbuf, "r/{s}/{s}", .{ id, objects_leaf }) catch unreachable;
+    try dest.createDirPath(io, objects_dir);
+
+    const root_text = try renderRoot(alloc, refs);
+    defer alloc.free(root_text);
+    const root_record = try sealRecord(alloc, rootKey(prk), root_aad, root_text);
+    defer alloc.free(root_record);
+
+    var pathbuf: [96]u8 = undefined;
+    try dest.writeFile(io, .{
+        .sub_path = rootSubPath(id, &pathbuf),
+        .data = root_record,
+    });
+
+    const oids = try collectReachable(st, alloc, refs);
+    defer alloc.free(oids);
+
+    for (oids) |o| {
+        const raw = try st.readRaw(o);
+        defer alloc.free(raw);
+        const record = try sealObject(alloc, prk, o, raw);
+        defer alloc.free(record);
+
+        var namebuf: [name_len]u8 = undefined;
+        const raw_name = blindedRaw(nk, o);
+        _ = b64.Encoder.encode(&namebuf, &raw_name);
+        try dest.writeFile(io, .{
+            .sub_path = objectSubPath(id, &namebuf, &pathbuf),
+            .data = record,
+        });
+    }
+}
+
+fn appendRecord(alloc: std.mem.Allocator, out: *std.ArrayList(u8), payload: []const u8) !void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, @intCast(payload.len), .little);
+    try out.appendSlice(alloc, &len);
+    try out.appendSlice(alloc, payload);
+}
+
+pub fn buildBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    s: ShareKey,
+    branches: []const []const u8,
+) ![]u8 {
+    const refs = try refsFor(st, alloc, branches);
+    defer freeRefs(alloc, refs);
+
+    const prk = prkOf(s);
+    const nk = nameKey(prk);
+    var idbuf: [id_len]u8 = undefined;
+    const id = shareId(s, &idbuf);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, bundle_magic);
+    try out.appendSlice(alloc, id);
+
+    const root_text = try renderRoot(alloc, refs);
+    defer alloc.free(root_text);
+    const root_record = try sealRecord(alloc, rootKey(prk), root_aad, root_text);
+    defer alloc.free(root_record);
+    try appendRecord(alloc, &out, root_record);
+
+    const oids = try collectReachable(st, alloc, refs);
+    defer alloc.free(oids);
+
+    for (oids) |o| {
+        const raw = try st.readRaw(o);
+        defer alloc.free(raw);
+        const record = try sealObject(alloc, prk, o, raw);
+        defer alloc.free(record);
+
+        const payload = try alloc.alloc(u8, name_raw_len + record.len);
+        defer alloc.free(payload);
+        const raw_name = blindedRaw(nk, o);
+        @memcpy(payload[0..name_raw_len], &raw_name);
+        @memcpy(payload[name_raw_len..], record);
+        try appendRecord(alloc, &out, payload);
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn writeBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    s: ShareKey,
+    out_path: []const u8,
+    branches: []const []const u8,
+) !void {
+    const bytes = try buildBundle(st, alloc, s, branches);
+    defer alloc.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+}
+
+const RecordMap = std.AutoHashMap([name_raw_len]u8, []const u8);
+
+const BundleSource = struct {
+    prk: Prk,
+    nk: [32]u8,
+    map: *const RecordMap,
+
+    fn fetch(self: BundleSource, alloc: std.mem.Allocator, o: Oid) ![]u8 {
+        const record = self.map.get(blindedRaw(self.nk, o)) orelse return Error.BadBundle;
+        return openObject(alloc, self.prk, o, record);
+    }
+};
+
+pub fn importBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    s: ShareKey,
+    bytes: []const u8,
+) !void {
+    if (bytes.len < bundle_magic.len + id_len) return Error.BadBundle;
+    if (!std.mem.eql(u8, bytes[0..bundle_magic.len], bundle_magic)) return Error.BadBundle;
+
+    var idbuf: [id_len]u8 = undefined;
+    if (!std.mem.eql(u8, bytes[bundle_magic.len..][0..id_len], shareId(s, &idbuf)))
+        return Error.BadShare;
+
+    const prk = prkOf(s);
+    var map = RecordMap.init(alloc);
+    defer map.deinit();
+
+    var pos: usize = bundle_magic.len + id_len;
+    var root_record: ?[]const u8 = null;
+    while (pos < bytes.len) {
+        if (pos + 8 > bytes.len) return Error.BadBundle;
+        const len: usize = @intCast(std.mem.readInt(u64, bytes[pos..][0..8], .little));
+        pos += 8;
         if (pos + len > bytes.len) return Error.BadBundle;
         const payload = bytes[pos..][0..len];
         pos += len;
@@ -6492,7 +6731,7 @@ test "both durability modes append the same bytes" {
     defer alloc.free(data);
     try testing.expectEqualStrings("one\ntwo\nthree\nfour\n", data);
 }
-N   §  -       .sdt/objects/77/851a56b22fd1d1c608d17bcad7487df3b835cd9ad67ea806ba7a0d3823d9e7B      õ   _¢`√æ`PªXXw#Dﬂ ^º&0OXΩ—ûÚ]7N   §  5       .sdt/objects/77/900bae981f86843fd7d2fc6d82797526640b5a78eb69ec8a6db97791416cfdx+)JMU06c040031QHÀÃI’+©(a8ﬂsbEî¸◊%ªÏ©˘öñ9… TÚN   §  -       .sdt/objects/77/93832c72392e6bd9689963bcfab4db4c4409d5554b6e18cadb8315d1ff7b2aB          µëÂd*7e˚‰ˆ3∞…v ^‡w≤Ø≤™ép íí¸b€N   §  -       .sdt/objects/77/a2d29adb427d94b909653e01d9fb8602743c49a47a3128cf2a29f1bbbd7847B       –   ;⁄∑%…òñÍÌÃù`™Hk∑Ò‡K ˛°N‡;ÊVŸN   §  -       .sdt/objects/77/aa0a3c681d73c230b01a9a50664924fd27d8574a4e646478ccb44f275f7737B      ü   9˚πÀf”Ï^…7mÊIÛ/2√PMy2Òº…!‘<’66N   §  -       .sdt/objects/77/afed1e2135995e4f39227d287d4aece3b057fe4eba43fb29aab747cc85ed14B       •   Á¬OÀÿëvó+/çâ˙√hV≠À„è;rÌLwOà,ßN   §         .sdt/objects/77/b58866ab3df6f09ff1866cc8ed60b8b5987302ec3e420a61aa610e524e3405xK …OR04eHLIIMQ»ÃS(ŒLI5‚ V∑N   §  -       .sdt/objects/77/b7c666f5cab42338a1ec37838c4e8a00fc74900c456329cf5378de9c3e6791B      0T   [¶ÊÕ-®ÒÃÕ±ØÙ“{ÈﬁÔ€ÆkVÜì⁄~4ÙzN   §  -       .sdt/objects/77/bb839c402ceab11bb7147e0286b1de55498323f314ce94854e8e3118b37865B      H   ôRCï∂∆;a%0[6¿ƒÑó1U°;Õ_\í⁄N   §  -       .sdt/objects/77/ca5cbb0f0b6508b5ee0cd653ccfa81563b3ebb171638a89de9c88787c99732B      ‰   ˚¢≥ê¿˝IN†»ª∏e
+N   §  -       .sdt/objects/77/851a56b22fd1d1c608d17bcad7487df3b835cd9ad67ea806ba7a0d3823d9e7B      õ   _¢`√æ`PªXXw#Dﬂ ^º&0OXΩ—ûÚ]7N   §  5       .sdt/objects/77/900bae981f86843fd7d2fc6d82797526640b5a78eb69ec8a6db97791416cfdx+)JMU06c040031QHÀÃI’+©(a8ﬂsbEî¸◊%ªÏ©˘öñ9… TÚN   §  -       .sdt/objects/77/93832c72392e6bd9689963bcfab4db4c4409d5554b6e18cadb8315d1ff7b2aB          µëÂd*7e˚‰ˆ3∞…v ^‡w≤Ø≤™ép íí¸b€N   §  -       .sdt/objects/77/a2d29adb427d94b909653e01d9fb8602743c49a47a3128cf2a29f1bbbd7847B       –   ;⁄∑%…òñÍÌÃù`™Hk∑Ò‡K ˛°N‡;ÊVŸN   §  -       .sdt/objects/77/aa0a3c681d73c230b01a9a50664924fd27d8574a4e646478ccb44f275f7737B      ü   9˚πÀf”Ï^…7mÊIÛ/2√PMy2Òº…!‘<’66N   §  -       .sdt/objects/77/afed1e2135995e4f39227d287d4aece3b057fe4eba43fb29aab747cc85ed14B       •   Á¬OÀÿëvó+/çâ˙√hV≠À„è;rÌLwOà,ßN   §         .sdt/objects/77/b58866ab3df6f09ff1866cc8ed60b8b5987302ec3e420a61aa610e524e3405xK …OR04eHLIIMQ»ÃS(ŒLI5‚ V∑N   §  -       .sdt/objects/77/b7c666f5cab42338a1ec37838c4e8a00fc74900c456329cf5378de9c3e6791B      0T   [¶ÊÕ-®ÒÃÕ±ØÙ“{ÈﬁÔ€ÆkVÜì⁄~4ÙzN   §  -       .sdt/objects/77/bb839c402ceab11bb7147e0286b1de55498323f314ce94854e8e3118b37865B      H   ôRCï∂∆;a%0[6¿ƒÑó1U°;Õ_\í⁄N   §  -       .sdt/objects/77/beb385acaed050e603cba0dbcef94d4b1abd0d01cd573a4d9a94cf1d29d9fdB     .ë   °óÚñªÍƒ⁄^Ø”ÏùË= I©Mëv}Œ±±√N   §  -       .sdt/objects/77/ca5cbb0f0b6508b5ee0cd653ccfa81563b3ebb171638a89de9c88787c99732B      ‰   ˚¢≥ê¿˝IN†»ª∏e
 ~{…çíÈ2õ4ªs´æ›heòN   §  -       .sdt/objects/77/cbf052a3862e3b09b6d4124437a427e6adc1772849cc03a19f9f0212a222bdB     xá   cJ˘’~Ÿi]™(ãÂ73¥ÿlÏˆ.7ïxZ;ßN   §        .sdt/objects/77/cfbb3f325362386836dd9fc568b4e84df6346b112d9fad997331a227190f6e„MIDX* œ -           „≈)                                                              E     )                       ªªªªªªªªªªõ          ˜ˇˇˇˇˇˇˇ       (                   ﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂ        ˚ˇ    -ÎCruns     -ECDSA-„ˇ                                     ARIA2           „≈)                                                              E     )                       ªªªªªªªªªªõ          CCruns     -ECDSA-„ˇ                                    ARIA2           „≈)                                                              E     )                       ªªªªªªªªªªõ          ˜ˇˇˇˇˇˇˇ       (                   ﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂﬂ        ˚ˇ    -ÎCruns     -ECDSA*„ˇ                                                      E     )                       ªªªªªªªªªªõ          ˜ˇˇˇˇˇˇ2     ﬂN   §  -       .sdt/objects/77/cfdff48070a0a5828d70a0482e0bdd3c5488b23651eb0712e73dab9ddb5b42B       Û   ·'zbdÁ¢˜ny%æû\E¥_4¥≈@m˙Æ™L‰™Cz_N   §  -       .sdt/objects/77/db1ecfb3b9be40e156f282dce53fe61c21b6aa824adc651b51a3c3b6d91e06B      	/   †Î–jkÑ,ÀoàqÁÙ›D?áœ∑ û≥ÔP<ÄóqﬁN   §  -       .sdt/objects/77/e5348ab78ebc680a8f0e137de25f3b35923d256af1dfab4c299c37295217fbB       ≈   uº*≤¿™ñ¿q\1£F·∫◊≠æÅuc∫)´@…I˜N   §  P      .sdt/objects/77/e72a53b666f936b4c5d2bbaa7af05a3fc1ef60aed725f367573ab4db8cfea7/*
  *  LibXDiff by Davide Libenzi ( File Differential Library )
  *  Copyright (C) 2003  Davide Libenzi
@@ -106080,328 +106319,4 @@ test "merge conflicts a symlink against a regular file" {
     const base_tree = try treeOf(&store, &base_entries);
 
     var ours_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
-        .{ .mode = .regular, .path = "p", .blob = try store.writeFileContent("plain\n") },
-    };
-    const ours_tree = try treeOf(&store, &ours_entries);
-
-    var theirs_entries = [_]object.TreeEntry{
-        .{ .mode = .regular, .path = "other", .blob = try store.writeFileContent("other\n") },
-        .{ .mode = .symlink, .path = "p", .blob = try store.writeFileContent("some/target") },
-    };
-    const theirs_tree = try treeOf(&store, &theirs_entries);
-
-    const result = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
-    defer freeMergeResult(alloc, result);
-
-    try testing.expectEqual(@as(usize, 1), result.conflicts.len);
-    try testing.expectEqualStrings("p", result.conflicts[0]);
-    const p = try entryAt(&store, alloc, result.tree, "p");
-    try testing.expectEqual(object.Mode.symlink, p.mode);
-    const p_data = try store.readFileContent(p.blob);
-    defer alloc.free(p_data);
-    try testing.expectEqualStrings("some/target", p_data);
-    try testing.expect(!hasConflictMarkers(p_data));
-}
-N   §  •       .sdt/objects/95/bf79085c653f3a69a7a4109ffe5a730d3488f08864e3fd6665f98a81609055/*
- * Copyright (C) the libgit2 contributors. All rights reserved.
- *
- * This file is part of libgit2, distributed under the GNU GPL v2 with
- * a Linking Exception. For full terms see the included COPYING file.
- */
-
-#include "common.h"
-
-#include "git2/sys/hashsig.h"
-#include "futils.h"
-#include "util.h"
-
-typedef uint32_t hashsig_t;
-typedef uint64_t hashsig_state;
-
-#define HASHSIG_SCALE 100
-
-#define HASHSIG_MAX_RUN 80
-#define HASHSIG_HASH_START	INT64_C(0x012345678ABCDEF0)
-#define HASHSIG_HASH_SHIFT  5
-
-#define HASHSIG_HASH_MIX(S,CH) \
-	(S) = ((S) << HASHSIG_HASH_SHIFT) - (S) + (hashsig_state)(CH)
-
-#define HASHSIG_HEAP_SIZE ((1 << 7) - 1)
-#define HASHSIG_HEAP_MIN_SIZE 4
-
-typedef int (*hashsig_cmp)(const void *a, const void *b, void *);
-
-typedef struct {
-	int size, asize;
-	hashsig_cmp cmp;
-	hashsig_t values[HASHSIG_HEAP_SIZE];
-} hashsig_heap;
-
-struct git_hashsig {
-	hashsig_heap mins;
-	hashsig_heap maxs;
-	size_t lines;
-	git_hashsig_option_t opt;
-};
-
-#define HEAP_LCHILD_OF(I) (((I)<<1)+1)
-#define HEAP_RCHILD_OF(I) (((I)<<1)+2)
-#define HEAP_PARENT_OF(I) (((I)-1)>>1)
-
-static void hashsig_heap_init(hashsig_heap *h, hashsig_cmp cmp)
-{
-	h->size  = 0;
-	h->asize = HASHSIG_HEAP_SIZE;
-	h->cmp   = cmp;
-}
-
-static int hashsig_cmp_max(const void *a, const void *b, void *payload)
-{
-	hashsig_t av = *(const hashsig_t *)a, bv = *(const hashsig_t *)b;
-	GIT_UNUSED(payload);
-	return (av < bv) ? -1 : (av > bv) ? 1 : 0;
-}
-
-static int hashsig_cmp_min(const void *a, const void *b, void *payload)
-{
-	hashsig_t av = *(const hashsig_t *)a, bv = *(const hashsig_t *)b;
-	GIT_UNUSED(payload);
-	return (av > bv) ? -1 : (av < bv) ? 1 : 0;
-}
-
-static void hashsig_heap_up(hashsig_heap *h, int el)
-{
-	int parent_el = HEAP_PARENT_OF(el);
-
-	while (el > 0 && h->cmp(&h->values[parent_el], &h->values[el], NULL) > 0) {
-		hashsig_t t = h->values[el];
-		h->values[el] = h->values[parent_el];
-		h->values[parent_el] = t;
-
-		el = parent_el;
-		parent_el = HEAP_PARENT_OF(el);
-	}
-}
-
-static void hashsig_heap_down(hashsig_heap *h, int el)
-{
-	hashsig_t v, lv, rv;
-
-	/* 'el < h->size / 2' tests if el is bottom row of heap */
-
-	while (el < h->size / 2) {
-		int lel = HEAP_LCHILD_OF(el), rel = HEAP_RCHILD_OF(el), swapel;
-
-		v  = h->values[el];
-		lv = h->values[lel];
-		rv = h->values[rel];
-
-		if (h->cmp(&v, &lv, NULL) < 0 && h->cmp(&v, &rv, NULL) < 0)
-			break;
-
-		swapel = (h->cmp(&lv, &rv, NULL) < 0) ? lel : rel;
-
-		h->values[el] = h->values[swapel];
-		h->values[swapel] = v;
-
-		el = swapel;
-	}
-}
-
-static void hashsig_heap_sort(hashsig_heap *h)
-{
-	/* only need to do this at the end for signature comparison */
-	git__qsort_r(h->values, h->size, sizeof(hashsig_t), h->cmp, NULL);
-}
-
-static void hashsig_heap_insert(hashsig_heap *h, hashsig_t val)
-{
-	/* if heap is not full, insert new element */
-	if (h->size < h->asize) {
-		h->values[h->size++] = val;
-		hashsig_heap_up(h, h->size - 1);
-	}
-
-	/* if heap is full, pop top if new element should replace it */
-	else if (h->cmp(&val, &h->values[0], NULL) > 0) {
-		h->size--;
-		h->values[0] = h->values[h->size];
-		hashsig_heap_down(h, 0);
-	}
-
-}
-
-typedef struct {
-	int use_ignores;
-	uint8_t ignore_ch[256];
-} hashsig_in_progress;
-
-static int hashsig_in_progress_init(
-	hashsig_in_progress *prog, git_hashsig *sig)
-{
-	int i;
-
-	/* no more than one can be set */
-	GIT_ASSERT(!(sig->opt & GIT_HASHSIG_IGNORE_WHITESPACE) ||
-		   !(sig->opt & GIT_HASHSIG_SMART_WHITESPACE));
-
-	if (sig->opt & GIT_HASHSIG_IGNORE_WHITESPACE) {
-		for (i = 0; i < 256; ++i)
-			prog->ignore_ch[i] = git__isspace_nonlf(i);
-		prog->use_ignores = 1;
-	} else if (sig->opt & GIT_HASHSIG_SMART_WHITESPACE) {
-		for (i = 0; i < 256; ++i)
-			prog->ignore_ch[i] = git__isspace(i);
-		prog->use_ignores = 1;
-	} else {
-		memset(prog, 0, sizeof(*prog));
-	}
-
-	return 0;
-}
-
-static int hashsig_add_hashes(
-	git_hashsig *sig,
-	const uint8_t *data,
-	size_t size,
-	hashsig_in_progress *prog)
-{
-	const uint8_t *scan = data, *end = data + size;
-	hashsig_state state = HASHSIG_HASH_START;
-	int use_ignores = prog->use_ignores, len;
-	uint8_t ch;
-
-	while (scan < end) {
-		state = HASHSIG_HASH_START;
-
-		for (len = 0; scan < end && len < HASHSIG_MAX_RUN; ) {
-			ch = *scan;
-
-			if (use_ignores)
-				for (; scan < end && git__isspace_nonlf(ch); ch = *scan)
-					++scan;
-			else if (sig->opt &
-					 (GIT_HASHSIG_IGNORE_WHITESPACE | GIT_HASHSIG_SMART_WHITESPACE))
-				for (; scan < end && ch == '\r'; ch = *scan)
-					++scan;
-
-			/* peek at next character to decide what to do next */
-			if (sig->opt & GIT_HASHSIG_SMART_WHITESPACE)
-				use_ignores = (ch == '\n');
-
-			if (scan >= end)
-				break;
-			++scan;
-
-			/* check run terminator */
-			if (ch == '\n' || ch == '\0') {
-				sig->lines++;
-				break;
-			}
-
-			++len;
-			HASHSIG_HASH_MIX(state, ch);
-		}
-
-		if (len > 0) {
-			hashsig_heap_insert(&sig->mins, (hashsig_t)state);
-			hashsig_heap_insert(&sig->maxs, (hashsig_t)state);
-
-			while (scan < end && (*scan == '\n' || !*scan))
-				++scan;
-		}
-	}
-
-	prog->use_ignores = use_ignores;
-
-	return 0;
-}
-
-static int hashsig_finalize_hashes(git_hashsig *sig)
-{
-	if (sig->mins.size < HASHSIG_HEAP_MIN_SIZE &&
-		!(sig->opt & GIT_HASHSIG_ALLOW_SMALL_FILES)) {
-		git_error_set(GIT_ERROR_INVALID,
-			"file too small for similarity signature calculation");
-		return GIT_EBUFS;
-	}
-
-	hashsig_heap_sort(&sig->mins);
-	hashsig_heap_sort(&sig->maxs);
-
-	return 0;
-}
-
-static git_hashsig *hashsig_alloc(git_hashsig_option_t opts)
-{
-	git_hashsig *sig = git__calloc(1, sizeof(git_hashsig));
-	if (!sig)
-		return NULL;
-
-	hashsig_heap_init(&sig->mins, hashsig_cmp_min);
-	hashsig_heap_init(&sig->maxs, hashsig_cmp_max);
-	sig->opt = opts;
-
-	return sig;
-}
-
-int git_hashsig_create(
-	git_hashsig **out,
-	const char *buf,
-	size_t buflen,
-	git_hashsig_option_t opts)
-{
-	int error;
-	hashsig_in_progress prog;
-	git_hashsig *sig = hashsig_alloc(opts);
-	GIT_ERROR_CHECK_ALLOC(sig);
-
-	if ((error = hashsig_in_progress_init(&prog, sig)) < 0)
-		return error;
-
-	error = hashsig_add_hashes(sig, (const uint8_t *)buf, buflen, &prog);
-
-	if (!error)
-		error = hashsig_finalize_hashes(sig);
-
-	if (!error)
-		*out = sig;
-	else
-		git_hashsig_free(sig);
-
-	return error;
-}
-
-int git_hashsig_create_fromfile(
-	git_hashsig **out,
-	const char *path,
-	git_hashsig_option_t opts)
-{
-	uint8_t buf[0x1000];
-	ssize_t buflen = 0;
-	int error = 0, fd;
-	hashsig_in_progress prog;
-	git_hashsig *sig = hashsig_alloc(opts);
-	GIT_ERROR_CHECK_ALLOC(sig);
-
-	if ((fd = git_futils_open_ro(path)) < 0) {
-		git__free(sig);
-		return fd;
-	}
-
-	if ((error = hashsig_in_progress_init(&prog, sig)) < 0) {
-		p_close(fd);
-		return error;
-	}
-
-	while (!error) {
-		if ((buflen = p_read(fd, buf, sizeof(buf))) <= 0) {
-			if ((error = (int)buflen) < 0)
-				git_error_set(GIT_ERROR_OS,
-					"read error on '%s' calculating similarity hashes", path);
-			break;
-		}
-
-		error =
+        .{ .mode = .regular, .path = "other", .blob = 

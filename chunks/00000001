@@ -1,4 +1,15 @@
-id_hex: [16]u8 = undefined;
+sdt grade --once`, or `sdt watch`, to start capturing");
+        return;
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const start = if (all.len > limit) all.len - limit else 0;
+    for (all[start..]) |m| {
+        var id_hex: [16]u8 = undefined;
         _ = m.shortId(&id_hex);
         const v = ix.best(
             m.full_tree,
@@ -41443,7 +41454,8 @@ int p_munmap(git_map *map)
 #endif
 
 N   ¤  -       .sdt/objects/24/f3e727bb3d7e08ddabe28074dd289ec1973a6304237334482733650fe7eb52B       )   ?´É¦²½~Bdğ©;ùè’fŒÂÂóĞÿ£Ùœ¹   í          .sdt/objects/25N   ¤  ¤       .sdt/objects/25/0369002524a8acb6efe619358ffd9d201633774cf043469d96dce0fc6c4550x¥Ë1C9§Š4°hò›M$„¸Ğä3Ñ®D6(hŸ€è€›ılYµ”µs©Í®7"N
-f™’!xk­RˆsÂœI²p»ùF[çaÎQÁh‘R&Q–6&´ŒÈ³ )2ÿèKmüœ^¾%~Yj¹×hĞ:Ñ7ø¹}¬åÈ…2R §øÀg;ı9Ãz[Ÿ«¿NØ;P]N   ¤  0       .sdt/objects/25/0e0b4c65266be830ceaaedabe85f985251378495b770955f8f48b063adb9abx+)JMU06d040031QHËÏgx6÷ÑìM¯9{wk®+ºqèIOğD àĞN   ¤  -       .sdt/objects/25/1420f8ebb612a36d99edffad43db0a2d02940c8fb998db13e915f3fb5c29f8B       Ğ   àŒçğ¹¹ÇKÚ–ÈèMU3f”©dPGóGÜC÷5—N   ¤  -       .sdt/objects/25/18f435c089c3d1bc8925dabcc1f442f05918f8f78f23a9f0e125a1b4df79f5B      bo   û^¾œ¯IØ™‚²“+û4c¹Ç4p*ı;Ÿæø‚­y}N   ¤  Œ      .sdt/objects/25/1c8c9795b508a4c86beeafb12b79bf8a72d55c9ff3d76efab0ed4d12793aad#include "clar_libgit2.h"
+f™’!xk­RˆsÂœI²p»ùF[çaÎQÁh‘R&Q–6&´ŒÈ³ )2ÿèKmüœ^¾%~Yj¹×hĞ:Ñ7ø¹}¬åÈ…2R §øÀg;ı9Ãz[Ÿ«¿NØ;P]N   ¤  0       .sdt/objects/25/0e0b4c65266be830ceaaedabe85f985251378495b770955f8f48b063adb9abx+)JMU06d040031QHËÏgx6÷ÑìM¯9{wk®+ºqèIOğD àĞN   ¤  Ï       .sdt/objects/25/0e505bbc030d52e1631debd12379e1b1745d73543a01ef1e57b6076a967f04V master    cohesive-workflows   ÑöúÔşHtÂúW(³òTE«¨¶t[šå+÷ì* from-git   ÈnÛP:b“HX¡çZƒ,$%±·;mâDÌ¢¤ master   ÄĞ*SÏœR¡P	•n&À°+dr¨ZÖ¼Õ§÷³ 
+sdt-remote   ¤1@m´a‚\ S'şh!ˆ÷ÊÁ¾Qkíiğ?ªÖ*~N   ¤  -       .sdt/objects/25/1420f8ebb612a36d99edffad43db0a2d02940c8fb998db13e915f3fb5c29f8B       Ğ   àŒçğ¹¹ÇKÚ–ÈèMU3f”©dPGóGÜC÷5—N   ¤  -       .sdt/objects/25/18f435c089c3d1bc8925dabcc1f442f05918f8f78f23a9f0e125a1b4df79f5B      bo   û^¾œ¯IØ™‚²“+û4c¹Ç4p*ı;Ÿæø‚­y}N   ¤  Œ      .sdt/objects/25/1c8c9795b508a4c86beeafb12b79bf8a72d55c9ff3d76efab0ed4d12793aad#include "clar_libgit2.h"
 #include "git2/sys/stream.h"
 #include "streams/tls.h"
 #include "streams/socket.h"
@@ -53654,7 +53666,18 @@ G.°cšÉ±ğm´)SoF D OmDã5¼²u«loCœ5±±ón%‰sÚÎe°*6Š\8*9œeÃ_mskÕ¡ªc»LDZ3
 ÄSR½ØŸn¡û%-G¯‡ğ-€–q*æyyiUÏ‡Œ¥4Œ_+T\šå¡ŒjZÌï°[¾%½y-eî²üIü÷\‡ƒ” Ô$\ãÏÓk`OHøUx58ÆE$Jãl‹ÃÜÒ£qdgAtıâ”HñT].pç>Àƒ°£øŒGøöp“<R¶f–mù>;dXõÛcx•)ãh›^¶AŸI–İXb¼[1œÇt– qƒŸc£¬"„Vó~MnÃ?Aİçx¾>ÎxxÛˆC°³n]S6ø szišâ
 6v»ÑªH›¡p'Œ_€§DGJx¦Ø_¡GØ9@óÇ>5±çykâ;&)pXxvÎ<‹@O·òìÍie€a¯9!‚˜_ó‹7`7zCÉç >–Á–\D,%ùˆô.IÕ³êƒØ¦“6Îa‰7»’Q„Sfr÷ñu#¹#Fy65L‰uC>^%€ƒOUO<$²O™úZçöÙã²©zÅ¾UÂıÛT(ágSĞĞ¼2â¼ÆK8§ÿ9^Çc6S¬ˆÇXdDo'±ëY©<Ùú½"Ç;Á¸‘Oóà×5‰å'Ÿ	‡ÏiFı<›c â¼Ëï}ÎòrÌ¤hâ¾«oš
 Ù2¾'?ÏõGä^81ŸiÆ!/Q(ñ/®1OPu»VıíØæÿ?IPÓN   ¤  -       .sdt/objects/27/bc45c115efba0a25982c2a86b556199b459831f7aded03622321fcdf077b44B      b   ¥†æSÇVIò«§§ŠWu	¨S9=ô²ÖBD1ì~N   ¤  -       .sdt/objects/27/c3039cfa2bf90abc33507ac19fbd3ca06fd2e4671080fa44620b588655ad18B          ÷Ãö0V¼ŞÖ÷Bb qzµRØÙ%˜Yºì„RcİN   ¤  )       .sdt/objects/27/c3a80c9986b9e6a574ed34f77b48155008246e21930b47382abb708ccc34833a34580a35add43a4cf361e8e9a30060a905c876
-N   ¤  -       .sdt/objects/27/c6c2a8148140d44113524d27c02b83c8d123520ea5347269db36f923ef5785B      ,T   ˜î?îœ÷P$Úçvx”PšÙ]‘û1Äÿ°¤w^øà¬ÓõN   ¤  -       .sdt/objects/27/c8bc65cf36c5ed7bad75bbf821e6d7719ffe5c70db6a168b4e76bba8c45591B       )   ±÷oêJû›†EX†}”ÁéôGÙøA:œÜ¯zph†N   ¤  -       .sdt/objects/27/c962f41f259b77126e4c29fae45291003deb3f954f4be93b42ebf612f4266eB       ¯   h8)Ù‰{ï9|ŒKX›P9ˆ/ÄG›P~À-N   ¤  -       .sdt/objects/27/ca8f22f36b72cf20b78cec906b06581164298d1c683b50d17757c66ee9ac83B      ^   ™•/ÜQ]öÃ5µ`Øƒ4õüâ$¬ĞEˆ	Ş—lÏì3 N   ¤  Œ      .sdt/objects/27/ccea15374130012cfe4aff05fdb6ce8f6c0db71a90af5e6249fceb655a9d90ÿÿÿáVR˜3P$Bó{õ=v=qªß	§•–ÉtlN~ìçÇ¯„–FÈT³…ê—t;æ¨wDyŸ×8è÷–|rÀµWNBùSóB²ïáº{[dé„qŸOİ#ŸQE/¦_íóšÀ›!Ç7<=¸5mr¶"„Ã<Èúy[+CS¼Î:RzĞ¤÷öDÄx Ç&j+àLWÕ¦aF‘ê™½Ğ{šŒ‰ñÙçMÄüæBì^ø¦Yé¸ß“J8c¿6DmÏ›÷TáVR˜3P$Bó{õ=v=qªß	§•–ÉtlN~ìçÇ¯„–FÈT³…ê—t;æ¨wDyŸ×8è÷–|rÀµ4k°û·ïóÏş³Å«       "	­œä$›Å€uéuO¥[[ZûL‘;L B“J4c¿6DmÏ›÷TáVR˜3P$Bó{õ=v=qªß	§•–ÉtlN~ìçÇ¯„–FÈT³…ê—t;æ¨wDyŸ×8è÷–|rÀµWéìBŸ²õN   ¤  -       .sdt/objects/27/dcf36a03cc4b1be2ef65d1833cb238084ecb47177211b8f6f3dfac9a981db8B      é   ·ÂK/AT²7"ëf£Š¿ß€›ÖR–‚ÎAö¨N   ¤  –
+N   ¤  -       .sdt/objects/27/c6c2a8148140d44113524d27c02b83c8d123520ea5347269db36f923ef5785B      ,T   ˜î?îœ÷P$Úçvx”PšÙ]‘û1Äÿ°¤w^øà¬ÓõN   ¤  -       .sdt/objects/27/c8bc65cf36c5ed7bad75bbf821e6d7719ffe5c70db6a168b4e76bba8c45591B       )   ±÷oêJû›†EX†}”ÁéôGÙøA:œÜ¯zph†N   ¤  -       .sdt/objects/27/c962f41f259b77126e4c29fae45291003deb3f954f4be93b42ebf612f4266eB       ¯   h8)Ù‰{ï9|ŒKX›P9ˆ/ÄG›P~À-N   ¤  -       .sdt/objects/27/ca8f22f36b72cf20b78cec906b06581164298d1c683b50d17757c66ee9ac83B      ^   ™•/ÜQ]öÃ5µ`Øƒ4õüâ$¬ĞEˆ	Ş—lÏì3 N   ¤  Œ      .sdt/objects/27/ccea15374130012cfe4aff05fdb6ce8f6c0db71a90af5e6249fceb655a9d90ÿÿÿáVR˜3P$Bó{õ=v=qªß	§•–ÉtlN~ìçÇ¯„–FÈT³…ê—t;æ¨wDyŸ×8è÷–|rÀµWNBùSóB²ïáº{[dé„qŸOİ#ŸQE/¦_íóšÀ›!Ç7<=¸5mr¶"„Ã<Èúy[+CS¼Î:RzĞ¤÷öDÄx Ç&j+àLWÕ¦aF‘ê™½Ğ{šŒ‰ñÙçMÄüæBì^ø¦Yé¸ß“J8c¿6DmÏ›÷TáVR˜3P$Bó{õ=v=qªß	§•–ÉtlN~ìçÇ¯„–FÈT³…ê—t;æ¨wDyŸ×8è÷–|rÀµ4k°û·ïóÏş³Å«       "	­œä$›Å€uéuO¥[[ZûL‘;L B“J4c¿6DmÏ›÷TáVR˜3P$Bó{õ=v=qªß	§•–ÉtlN~ìçÇ¯„–FÈT³…ê—t;æ¨wDyŸ×8è÷–|rÀµWéìBŸ²õN   ¤        .sdt/objects/27/d7490ede5479f5db23818d05687c1205092c17284038e07bef14976f1b7401T   Q  ¤W ˜–4ó(aöó#ıûÊ\\ND§Pl·fç0¥^ .github/workflows/nightly.yml  ¤IÌã¹}Şn$l-Œ½ÇG¼vKùú7YQœ²6 .github/workflows/release.yml  ¤oE¹6¯vø5ù]*ù¬Óæ¾<öAşÌnò5rxXF 
+.gitignore  ¤#ñÏ²wX)¢»ë…şaÄ%Ş,şjIëÊÊß‚ 	.grignore  ¤6Ï\'¿r,ÏÊ±« :PÜÁ;šæ €á~á¶ %2026-08-31-recovery-and-split-gaps.md  ¤áªúi’‹Ğø®'/¬2¸ƒcvÄÈìg)c{JÁÿpš LICENSE  ¤9ï½é$á6Òß=ÈœÒ[ñšÙ¼Æ~¡4íĞÔ‚
+ 	README.md  ¤·\j¢[>ú`ÒæL% ù¼Eb‹°"¥†YÌØK&% SKILL.md  ¤WÆ¥1N?óKI™ˆ±Ó4”M`"ø]7¨cšq¨±9ì‡¤ brand/icon.svg  ¤”¤¾«<ÓeP]Óÿ2óPèPx§—Ÿõ×²L	~˜2 brand/logo-track.svg  ¤û~H}{V#é- ó­»	¥Üài~÷(œ	™~I— brand/logo-wordmark.svg  ¤Şö›–kgËca¦:H<ÂQ4xù(ÿÔCeáô‹l±Ş brand/logo.svg  ¤7+ı;	€å$<²„uêJŠ,%€.¤G˜×Ì¡ó 	build.zig  ¤¸‹Ñ½S»0ôPB*‹‘ÂWÏºNß¢ë¼mÖ•$$ò2Œ build.zig.zon  ¤éŸøü¸r¦t±x¥Ç‰~ÃF§¥d²¥kúep÷Ÿ; demo.gif  ¤sç_w–›r*ĞGøtWïC4›'a­¬n[ÑB 	demo.tape  ¤gQJ}·¬ŸT’‘?~«’ë&‹(£âä°ŸBğ3é docs/zig-0.16-notes.md  ¤ZÙê?´c›¡w”ÈÃ?ÕÀæI³·ÅÒÁóY+¨óR«f src/absorb.zig  ¤—Ö`K»u…û5áŸ¼×å!!x FLšòFÿ‹×ê src/agentscan.zig  ¤©ÂA 
+ëùÑS=OÚ„ººÒ.
+°IFRõÃã™” src/applog.zig  ¤×â:]#ÂòÆ¾Cªœ~Lë²ûÿq±‰>µ;B”‘ src/apricot_bridge.zig  ¤…E•$jÉ"í¬=ÈÍ†ÀMäÌU§Ö$Aİ src/attest.zig  ¤ÚÓñG~ƒ5‡]YçÂ(„é÷°SŸ¼>°Ì¦¡l—~İô src/attribution.zig  ¤Îé’@• YÚƒ¢×n«IwäĞMÄ(ÄÑs‹ÃTú src/blame.zig  ¤€õh4epı¬«Cnî™\nIöaĞoT1§/vÇ51 src/branches.zig  ¤¶zÖuÆoC¾÷¶=i2WÌÛŞbMÚYÓ@+Wn{a src/cdc.zig  ¤œh/Gq¯û¾õÎyK“] Ñ'±?‰ğ8t½ÇÛb src/checks.zig  ¤äOzÿo“L: šN,-¸à?a‡ÂÏ­úØ·op src/completions.zig  ¤ØHâK6Tò®XïRŠÏÙ"b3=Ã^aP°¬|ÜaTì src/config.zig  ¤¢À Ÿ0¯êŠÌ7Q Û|Ÿâç;v%ey¡3­K src/diff.zig  ¤S…Ìm„Ÿ•Ú*ÄÖgŞpMeAÒ’şœ¯1èî'-èËáb src/discovery.zig  ¤N'ió
+b¡²5›†=Ğùr‹vÕ3g¬¡ïÒèÂ src/flow.zig  ¤w·ÆfõÊ´#8¡ì7ƒŒNŠ ütEc)ÏSxŞœ>g‘ src/fork.zig  ¤çÓ€óÓ4äóøä„Š‚1Ÿ#µ'Ìºçï¾6‘šc] src/freshness.zig  ¤÷ëÁKjvu]äP™[%ªæ!r#@„B\Î"£*= 
+src/gc.zig  ¤ó7ªûW@š'_¬AKk!R!ñ­õí”Éd.«Ÿ	ÖVÉí src/git.zig  ¤>%ìì¬#İJÊ·¾×·7fİÎõÌVÀæK†2²çşn8 src/grade.zig  ¤Eïò¿?Æhî²~BÃ6ô~½"¨ùĞoV÷óê— src/history.zig  ¤ZW|›¿e,óù=5†Bkîó*ç†w¸&L'ë¼£{ src/hook.zig  ¤Âù`Ú^†B9Ñ_±ùºmƒYoâ =UœFH\«Á
+Ş“ñ src/ignore.zig  ¤¸ÃØÅ·haÅELE(aa€¡6áà¨É@º‹Aché†È src/index.zig  ¤ÃopÕ60;¨8!w®çŞÛ…6%$êü”nü<Üz» src/integrity.zig  ¤l÷J™ÈÈ·É«ÕìpxI–#Üd­ÓÄ÷$	üË@p src/keyring.zig  ¤Âƒ/*µê…oÏı‰ù[%jWŒôiÖ¸ÏíZC?·Û src/lfs.zig  ¤ÖÏqVË¯—”6˜ı©)’.±è ¬0´‰.àq­ src/live.zig  ¤w¾³…¬®ĞPæË ÛÎùMK½ÍW:Mš”Ï)Ùı src/main.zig  ¤ä/×Ó`eìm£„”j|ŠçğıåÄ„ã°qm=~ÊmQä src/merge.zig  ¤ñíàıGMn¯E¢SÈ{°tïÎ—Uš¤VóIBCõ8nñ src/mesh.zig  ¤Iº5"*¤Dú}´A/8‚mâ½©44r›æÀœ@Oağ src/moment.zig  ¤5”sAdÑEóÂÚÙJãÌdıl%zEi‰-bëHn«ˆ• src/net.zig  ¤ˆùKeoÈ¼{»85);q¥eKÍİvS,c¶Ë¥ŒG src/object.zig  ¤6¹«x8°oòÜ‚Á›Ø¼r¯m2¯‚Ì` ğ) src/oid.zig  ¤ôÉ–*g©µ„µøm‚ (û0ÚE0‡ôéôpõ¯* src/opdag.zig  ¤¾şŠ¸,SKØuævßS<›Ë˜ô¸½Ph\{q¡t src/oplog.zig  ¤Cˆ†èVYæ¯™c‚±e+üàIèÖ½•w!ŞwÀä(¡ src/proc.zig  ¤ı]1šÙšvÛ¡S†Öü­]uz÷gÄ1<íFıîÂ src/provenance.zig  ¤oÛû‹RÛ3§sOUÙ„Æeªóf+ÜÿÜÙÛI src/purge.zig  ¤œ+í¾À»@÷?­rc492ë£LssøçjÅw(xë src/readset.zig  ¤¡^Ä²ÄÌz¤¯<Ë´'Ùú`E¬÷zNÍé;çİ#V° src/recap.zig  ¤­§)?	È`„Š’<áï2hÇZyV´lãkê‘¥ src/replay.zig  ¤¯"ƒıæ½Évï+ûTÓ$ŒŒÙ˜s³iÿk1SÒù° src/resolution.zig  ¤Ù2Şs^­ñMOyÈßë°ËÍ¶/—	×¡¡tx!"7• src/revspec.zig  ¤x¢!ï)t¥*‰Å"X3È˜/ŒÓñ
+Öš8NöÚE+mj src/rewind.zig  ¤èÕïz>ªÂ²~Åz=÷Ö~Jè/œ·[EïIÙ^Õ src/sched.zig  ¤‹ël¦òÙµ*ş×ùş'>+Nº®Ñ¾i8h²ø src/seal.zig  ¤ê# iû.É½'-4/yéGÌğèDnñÂù>•O src/settings.zig  ¤7Ú5'Oƒ`¾m‰Á[	'Ò°‰æ¹Cƒ>T÷| src/share.zig  ¤·£ŞÌ%<§ÆëÆälÑye×oßÉ\8c™èy-¬ˆ src/stack.zig  ¤æï
+Wz!0ápd mêWc2#æ]~oØ°jA6
+ src/store.zig  ¤Ó ­wi“ë‹;“t:ä3$ßtÖĞÔæ¾²Ëín4+'t src/superpose.zig  ¤–c”/€®/ÈZˆ÷©	p>¾üøïÜ²t.Yƒ¼B src/sync.zig  ¤«ŞFˆ2ˆçß[›eëU:­( —Ó¦®<ªCëI9m src/tracer.zig  ¤fİ.ã¡ÕèÜHlÇ~nÂÙÈMGXë´š”ÜnØ"	¼ src/transfer.zig  ¤·uoá.A<æŒ·–º”ªél©QT8©ûØV( 
+src/ui.zig  ¤è©Á›0Åî‰hs®\PÊìX4Ê7É|í³5n&^]è src/update.zig  ¤¶n”ÓÃÄ’pç\^¥xXfâà7ÏtAã²û src/verdict.zig  ¤üÅ{Hè„d]\ŠÃ7­ÕèéÍ1¸Í:Mhs2 src/warrant.zig  ¤4ÛÚL"¯:rÖıVÙÓ£h–İ÷O'SŒª@N)f src/watch.zig  ¤½Ûy´şğ%&Y¥°œyp”h;¦ÑÚªVÍìÚ»ı src/workspace.zig  ¤R˜ óğKq9ßÈšõ—Ç°Ö7ç‘±tÃ×5ÒÆ­ src/worktrees.zig  ¤ó+|sÉR·úUe2,‡Öã¾áE8åHOÿßY‹ src/wormhole.zigN   ¤  -       .sdt/objects/27/dcf36a03cc4b1be2ef65d1833cb238084ecb47177211b8f6f3dfac9a981db8B      é   ·ÂK/AT²7"ëf£Š¿ß€›ÖR–‚ÎAö¨N   ¤  –
       .sdt/objects/27/e0ce8c68bcd5abb05539a13991ce38f8be076719916bc309584ee59a7ef66a    CGPH OIDF                                                          ÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍÍ   µ              /           àWƒp‡e  üÿÿÿ   KúµÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ĞŠ0]*JíøÈÊNd¹p   p      LZé½®á.êi—)í$U^@¹ıf¡*  ¼Œi[½´l\o                                            àWƒp‡e   p €    KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p                àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ĞŠ0]*JíøÈÊNd¹p   p     LZé½®ñ.êi—)í$U^@¹ıf¡*  ¼Œi[½´l\o                                            àWƒp‡e   p €    KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨2ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ĞŠ0]*JíøÈÊNd¹p   p     LZé½®ñ.êi—)í$U^@¹ıf¡*  ¼Œi[½´l\ofÌŒÅ´n  ¡ë_«@F                    CGPH €                                                                      àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ĞŠ0]*JíøÈÊNd¹p   p      LZé½®ñ.êi—)í$U^@¹ıf¡*   p      N‘Íå‹Gp   p      KéÀ·ö y‹fNµy2š~ùUœxÑ   p      KéÀR¾ĞŠ0]*JíøÈÊNd¹p   p      LZé½®ñ.êi—)í$U^@¹ıf¡*  ¼Œi[½´l\o                                            àWƒp‡e   p €    KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p                àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ĞŠ0]*JíøÈÊNd¹p   p     LZé½®ñ.êi—)í$U^@¹ıf¡*  ¼Œi[½´l\o                                            àWƒp‡e   p €    KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨2ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p     K éÀR¾ĞŠ0]*JíøÈÊNd¹p   p~    LZé½®ñ.êi—)í$U^@¹ıf¡*  ¼Œi[½´l\ofÌŒÅ´n  ¡ë_«@F                    CGPH €                                                                      àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   p      KéÀ·ö y‹fNNy2š~ùUœxÑ   p      KéÀR¾ àWƒp‡e   p      KúµAƒ‚ßñÿ¸½û¨3ôØ»Íå‹Gp   KéÀR¾ĞŠ0]       N   ¤  d     .sdt/objects/27/e7d7b12c39135bc979a01914cc0bdf7e01fc88be7884960d5eb70b843a4c45PACK     \6xœRMoœ0=Ç¿bniÕ°1°`XEU{È±—6ªrìñ®µ`#Ût³ÿ¾ºí*•Úsy~ã'GOE.oIW(ëºàm'8’n„ĞŠË¦SBkEEK‚êr["µR–JI¡Ùˆl„Jm‰‹F*¹mkŞB
 äºÙ
 .[%ZTämSoHËºJæº¬«¦¥èò¦T§xp¾9Û}A<D´î8}ÚhútÃGÈÑVÛºª
@@ -98460,131 +98483,4 @@ pub fn importAll(store: *Store, git_repo_path: []const u8, progress: ?*Progress)
                 var ref: ?*c.git_reference = null;
                 if (c.git_reference_lookup(&ref, repo, rn.ptr) != 0) continue;
                 defer c.git_reference_free(ref);
-                var obj: ?*c.git_object = null;
-                if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) != 0) continue;
-                defer c.git_object_free(obj);
-                const chex = gitOidHex(c.git_object_id(obj));
-                if (map.lookupGr(&chex)) |gr| {
-                    var pbuf: [512]u8 = undefined;
-                    const pth = std.fmt.bufPrint(&pbuf, "refs/tags/{s}", .{tname}) catch continue;
-                    var hbuf: [65]u8 = undefined;
-                    _ = gr.toHex(hbuf[0..64]);
-                    hbuf[64] = '\n';
-                    try store.root.writeFile(store.io, .{ .sub_path = pth, .data = hbuf[0..65] });
-                }
-            }
-        }
-    }
-
-    // Point gr HEAD at the git repo's HEAD branch so gr commands resolve.
-    {
-        var hr: ?*c.git_reference = null;
-        if (c.git_repository_head(&hr, repo) == 0) {
-            defer c.git_reference_free(hr);
-            const sh = c.git_reference_shorthand(hr);
-            if (sh != null) try store.setHeadBranch(std.mem.span(sh));
-        }
-    }
-
-    try map.save(store);
-}
-
-fn gitFilemode(mode: object.Mode) c.git_filemode_t {
-    return switch (mode) {
-        .executable => c.GIT_FILEMODE_BLOB_EXECUTABLE,
-        .symlink => c.GIT_FILEMODE_LINK,
-        else => c.GIT_FILEMODE_BLOB,
-    };
-}
-
-const ExportNode = struct {
-    is_dir: bool,
-    children: std.StringHashMapUnmanaged(*ExportNode),
-    blob_oid: c.git_oid,
-    filemode: c.git_filemode_t,
-
-    fn newDir(alloc: std.mem.Allocator) !*ExportNode {
-        const n = try alloc.create(ExportNode);
-        n.* = .{ .is_dir = true, .children = .{}, .blob_oid = undefined, .filemode = 0 };
-        return n;
-    }
-};
-
-/// Recursively write an ExportNode directory into `repo`, returning its git tree Oid.
-fn writeExportTree(repo: ?*c.git_repository, node: *ExportNode) !c.git_oid {
-    var bld: ?*c.git_treebuilder = null;
-    try check(c.git_treebuilder_new(&bld, repo, null));
-    defer c.git_treebuilder_free(bld);
-
-    var it = node.children.iterator();
-    while (it.next()) |kv| {
-        const name = kv.key_ptr.*;
-        const child = kv.value_ptr.*;
-        var name_z_buf: [1024]u8 = undefined;
-        if (name.len >= name_z_buf.len) return Error.GitError;
-        @memcpy(name_z_buf[0..name.len], name);
-        name_z_buf[name.len] = 0;
-        const name_z: [*c]const u8 = @ptrCast(&name_z_buf);
-        if (child.is_dir) {
-            var sub = try writeExportTree(repo, child);
-            try check(c.git_treebuilder_insert(null, bld, name_z, &sub, c.GIT_FILEMODE_TREE));
-        } else {
-            try check(c.git_treebuilder_insert(null, bld, name_z, &child.blob_oid, child.filemode));
-        }
-    }
-
-    var out: c.git_oid = undefined;
-    try check(c.git_treebuilder_write(&out, bld));
-    return out;
-}
-
-/// Split "Name <email>" into name/email spans. Falls back to the whole string.
-fn splitAuthor(author: []const u8) struct { name: []const u8, email: []const u8 } {
-    if (std.mem.lastIndexOfScalar(u8, author, '<')) |lt| {
-        const gt = std.mem.lastIndexOfScalar(u8, author, '>') orelse author.len;
-        const name = std.mem.trim(u8, author[0..lt], " \t");
-        const email = if (gt > lt + 1) author[lt + 1 .. gt] else "";
-        return .{
-            .name = if (name.len == 0) "superdetermine" else name,
-            .email = if (email.len == 0) "none@superdetermine" else email,
-        };
-    }
-    return .{ .name = if (author.len == 0) "superdetermine" else author, .email = "none@superdetermine" };
-}
-
-/// Git blobs already written during one export, keyed by the superdetermine blob
-/// they came from. Every saved state carries a FULL tree, so without this a file
-/// that never changed is re-read and re-compressed once per state: exporting a
-/// long history of a large tree turns quadratic and looks like a hang.
-const BlobCache = struct {
-    /// How the superdetermine blob was turned into git bytes. `plain` is the
-    /// content verbatim, `pointer` is content that already was an LFS pointer,
-    /// `cleaned` is content replaced by a pointer under the LFS rules of that
-    /// state. The last two are only reusable where the same rules still apply.
-    const Kind = enum { plain, pointer, cleaned };
-
-    const Entry = struct {
-        git_oid: c.git_oid,
-        kind: Kind,
-        lfs_oid_hex: [64]u8,
-        lfs_size: u64,
-    };
-
-    map: std.AutoHashMapUnmanaged([Oid.len]u8, Entry) = .{},
-
-    fn deinit(self: *BlobCache, alloc: std.mem.Allocator) void {
-        self.map.deinit(alloc);
-    }
-
-    fn get(self: *const BlobCache, blob: Oid) ?Entry {
-        return self.map.get(blob.bytes);
-    }
-
-    fn put(self: *BlobCache, alloc: std.mem.Allocator, blob: Oid, entry: Entry) !void {
-        try self.map.put(alloc, blob.bytes, entry);
-    }
-};
-
-/// Build a git tree object in `repo` from a superdetermine flat Tree, returning the
-/// looked-up git tree (caller frees). Reuses the nested ExportNode builder.
-fn buildGitTre
+              

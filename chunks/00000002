@@ -1,4 +1,131 @@
-e(
+  var obj: ?*c.git_object = null;
+                if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) != 0) continue;
+                defer c.git_object_free(obj);
+                const chex = gitOidHex(c.git_object_id(obj));
+                if (map.lookupGr(&chex)) |gr| {
+                    var pbuf: [512]u8 = undefined;
+                    const pth = std.fmt.bufPrint(&pbuf, "refs/tags/{s}", .{tname}) catch continue;
+                    var hbuf: [65]u8 = undefined;
+                    _ = gr.toHex(hbuf[0..64]);
+                    hbuf[64] = '\n';
+                    try store.root.writeFile(store.io, .{ .sub_path = pth, .data = hbuf[0..65] });
+                }
+            }
+        }
+    }
+
+    // Point gr HEAD at the git repo's HEAD branch so gr commands resolve.
+    {
+        var hr: ?*c.git_reference = null;
+        if (c.git_repository_head(&hr, repo) == 0) {
+            defer c.git_reference_free(hr);
+            const sh = c.git_reference_shorthand(hr);
+            if (sh != null) try store.setHeadBranch(std.mem.span(sh));
+        }
+    }
+
+    try map.save(store);
+}
+
+fn gitFilemode(mode: object.Mode) c.git_filemode_t {
+    return switch (mode) {
+        .executable => c.GIT_FILEMODE_BLOB_EXECUTABLE,
+        .symlink => c.GIT_FILEMODE_LINK,
+        else => c.GIT_FILEMODE_BLOB,
+    };
+}
+
+const ExportNode = struct {
+    is_dir: bool,
+    children: std.StringHashMapUnmanaged(*ExportNode),
+    blob_oid: c.git_oid,
+    filemode: c.git_filemode_t,
+
+    fn newDir(alloc: std.mem.Allocator) !*ExportNode {
+        const n = try alloc.create(ExportNode);
+        n.* = .{ .is_dir = true, .children = .{}, .blob_oid = undefined, .filemode = 0 };
+        return n;
+    }
+};
+
+/// Recursively write an ExportNode directory into `repo`, returning its git tree Oid.
+fn writeExportTree(repo: ?*c.git_repository, node: *ExportNode) !c.git_oid {
+    var bld: ?*c.git_treebuilder = null;
+    try check(c.git_treebuilder_new(&bld, repo, null));
+    defer c.git_treebuilder_free(bld);
+
+    var it = node.children.iterator();
+    while (it.next()) |kv| {
+        const name = kv.key_ptr.*;
+        const child = kv.value_ptr.*;
+        var name_z_buf: [1024]u8 = undefined;
+        if (name.len >= name_z_buf.len) return Error.GitError;
+        @memcpy(name_z_buf[0..name.len], name);
+        name_z_buf[name.len] = 0;
+        const name_z: [*c]const u8 = @ptrCast(&name_z_buf);
+        if (child.is_dir) {
+            var sub = try writeExportTree(repo, child);
+            try check(c.git_treebuilder_insert(null, bld, name_z, &sub, c.GIT_FILEMODE_TREE));
+        } else {
+            try check(c.git_treebuilder_insert(null, bld, name_z, &child.blob_oid, child.filemode));
+        }
+    }
+
+    var out: c.git_oid = undefined;
+    try check(c.git_treebuilder_write(&out, bld));
+    return out;
+}
+
+/// Split "Name <email>" into name/email spans. Falls back to the whole string.
+fn splitAuthor(author: []const u8) struct { name: []const u8, email: []const u8 } {
+    if (std.mem.lastIndexOfScalar(u8, author, '<')) |lt| {
+        const gt = std.mem.lastIndexOfScalar(u8, author, '>') orelse author.len;
+        const name = std.mem.trim(u8, author[0..lt], " \t");
+        const email = if (gt > lt + 1) author[lt + 1 .. gt] else "";
+        return .{
+            .name = if (name.len == 0) "superdetermine" else name,
+            .email = if (email.len == 0) "none@superdetermine" else email,
+        };
+    }
+    return .{ .name = if (author.len == 0) "superdetermine" else author, .email = "none@superdetermine" };
+}
+
+/// Git blobs already written during one export, keyed by the superdetermine blob
+/// they came from. Every saved state carries a FULL tree, so without this a file
+/// that never changed is re-read and re-compressed once per state: exporting a
+/// long history of a large tree turns quadratic and looks like a hang.
+const BlobCache = struct {
+    /// How the superdetermine blob was turned into git bytes. `plain` is the
+    /// content verbatim, `pointer` is content that already was an LFS pointer,
+    /// `cleaned` is content replaced by a pointer under the LFS rules of that
+    /// state. The last two are only reusable where the same rules still apply.
+    const Kind = enum { plain, pointer, cleaned };
+
+    const Entry = struct {
+        git_oid: c.git_oid,
+        kind: Kind,
+        lfs_oid_hex: [64]u8,
+        lfs_size: u64,
+    };
+
+    map: std.AutoHashMapUnmanaged([Oid.len]u8, Entry) = .{},
+
+    fn deinit(self: *BlobCache, alloc: std.mem.Allocator) void {
+        self.map.deinit(alloc);
+    }
+
+    fn get(self: *const BlobCache, blob: Oid) ?Entry {
+        return self.map.get(blob.bytes);
+    }
+
+    fn put(self: *BlobCache, alloc: std.mem.Allocator, blob: Oid, entry: Entry) !void {
+        try self.map.put(alloc, blob.bytes, entry);
+    }
+};
+
+/// Build a git tree object in `repo` from a superdetermine flat Tree, returning the
+/// looked-up git tree (caller frees). Reuses the nested ExportNode builder.
+fn buildGitTree(
     store: *Store,
     repo: ?*c.git_repository,
     tree: object.Tree,
@@ -96536,41 +96663,4 @@ echo
 
 git cherry-pick $commits
 N   ¤  —       .sdt/objects/5a/731fef42a36e24b1cfc28da4261fcb8f6f12dcb26fa8b205b4f4b593fa1253V master    from-git   ÈnÛP:b“HX¡çZƒ,$%±·;mâDÌ¢¤ master   ö…Kîo©Hä‘2%­ãÈB£/w)ªY¬èb:HÓ 
-sdt-remote   §A/š%¨¢34Ê»óUg+Å÷Î*àRß8`ä­N   ¤  -       .sdt/objects/5a/7daa79ed584c2e1ea7acd24396072142013e3dcaaa223b442d69ddd4efbddfB       A   ¸%>ê5LG»nÉŞeÉ±/¾¤\ÄRnÉÈà9xÂÓoN   ¤  -       .sdt/objects/5a/80cf4b3e4065988a14b977a0f3671a82b65dab64c33773dbd82b77292717e0B       M   	«.Gx+¾³ğT‘‘ß	è ¶ÍÂZOvUd£`qìN   ¤  -       .sdt/objects/5a/85e0bfb56a2cd4874d7e87f264c123b616896a13dbcc45b2cf4d0318a98505B      4B   õ½ËD@@—xÏÔ½=gØÃnG@XÔdáGYN!ÙN   ¤  Q       .sdt/objects/5a/8dea71fa548b3736eb517621e68035e2162c55e3d05ba8bce1c35dab75baa7x+)JMU07`040031QHËÌIepİÙ¼Ïl»{Ç9{¶çìnøS½!*_\šDz%%ó¢ï¸_[Á¯ıà•çÚeé)	“œ yÊİN   ¤  -       .sdt/objects/5a/928ff4677a1733142e3e14b9ea0a8a6cbe319c56b4d9fecc098fe64ab94609B      „   «¢á[{˜sGC†sîSÌöJ@<|>¬LÛ6²f7NN   ¤  -       .sdt/objects/5a/96f2bc35865a382c8a522a74893104a7a3f582df05e0d681a043f61654af4aB       B   ï¨>Ù^Á§¡ãØCAË­@0ÂnŠLƒ|‘ÿ LCˆ,N   ¤  -       .sdt/objects/5a/98ebb7a502607f9c2edc658ffe3e1cbe1264c4b3e0712b8897a1ccd10eea2cB      3   ÔŞºüÒvœ ZàuÒÑX·!lS†Î—:—ØÆN   ¤  -       .sdt/objects/5a/9dd302372d4dba1fa1935ea53329c7977f98786559e256e3ce9767ccef6410B       ‰   SO°Çx«å¬èowiCä—r¤¸°ç•c!éN   ¤  -       .sdt/objects/5a/9fd0741176a6e7490e23d4bb033d86ef87022f54e94e977d3c7a2efb197472B       6   N“E€Æ©ñ±nÑ0óbSÁ,øhÀKĞ¶eSş ?	€N   ¤  p      .sdt/objects/5a/a3cfe0a4ecfc2273b46357dff42926e9ebcbaeceb5e697b5c23e043a9e974aDIRC      Qg*¤    Qg*¤      şËø  ¤  õ      #<	É˜í
-Koóo5:ì‹q4‡ added-in-master.txt       Qg*¤    Qg*¤      şËù  ¤  õ      ÷î?¡¸À
-ÿà eıµd»“,Ï automergeable.txt Qg*¤    Qg*¤      şËú  ¤  õ      «lD¢èD’­KA»k¬‡5>¬‹ changed-in-branch.txt     Qg*¤    Qg*¤      şËû  ¤  õ      Ş« ²Ó¦õ£9ˆ¬-{fUâ changed-in-master.txt     Qg*¤    Qg*¤      şËü  ¤  õ      *Nˆn`%)Ê©«×†cKÑ¶àŞ conflicting.txt   Qg*¤    Qg*¤      şËı  ¤  õ      ßãò+ªoÎTG0†ºãhŞkİ removed-in-branch.txt     Qg*¤    Qg*¤      şËş  ¤  õ      Èğo.;²–Atg~‘ğ«êĞä<] unchanged.txt     ‘1Šà5Fšñ¥äYÄñ;ş—\„N   ¤  -       .sdt/objects/5a/a4c3b61e5f42e43bc968de68e1398a14e55d01824bae0e8897b8b693414978B       )   !®_hi¶-L†ÖÂç ÂZÁC7?¸0YäN   ¤  -       .sdt/objects/5a/ac2cdd6b20eeeb175b54e0ac9a267772f3e1807f9db6bbf0a9048c91a7a6bfB      {   ÷‚„¹_iåSD¹–ŒïÄn>1³İ ºÅ˜ÿä8÷ñöÅÅN   ¤  5       .sdt/objects/5a/ae0113eba232ad290b937319d092bcb2499ee74f1c10d4876ecab9357ef63cx+)JMU06c040031QHËÌIÕ+©(aèùR:e¶Ëëõ–;<›vsíöË JY±N   ¤  3       .sdt/objects/5a/ae3d61da0a027c9382cbdf4fa35001d2c8f673e18ceb7af7b9be51cc4afe09xKÊÉOR06eˆJ-Êç2ä2â2æ2á2Uˆˆˆà2SˆŒŒä2ç²à²ä
-IÍã à	N   ¤  -       .sdt/objects/5a/bb29dbde45c857850749747fd55d6e564716f300d3760980516adc97fd5159B       ª   íJê¦õƒ(å˜EåÆã¡|n?Vr)©F³M 'Ó«BN   ¤  5       .sdt/objects/5a/c3bdcfa145e0abb6c393170cf07a5ea0babb80e39edbb9e6f18f9ddff04fd7x+)JMU06c040031QÈ/ÊL×+©(a¨ú/xkê)íû·{³=?#ãÁyû9 Po”N   ¤  -       .sdt/objects/5a/ceadb98f2177de3cd83adb6c8c7c63d5c9038e53f3a542e8c32743f152f40dB          á˜5#;ÜÑNGòŞcMÎâ.6ñNÇ iá÷DİcN   ¤  -       .sdt/objects/5a/d3e33751d9a10502cfe7d2b5f01d548723d63007e3534d2128f1eb085fe093B       >   Í£šeXsAJ—“jÚ1êt÷•¿k‰·sTLÍiN   ¤  -       .sdt/objects/5a/d9ea033fb4639ba17794c8c33f9ed5c0e649b3b7c5d2c1f3592ba8f352ab66B      Fk   ³¸‰6ÚqàÔhf5İÒzvLÉy¶Lÿ? ëN   ¤  ‹      .sdt/objects/5a/e1c6a965c59162ff68a183b2d2dd5ee7dbaa54923271afb6feb6bbbed0eb3b/*************************************************
-*      Perl-Compatible Regular Expressions       *
-*************************************************/
-
-/* PCRE is a library of functions to support regular expressions whose syntax
-and semantics are as close as possible to those of the Perl 5 language.
-
-                       Written by Philip Hazel
-           Copyright (c) 1997-2013 University of Cambridge
-
------------------------------------------------------------------------------
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-    * Redistributions of source code must retain the above copyright notice,
-      this list of conditions and the following disclaimer.
-
-    * Redistributions in binary form must reproduce the above copyright
-      notice, this list of conditions and the following disclaimer in the
-      documentation and/or other materials provided with the distribution.
-
-    * Neither the name of the University of Cambridge nor the names of its
-      contributors may be used to endorse or promote products derived from
-      this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-ARI
+sdt-remote   §A/š%¨¢34Ê»óUg+Å÷Î*àRß8`ä­N   ¤  -       .sdt/objects/5a/7daa79ed584c2e1ea7acd24396072142013e3dcaaa223b442d69ddd4efbddfB       A   ¸%>ê5LG»nÉŞeÉ±/¾¤\ÄRnÉÈà9xÂÓoN   ¤  -       .sdt/objects/5a/80cf4b3e4065988a14b977a0f3671a82b65dab64c33773dbd82b77292717e0B       M   	«.Gx+¾³ğT‘‘ß	è ¶ÍÂZOvUd
