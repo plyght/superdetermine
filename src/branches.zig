@@ -71,20 +71,59 @@ pub fn headTree(store: *Store) ?Oid {
     return change.tree;
 }
 
+var clone_err_buf: [1024]u8 = undefined;
+var clone_err_len: usize = 0;
+
+/// Why the last `work` call could not build a worktree, naming the syscall, the
+/// errno and both paths. Empty when the last call succeeded. A bare
+/// `CloneFailed` tells the person at the terminal nothing they can act on.
+pub fn lastCloneError() []const u8 {
+    return clone_err_buf[0..clone_err_len];
+}
+
+fn recordCloneError(comptime fmt: []const u8, args: anytype) void {
+    const out = std.fmt.bufPrint(&clone_err_buf, fmt, args) catch clone_err_buf[0..];
+    clone_err_len = out.len;
+}
+
 /// Instant copy-on-write worktree via macOS clonefile(2). `dst_dir_path` must
 /// NOT already exist. Clones the entire src tree (including `.sdt`) for the MVP;
 /// a later refinement can exclude/redirect the repo dir to share one repo.
 pub fn work(io: std.Io, src_dir_path: []const u8, dst_dir_path: []const u8) !void {
+    clone_err_len = 0;
     if (builtin.os.tag == .macos) {
         var src_buf: [std.fs.max_path_bytes]u8 = undefined;
         var dst_buf: [std.fs.max_path_bytes]u8 = undefined;
         const src_z = try std.fmt.bufPrintZ(&src_buf, "{s}", .{src_dir_path});
         const dst_z = try std.fmt.bufPrintZ(&dst_buf, "{s}", .{dst_dir_path});
         if (clonefile(src_z.ptr, dst_z.ptr, 0) != 0) {
-            return Error.CloneFailed;
+            const err: std.c.E = @enumFromInt(std.c._errno().*);
+            switch (err) {
+                // clonefile only works inside one filesystem, and only on one
+                // that supports it. A scratch dir under /tmp and a repo on the
+                // data volume hit this every time, and it is not a failure:
+                // copy the tree instead, losing only the sharing.
+                .XDEV, .OPNOTSUPP => {
+                    workTree(io, src_dir_path, dst_dir_path) catch |e| {
+                        recordCloneError(
+                            "clonefile could not span {s} and {s} ({s}), and the copy fallback failed: {s}",
+                            .{ src_dir_path, dst_dir_path, @tagName(err), @errorName(e) },
+                        );
+                        return Error.CloneFailed;
+                    };
+                    return;
+                },
+                else => {
+                    recordCloneError("clonefile({s} -> {s}): {s}", .{ src_dir_path, dst_dir_path, @tagName(err) });
+                    return Error.CloneFailed;
+                },
+            }
         }
     } else {
-        try workTree(io, src_dir_path, dst_dir_path);
+        workTree(io, src_dir_path, dst_dir_path) catch |e| {
+            recordCloneError("copying {s} to {s}: {s}", .{ src_dir_path, dst_dir_path, @errorName(e) });
+            return Error.CloneFailed;
+        };
     }
 }
 

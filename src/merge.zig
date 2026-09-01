@@ -4,6 +4,7 @@ const object = @import("object.zig");
 const diff = @import("diff.zig");
 const store_mod = @import("store.zig");
 const superpose = @import("superpose.zig");
+const resolution = @import("resolution.zig");
 const Oid = oid.Oid;
 const Store = store_mod.Store;
 
@@ -181,6 +182,25 @@ fn isSymlink(e: ?object.TreeEntry) bool {
     return if (e) |x| x.mode == .symlink else false;
 }
 
+const ReusedResolution = union(enum) {
+    miss,
+    resolved: ?Oid,
+};
+
+fn reuseResolution(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: ?Oid, theirs: ?Oid) !ReusedResolution {
+    const candidates = [_]?Oid{ ours, theirs };
+    const found = resolution.lookup(store, alloc, .{ .base = base, .candidates = &candidates }) catch |err| switch (err) {
+        resolution.Error.CorruptResolutionRecord, resolution.Error.CorruptResolutionObject => return .miss,
+        else => return err,
+    };
+    var matched = found orelse return .miss;
+    defer matched.deinit(alloc);
+    return switch (matched.resolution) {
+        .deleted => .{ .resolved = null },
+        .content => |bytes| .{ .resolved = try store.writeFileContent(bytes) },
+    };
+}
+
 pub const ModeResolution = struct { mode: object.Mode, conflict: bool };
 
 pub fn resolveMode(base: ?object.Mode, ours: ?object.Mode, theirs: ?object.Mode) ModeResolution {
@@ -257,11 +277,19 @@ pub fn resolvePath(
 
     // Deletion vs modification.
     if (ours == null) {
+        switch (try reuseResolution(store, alloc, base, ours, theirs)) {
+            .miss => {},
+            .resolved => |reused| return reused,
+        }
         // deleted on ours, modified on theirs → conflict, keep theirs.
         try conflicts.append(alloc, try alloc.dupe(u8, path));
         return theirs;
     }
     if (theirs == null) {
+        switch (try reuseResolution(store, alloc, base, ours, theirs)) {
+            .miss => {},
+            .resolved => |reused| return reused,
+        }
         try conflicts.append(alloc, try alloc.dupe(u8, path));
         return ours;
     }
@@ -275,6 +303,10 @@ pub fn resolvePath(
     defer alloc.free(base_data);
 
     if (looksBinary(ours_data) or looksBinary(theirs_data) or looksBinary(base_data)) {
+        switch (try reuseResolution(store, alloc, base, ours, theirs)) {
+            .miss => {},
+            .resolved => |reused| return reused,
+        }
         if (try superposeCandidates(store, alloc, path, ours.?, theirs.?, sset, superposed)) |primary| {
             return primary;
         }
@@ -285,6 +317,10 @@ pub fn resolvePath(
     const merged = try threeWayMerge(alloc, base_data, ours_data, theirs_data);
     defer alloc.free(merged.text);
     if (merged.conflict) {
+        switch (try reuseResolution(store, alloc, base, ours, theirs)) {
+            .miss => {},
+            .resolved => |reused| return reused,
+        }
         // The three-way merge ran first and could not reconcile this path.
         // Only now does superposition apply, and it replaces the conflict
         // markers rather than the merge: markers are syntactically invalid in
@@ -508,23 +544,150 @@ pub const MergeState = struct {
     from_branch: []u8,
     pre_merge: Oid,
     conflicts: [][]u8,
+    identities: []?ConflictIdentity,
 };
 
-pub fn saveState(store: *Store, from_branch: []const u8, pre_merge: Oid, conflicts: []const []const u8) !void {
+pub const ConflictIdentity = struct {
+    base: ?Oid,
+    candidates: [2]?Oid,
+};
+
+fn escapeState(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (value) |byte| switch (byte) {
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => try out.append(alloc, byte),
+    };
+    return out.toOwnedSlice(alloc);
+}
+
+fn unescapeState(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (value[i] != '\\') {
+            try out.append(alloc, value[i]);
+            continue;
+        }
+        if (i + 1 >= value.len) return error.InvalidMergeState;
+        i += 1;
+        switch (value[i]) {
+            '\\' => try out.append(alloc, '\\'),
+            'n' => try out.append(alloc, '\n'),
+            't' => try out.append(alloc, '\t'),
+            else => return error.InvalidMergeState,
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn optionalOidToken(value: ?Oid, buf: *[Oid.len * 2]u8) []const u8 {
+    if (value) |present| return present.toHex(buf);
+    return "-";
+}
+
+fn parseStateOid(value: []const u8) !?Oid {
+    if (std.mem.eql(u8, value, "-")) return null;
+    return Oid.fromHex(value) catch return error.InvalidMergeState;
+}
+
+fn writeState(store: *Store, state: MergeState) !void {
     const alloc = store.alloc;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
-    try buf.appendSlice(alloc, from_branch);
+    try buf.appendSlice(alloc, "v2\n");
+    const branch = try escapeState(alloc, state.from_branch);
+    defer alloc.free(branch);
+    try buf.appendSlice(alloc, branch);
     try buf.append(alloc, '\n');
     var hex: [Oid.len * 2]u8 = undefined;
-    _ = pre_merge.toHex(&hex);
+    _ = state.pre_merge.toHex(&hex);
     try buf.appendSlice(alloc, &hex);
     try buf.append(alloc, '\n');
-    for (conflicts) |c| {
-        try buf.appendSlice(alloc, c);
+    for (state.conflicts, state.identities) |path, identity| {
+        const escaped = try escapeState(alloc, path);
+        defer alloc.free(escaped);
+        try buf.appendSlice(alloc, escaped);
+        if (identity) |known| {
+            var base_hex: [Oid.len * 2]u8 = undefined;
+            var ours_hex: [Oid.len * 2]u8 = undefined;
+            var theirs_hex: [Oid.len * 2]u8 = undefined;
+            try buf.print(alloc, "\t{s}\t{s}\t{s}", .{
+                optionalOidToken(known.base, &base_hex),
+                optionalOidToken(known.candidates[0], &ours_hex),
+                optionalOidToken(known.candidates[1], &theirs_hex),
+            });
+        } else {
+            try buf.appendSlice(alloc, "\t?");
+        }
         try buf.append(alloc, '\n');
     }
-    try store.root.writeFile(store.io, .{ .sub_path = merge_state_path, .data = buf.items });
+    try store.writeFileAtomic(merge_state_path, buf.items);
+}
+
+fn blobAtPath(store: *Store, alloc: std.mem.Allocator, tree_oid: Oid, path: []const u8) !?Oid {
+    const tree = try store.readTree(tree_oid);
+    defer object.freeTree(alloc, tree);
+    for (tree.entries) |entry| {
+        if (std.mem.eql(u8, entry.path, path)) return entry.blob;
+    }
+    return null;
+}
+
+fn identityForConflict(store: *Store, alloc: std.mem.Allocator, pre_merge: Oid, path: []const u8) !?ConflictIdentity {
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const merge_tip = try store.readRef(branch);
+    const merge_change = try store.readChange(merge_tip);
+    defer object.freeChange(alloc, merge_change);
+    if (merge_change.parents.len != 2 or !merge_change.parents[0].eql(pre_merge)) return null;
+
+    const ours_change = try store.readChange(merge_change.parents[0]);
+    defer object.freeChange(alloc, ours_change);
+    const theirs_change = try store.readChange(merge_change.parents[1]);
+    defer object.freeChange(alloc, theirs_change);
+    const ancestor = (try commonAncestor(store, alloc, merge_change.parents[0], merge_change.parents[1])) orelse return null;
+    const base_change = try store.readChange(ancestor);
+    defer object.freeChange(alloc, base_change);
+
+    const ours = try blobAtPath(store, alloc, ours_change.tree, path);
+    const theirs = try blobAtPath(store, alloc, theirs_change.tree, path);
+    if (oidEqOpt(ours, theirs)) return null;
+    return .{
+        .base = try blobAtPath(store, alloc, base_change.tree, path),
+        .candidates = .{ ours, theirs },
+    };
+}
+
+pub fn saveState(store: *Store, from_branch: []const u8, pre_merge: Oid, conflicts: []const []const u8) !void {
+    const alloc = store.alloc;
+    const from = try alloc.dupe(u8, from_branch);
+    errdefer alloc.free(from);
+    const paths = try alloc.alloc([]u8, conflicts.len);
+    var paths_init: usize = 0;
+    errdefer {
+        for (paths[0..paths_init]) |path| alloc.free(path);
+        alloc.free(paths);
+    }
+    const identities = try alloc.alloc(?ConflictIdentity, conflicts.len);
+    errdefer alloc.free(identities);
+    for (conflicts, 0..) |path, i| {
+        paths[i] = try alloc.dupe(u8, path);
+        paths_init += 1;
+        identities[i] = identityForConflict(store, alloc, pre_merge, path) catch null;
+    }
+    const state: MergeState = .{
+        .from_branch = from,
+        .pre_merge = pre_merge,
+        .conflicts = paths,
+        .identities = identities,
+    };
+    defer freeState(alloc, state);
+    try writeState(store, state);
 }
 
 pub fn loadState(store: *Store, alloc: std.mem.Allocator) !?MergeState {
@@ -535,10 +698,12 @@ pub fn loadState(store: *Store, alloc: std.mem.Allocator) !?MergeState {
     defer alloc.free(data);
 
     var lines = std.mem.splitScalar(u8, data, '\n');
-    const from_line = lines.next() orelse return error.InvalidMergeState;
+    const first_line = lines.next() orelse return error.InvalidMergeState;
+    const is_v2 = std.mem.eql(u8, first_line, "v2");
+    const from_line = if (is_v2) lines.next() orelse return error.InvalidMergeState else first_line;
     const oid_line = lines.next() orelse return error.InvalidMergeState;
 
-    const from_branch = try alloc.dupe(u8, from_line);
+    const from_branch = if (is_v2) try unescapeState(alloc, from_line) else try alloc.dupe(u8, from_line);
     errdefer alloc.free(from_branch);
     const pre_merge = Oid.fromHex(oid_line) catch return error.InvalidMergeState;
 
@@ -547,16 +712,39 @@ pub fn loadState(store: *Store, alloc: std.mem.Allocator) !?MergeState {
         for (conflicts.items) |p| alloc.free(p);
         conflicts.deinit(alloc);
     }
+    var identities: std.ArrayList(?ConflictIdentity) = .empty;
+    errdefer identities.deinit(alloc);
 
     while (lines.next()) |l| {
         if (l.len == 0) continue;
-        try conflicts.append(alloc, try alloc.dupe(u8, l));
+        if (!is_v2) {
+            try conflicts.append(alloc, try alloc.dupe(u8, l));
+            try identities.append(alloc, null);
+            continue;
+        }
+        var fields = std.mem.splitScalar(u8, l, '\t');
+        const path = try unescapeState(alloc, fields.next() orelse return error.InvalidMergeState);
+        errdefer alloc.free(path);
+        const identity_token = fields.next() orelse return error.InvalidMergeState;
+        var identity: ?ConflictIdentity = null;
+        if (!std.mem.eql(u8, identity_token, "?")) {
+            const ours_token = fields.next() orelse return error.InvalidMergeState;
+            const theirs_token = fields.next() orelse return error.InvalidMergeState;
+            identity = .{
+                .base = try parseStateOid(identity_token),
+                .candidates = .{ try parseStateOid(ours_token), try parseStateOid(theirs_token) },
+            };
+        }
+        if (fields.next() != null) return error.InvalidMergeState;
+        try conflicts.append(alloc, path);
+        try identities.append(alloc, identity);
     }
 
     return .{
         .from_branch = from_branch,
         .pre_merge = pre_merge,
         .conflicts = try conflicts.toOwnedSlice(alloc),
+        .identities = try identities.toOwnedSlice(alloc),
     };
 }
 
@@ -564,6 +752,7 @@ pub fn freeState(alloc: std.mem.Allocator, s: MergeState) void {
     alloc.free(s.from_branch);
     for (s.conflicts) |p| alloc.free(p);
     alloc.free(s.conflicts);
+    alloc.free(s.identities);
 }
 
 pub fn clearState(store: *Store) !void {
@@ -681,6 +870,7 @@ pub fn markResolved(store: *Store, alloc: std.mem.Allocator, work_dir: std.Io.Di
 pub fn remainingConflicts(store: *Store, alloc: std.mem.Allocator) ![][]u8 {
     const state = (try loadState(store, alloc)) orelse return alloc.alloc([]u8, 0);
     alloc.free(state.from_branch);
+    alloc.free(state.identities);
     return state.conflicts;
 }
 

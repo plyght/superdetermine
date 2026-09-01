@@ -45,7 +45,9 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a snap -d 'checkpoint the working tree'
     \\complete -c sdt -n __fish_use_subcommand -a status -d 'what changed since the last save'
     \\complete -c sdt -n __fish_use_subcommand -a st -d 'what changed since the last save'
-    \\complete -c sdt -n __fish_use_subcommand -a diff -d 'line-level diff vs the last save'
+    \\complete -c sdt -n __fish_use_subcommand -a diff -d 'line-level diff vs the last save, or between states'
+    \\complete -c sdt -n __fish_use_subcommand -a show -d 'what one change or moment contains'
+    \\complete -c sdt -n __fish_use_subcommand -a cat -d "one file's content as of any state"
     \\complete -c sdt -n __fish_use_subcommand -a log -d 'the change history'
     \\complete -c sdt -n __fish_use_subcommand -a desc -d 'name (or rename) the current change'
     \\complete -c sdt -n __fish_use_subcommand -a new -d 'start a new branch and switch to it'
@@ -54,7 +56,7 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a branch -d 'list branches'
     \\complete -c sdt -n __fish_use_subcommand -a branches -d 'list branches'
     \\complete -c sdt -n __fish_use_subcommand -a work -d 'instant copy-on-write worktree'
-    \\complete -c sdt -n __fish_use_subcommand -a restore -d 'discard local edits to one file'
+    \\complete -c sdt -n __fish_use_subcommand -a restore -d 'put one file back, from the last save or any state'
     \\complete -c sdt -n __fish_use_subcommand -a merge -d 'merge another branch into this one'
     \\complete -c sdt -n __fish_use_subcommand -a absorb -d 'fold edits into the changes they belong to'
     \\complete -c sdt -n __fish_use_subcommand -a point -d "move this branch's tip to any ref"
@@ -90,7 +92,7 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a green -d 'rewind to the last state that passed'
     \\complete -c sdt -n __fish_use_subcommand -a back -d 'rewind n moments, default 1'
     \\complete -c sdt -n __fish_use_subcommand -a rewind -d 'rewind to any @ref'
-    \\complete -c sdt -n __fish_use_subcommand -a moments -d 'captured states and their verdicts'
+    \\complete -c sdt -n __fish_use_subcommand -a moments -d 'captured states, their age and their verdicts'
     \\complete -c sdt -n __fish_use_subcommand -a grade -d 'run checks now, or grade a git ref'
     \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l repo -d 'grade a ref in another git repo' -r
     \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l fast -d 'use the fast tier'
@@ -148,7 +150,9 @@ const zsh_script =
     \\    'snap:checkpoint the working tree'
     \\    'status:what changed since the last save'
     \\    'st:what changed since the last save'
-    \\    'diff:line-level diff vs the last save'
+    \\    'diff:line-level diff vs the last save, or between states'
+    \\    'show:what one change or moment contains'
+    \\    'cat:one file content as of any state'
     \\    'log:the change history'
     \\    'desc:name (or rename) the current change'
     \\    'new:start a new branch and switch to it'
@@ -157,7 +161,7 @@ const zsh_script =
     \\    'branch:list branches'
     \\    'branches:list branches'
     \\    'work:instant copy-on-write worktree'
-    \\    'restore:discard local edits to one file'
+    \\    'restore:put one file back, from the last save or any state'
     \\    'merge:merge another branch into this one'
     \\    'absorb:fold edits into the changes they belong to'
     \\    'point:move this branch tip to any ref'
@@ -185,7 +189,7 @@ const zsh_script =
     \\    'green:rewind to the last state that passed'
     \\    'back:rewind n moments, default 1'
     \\    'rewind:rewind to any @ref'
-    \\    'moments:captured states and their verdicts'
+    \\    'moments:captured states, their age and their verdicts'
     \\    'grade:run checks now, or grade a git ref'
     \\    'doctor:what is on, what is degraded, and why'
     \\    'recap:green and red spans, and what thrashed'
@@ -245,7 +249,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0

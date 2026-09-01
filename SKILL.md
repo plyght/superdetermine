@@ -244,7 +244,10 @@ Every one of these is reachable by the recipe-2 rebuild (`park → point → rep
 | `sdt status [--json]` | dirty set; **says "clean" during an unresolved rebase conflict** |
 | `sdt log [--json]` | change history (`--json` carries full ids; plain output truncates to 12) |
 | `sdt describe -m "msg"` | reword **the tip only** |
-| `sdt restore <file>` | one file back to the last save |
+| `sdt restore <file>... [--at <ref>] [--dry-run]` | one file back to the last save, or to any state; refuses a path that state never held instead of deleting it |
+| `sdt show <ref>` | what one change or moment contains, against the state before it — the question `sdt diff` cannot answer on a clean tree |
+| `sdt diff [<ref> \| <a>..<b>]` | working tree vs the last save, vs a named state, or two states against each other |
+| `sdt cat <ref>:<path>` | one file's content as of any state, straight to stdout; also `<ref> <path>` and `<path> --at <ref>` |
 | `sdt rewind <ref> [--dry-run] [-- <paths>]` | worktree only; flags go **before** `--`; only reaches changes still reachable from a branch |
 | `sdt new <name>` | branch off here — **discards dirty tracked edits** |
 | `sdt switch <name>` | move branch, auto-saving the dirty tree first |
@@ -256,11 +259,11 @@ Every one of these is reachable by the recipe-2 rebuild (`park → point → rep
 | `sdt absorb` | fold whole-file edits into the change that last touched each file |
 | `sdt merge <branch>` · `sdt resolve <file>` · `sdt resolve --abort` | three-way merge and conflict flow |
 | `sdt undo` / `sdt redo` | reverse / replay the last history operation — **not** discarded worktree edits |
-| `sdt moments [-n N]` · `sdt back [n]` · `sdt green` | polled captures; `sdt rewind @<moment>` is what actually restores one |
+| `sdt moments [-n N] [--path <file>]` · `sdt back [n]` · `sdt green` | polled captures with their age; `--path` keeps only the ones where that file's content moved. `sdt rewind @<moment>` restores the whole tree, `sdt restore <file> --at @<moment>` restores one file |
 | `sdt import <repo>` | pull git history in (idempotent; re-run to pick up git-side movement) |
 | `sdt export <repo> --force` | write **all** sdt branches out to git, replacing what was there |
 | `sdt sync <dir> --force` | mirror sdt HEAD onto **git HEAD's** branch and reset git's index |
-| `sdt work <dir> [--at <ref>]` | instant copy-on-write worktree at any state — safe place to inspect |
+| `sdt work <dir> [--at <ref>]` | instant copy-on-write worktree at any state — safe place to inspect. Falls back to a plain copy when the destination is on another filesystem |
 | `sdt revert [<full-hex>]` | **new** change restoring an old tree (not a rewrite) |
 
 Every command has a short alias (`sv st d l rs rw bk u gn ab mg res`). `sdt help` prints the full table.

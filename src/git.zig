@@ -1275,6 +1275,33 @@ pub fn exportHeadTo(store: *Store, dest_git_repo_path: []const u8, git_branch: ?
 /// repaired rather than replayed. It is how the caller says "yes, drop the
 /// git-side commits I was just shown".
 pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
+    return exportHeadMode(store, dest_git_repo_path, git_branch, if (force) .rebuild else .graft);
+}
+
+/// As `exportHeadTo`, but for a branch superdetermine has rewritten under git's
+/// feet: no graft onto git's tip and no fast-forward guard, and the commits sdt
+/// already exported are reused for the changes the rewrite did not touch.
+///
+/// That reuse is the whole difference from `--force`. Rebuilding every commit
+/// changes every id on the branch for content that did not move, which is not
+/// something a split asked for.
+pub fn exportHeadRewritten(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8) !void {
+    return exportHeadMode(store, dest_git_repo_path, git_branch, .rewrite);
+}
+
+/// How an export treats the commits already on the target git branch.
+const ExportMode = enum {
+    /// Graft sdt's roots onto git's tip, and refuse anything that is not a
+    /// fast-forward.
+    graft,
+    /// Replace the branch, rebuilding every commit from sdt truth.
+    rebuild,
+    /// Replace the branch, reusing the commits sdt already exported for the
+    /// changes a rewrite left alone.
+    rewrite,
+};
+
+fn exportHeadMode(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, mode: ExportMode) !void {
     ensureInit();
     exported_files = 0;
     exported_blobs = 0;
@@ -1308,9 +1335,17 @@ pub fn exportHeadToForced(store: *Store, dest_git_repo_path: []const u8, git_bra
     var session = lfsSessionFor(store, repo, null);
     defer if (session) |*s| s.deinit();
 
-    const tip_git = try exportChain(store, repo, &map, tip_gr, if (have_graft and !force) &graft_oid else null, if (session) |*s| s else null, force);
+    const tip_git = try exportChain(
+        store,
+        repo,
+        &map,
+        tip_gr,
+        if (have_graft and mode == .graft) &graft_oid else null,
+        if (session) |*s| s else null,
+        mode == .rebuild,
+    );
 
-    if (!force) try guardFastForward(repo, ref_name.ptr, &tip_git, target);
+    if (mode == .graft) try guardFastForward(repo, ref_name.ptr, &tip_git, target);
 
     var newref: ?*c.git_reference = null;
     try check(c.git_reference_create(&newref, repo, ref_name.ptr, &tip_git, 1, null));
@@ -1905,6 +1940,113 @@ pub fn pullHead(store: *Store, target: []const u8) !void {
     _ = try importHead(store, target);
 }
 
+/// Where a colocated git branch stands relative to superdetermine's own history.
+pub const ColocatedState = enum {
+    /// git's tip is a commit sdt exported for a change this branch still holds.
+    /// The ordinary grafting mirror is right here.
+    in_step,
+    /// Every commit on the git branch is one sdt exported, but its tip is a
+    /// change this branch no longer holds. Something rewrote sdt history out
+    /// from under it, and only rebuilding git's chain from sdt truth will make
+    /// the two agree.
+    rewritten,
+    /// The git branch holds commits sdt never exported, listed in `at_risk`.
+    /// Nothing may be rewritten there.
+    foreign,
+    /// No colocated repo, no branch, or nothing readable to compare.
+    unavailable,
+};
+
+/// Classify the colocated branch so a rewrite knows whether it may rebuild the
+/// git chain, must graft, or must stop.
+///
+/// Errs toward `foreign`: anything unreadable counts as history worth keeping.
+pub fn colocatedState(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8) ColocatedState {
+    ensureInit();
+    at_risk = .{};
+    const alloc = store.alloc;
+
+    const path_z = alloc.dupeZ(u8, work_dir_path) catch return .foreign;
+    defer alloc.free(path_z);
+
+    var repo: ?*c.git_repository = null;
+    if (c.git_repository_open(&repo, path_z.ptr) != 0) return .unavailable;
+    defer c.git_repository_free(repo);
+
+    const branch = store.headBranch() catch return .unavailable;
+    defer alloc.free(branch);
+    if (!store.refExists(branch)) return .unavailable;
+    const sdt_tip = store.readRef(branch) catch return .unavailable;
+
+    const target = resolveTargetBranch(store, repo, git_branch, branch) catch return .foreign;
+    defer alloc.free(target);
+
+    const bn = @min(target.len, at_risk.branch_buf.len);
+    @memcpy(at_risk.branch_buf[0..bn], target[0..bn]);
+    at_risk.branch_len = bn;
+
+    var ref_buf: [512]u8 = undefined;
+    const ref_name = std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{target}) catch return .foreign;
+
+    var tip: c.git_oid = undefined;
+    // Nothing there yet: an ordinary export creates it.
+    if (c.git_reference_name_to_id(&tip, repo, ref_name.ptr) != 0) return .in_step;
+
+    var map = Gitmap.load(store) catch return .foreign;
+    defer map.deinit();
+
+    var walk: ?*c.git_revwalk = null;
+    if (c.git_revwalk_new(&walk, repo) != 0) return .foreign;
+    defer c.git_revwalk_free(walk);
+    _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL);
+    if (c.git_revwalk_push(walk, &tip) != 0) return .foreign;
+
+    var woid: c.git_oid = undefined;
+    var seen: usize = 0;
+    while (c.git_revwalk_next(&woid, walk) == 0) {
+        seen += 1;
+        // A history this long is not one to move on an inference.
+        if (seen > 100_000) return .foreign;
+
+        const hex = gitOidHex(&woid);
+        if (map.lookupGr(hex[0..]) != null) continue;
+
+        at_risk.total += 1;
+        const i = at_risk.shown;
+        if (i >= at_risk.ids.len) continue;
+        at_risk.ids[i] = hex;
+        var commit: ?*c.git_commit = null;
+        if (c.git_commit_lookup(&commit, repo, &woid) == 0) {
+            defer c.git_commit_free(commit);
+            const sm = c.git_commit_summary(commit);
+            if (sm != null) {
+                const text = std.mem.span(sm);
+                const n = @min(text.len, at_risk.subject_bufs[i].len);
+                @memcpy(at_risk.subject_bufs[i][0..n], text[0..n]);
+                at_risk.subject_lens[i] = n;
+            }
+        }
+        at_risk.shown += 1;
+    }
+    if (at_risk.total != 0) return .foreign;
+
+    // Every commit there is ours. The question left is whether the change git
+    // is standing on is still on this branch.
+    const tip_hex = gitOidHex(&tip);
+    const stands_on = map.lookupGr(tip_hex[0..]) orelse return .foreign;
+
+    var cur = sdt_tip;
+    var walked: usize = 0;
+    while (walked < 100_000) : (walked += 1) {
+        if (cur.eql(stands_on)) return .in_step;
+        const change = store.readChange(cur) catch return .rewritten;
+        defer object.freeChange(alloc, change);
+        if (change.parents.len == 0) break;
+        cur = change.parents[0];
+    }
+    return .rewritten;
+}
+
 /// Mirror superdetermine HEAD into a colocated git repo at `work_dir_path`, so `git log`
 /// there reflects superdetermine's current change ("sdt and git coexist live").
 pub fn syncColocated(store: *Store, work_dir_path: []const u8) !void {
@@ -1916,6 +2058,13 @@ pub fn syncColocated(store: *Store, work_dir_path: []const u8) !void {
 /// on `master` is the common case, and the sdt history lands on `master` there.
 pub fn syncColocatedTo(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8) !void {
     try syncColocatedForced(store, work_dir_path, git_branch, false);
+}
+
+/// Mirror a rewritten sdt history onto the colocated branch, reusing the commits
+/// the rewrite did not touch. See `exportHeadRewritten`.
+pub fn syncColocatedRewrite(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8) !void {
+    try exportHeadRewritten(store, work_dir_path, git_branch);
+    resetIndexToHead(store, work_dir_path) catch {};
 }
 
 pub fn syncColocatedForced(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
@@ -3441,6 +3590,53 @@ test "forced export repairs a chain that was already exported grafted" {
     var again: c.git_oid = undefined;
     try check(c.git_reference_name_to_id(&again, repo, "refs/heads/master"));
     try testing.expect(c.git_oid_cmp(&again, &tip_oid) == 0);
+}
+
+test "rewritten export preserves unchanged ancestor commit ids" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "gitrepo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitrepo", alloc);
+    defer alloc.free(abs);
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const c1 = try store.readRef(branch);
+    const c2 = try writeChangeWith(&store, &[_]Oid{c1}, "second.txt", "second\n", "second\n", 8, 1_700_000_100);
+    try store.updateRef(branch, c2);
+    try exportHeadTo(&store, abs, "master");
+
+    var map = try Gitmap.load(&store);
+    const old_root = map.lookupGit(c1).?;
+    map.deinit();
+
+    const rewritten = try writeChangeWith(&store, &[_]Oid{c1}, "second.txt", "rewritten\n", "rewritten\n", 9, 1_700_000_200);
+    try store.updateRef(branch, rewritten);
+    try exportHeadRewritten(&store, abs, "master");
+
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, abs_z.ptr));
+    defer c.git_repository_free(repo);
+
+    var tip_oid: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&tip_oid, repo, "refs/heads/master"));
+    var tip_commit: ?*c.git_commit = null;
+    try check(c.git_commit_lookup(&tip_commit, repo, &tip_oid));
+    defer c.git_commit_free(tip_commit);
+    try testing.expect(c.git_oid_cmp(c.git_commit_parent_id(tip_commit, 0), &old_root) == 0);
 }
 
 test "pushRemote refuses when the mirror would drop fetched remote commits" {

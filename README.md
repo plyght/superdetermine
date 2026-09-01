@@ -134,6 +134,8 @@ sdt init
 sdt setup                  # name, email, and the command that says it works
 sdt save -m "message"      # sv   snapshot the working tree (no add, no stash)
 sdt status | sdt diff | sdt log     # st | d | l
+sdt show <ref>             # sh   what one change or moment contains
+sdt cat <ref>:file.txt     #      one file as of any state, without moving the tree
 sdt new feature            # n    branch and switch
 sdt work ../agent-copy     # wt   instant worktree
 sdt undo   /   sdt redo     # u   /  r
@@ -226,7 +228,7 @@ sdt seal .env              # sl     .env becomes uncommittable from here on
 sdt save -m "add config"
 ```
 
-Your `.env` stays exactly where it is, in plaintext, for your app to read. It just stops being committable. The sealed copy lives in `.grsealed`, the one file sdt adds:
+Your `.env` stays exactly where it is, in plaintext, for your app to read. It just stops being committable. The sealed copy lives in `.sdtsealed`, the one file sdt adds:
 
 ```
 version 1
@@ -244,7 +246,7 @@ Adding a teammate is a pull request, not an account:
 
 ```
 sdt key show                       # they run this, send you the string
-sdt key add dana gr1lPATx6VZ...    # you run this, then commit .grsealed
+sdt key add dana gr1lPATx6VZ...    # you run this, then commit .sdtsealed
 sdt unseal                         # they run this, and have .env
 ```
 
@@ -277,7 +279,7 @@ With `--file`, send the file and the key over different channels. Either alone i
 
 The key is never transmitted. Both sides derive it from the spoken code by PAKE (SPAKE2 over Ristretto255), so a relay watching the whole exchange gets nothing it can attack offline. that is exactly what makes three words safe here where three words in a URL would not be. A wrong guess costs an online attempt, and a code burns after five. Run a relay yourself with `sdt relay` (`sdt rv`); `sdt serve --link <dir>` hosts a `--link` export over HTTP.
 
-The two layers compose the way you would want: share a repo and the recipient gets `.grsealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not, without remembering to scrub anything. Granting the secrets is a separate, deliberate `sdt key add`.
+The two layers compose the way you would want: share a repo and the recipient gets `.sdtsealed`, still sealed, because they were given the share key and not the repo key. Code shared, secrets not, without remembering to scrub anything. Granting the secrets is a separate, deliberate `sdt key add`.
 
 Git interop deliberately has no share layer: GitHub sees your code so review works, and only your values stay sealed.
 

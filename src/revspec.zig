@@ -399,8 +399,20 @@ pub fn resolveChangeOid(ctx: Context, o: Oid) !Resolved {
 /// Resolve a revspec against captured history. The caller owns the result and
 /// must call `Resolved.deinit`.
 pub fn resolve(ctx: Context, spec: []const u8) !Resolved {
-    const p = try parse(spec);
+    return resolveParsed(ctx, try parse(spec));
+}
 
+/// Resolve `spec`, then step `extra` further back along whatever line the
+/// selector already picked. Composing on the parsed form is what keeps one step
+/// meaning "the change before this one" for a change spec and "the moment
+/// before this one" for a moment spec, with no special case for either.
+pub fn resolveBack(ctx: Context, spec: []const u8, extra: usize) !Resolved {
+    var p = try parse(spec);
+    p.back += extra;
+    return resolveParsed(ctx, p);
+}
+
+fn resolveParsed(ctx: Context, p: Parsed) !Resolved {
     if (!p.sigil) {
         if (ctx.store.refExists(p.selector)) {
             const tip = ctx.store.readRef(p.selector) catch return Error.NoSuchMoment;

@@ -70,7 +70,9 @@ const sections = [_]Section{
     .{ .title = "the everyday loop", .entries = &.{
         .{ .name = "save", .alias = "sv", .args = "[-m msg]", .desc = "checkpoint the working tree" },
         .{ .name = "status", .alias = "st", .desc = "what changed since the last save" },
-        .{ .name = "diff", .alias = "d", .desc = "line-level diff vs the last save" },
+        .{ .name = "diff", .alias = "d", .args = "[<ref> | <a>..<b>]", .desc = "line-level diff vs the last save, or between states" },
+        .{ .name = "show", .alias = "sh", .args = "<ref>", .desc = "what one change or moment contains" },
+        .{ .name = "cat", .args = "<ref>:<path>", .desc = "one file's content as of any state" },
         .{ .name = "log", .alias = "l", .desc = "the change history" },
         .{ .name = "describe", .alias = "desc", .args = "-m msg [--at]", .desc = "name or rename any change" },
     } },
@@ -79,7 +81,7 @@ const sections = [_]Section{
         .{ .name = "switch", .alias = "sw", .args = "<name>", .desc = "move to another branch (auto-saves)" },
         .{ .name = "branch", .alias = "b", .args = "[-d name]", .desc = "list branches, or delete one" },
         .{ .name = "work", .alias = "wt", .args = "<dir>", .desc = "instant copy-on-write worktree" },
-        .{ .name = "restore", .alias = "rs", .args = "<file>", .desc = "discard local edits to one file" },
+        .{ .name = "restore", .alias = "rs", .args = "<file>... [--at ref]", .desc = "put one file back, from the last save or any state" },
         .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
         .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
         .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
@@ -107,7 +109,7 @@ const sections = [_]Section{
         .{ .name = "green", .alias = "gn", .desc = "rewind to the last state that passed" },
         .{ .name = "back", .alias = "bk", .args = "[n]", .desc = "rewind n moments, default 1" },
         .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
-        .{ .name = "moments", .alias = "mo", .args = "[-n N]", .desc = "captured states and their verdicts" },
+        .{ .name = "moments", .alias = "mo", .args = "[-n N] [--path f]", .desc = "captured states, their age and their verdicts" },
         .{ .name = "grade", .alias = "gd", .args = "[git-ref]", .desc = "grade now, or any git ref; --on automates" },
         .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
         .{ .name = "recap", .alias = "rc", .args = "[@ref..]", .desc = "green and red spans, and what thrashed" },
@@ -242,6 +244,7 @@ const aliases = [_]Alias{
     .{ .short = "ci", .full = "save" },
     .{ .short = "st", .full = "status" },
     .{ .short = "d", .full = "diff" },
+    .{ .short = "sh", .full = "show" },
     .{ .short = "l", .full = "log" },
     .{ .short = "desc", .full = "describe" },
     .{ .short = "b", .full = "branch" },
@@ -355,6 +358,14 @@ fn canonical(cmd: []const u8) []const u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |e| switch (e) {
+        error.WriteFailed => return,
+        error.InvalidUsage => std.process.exit(2),
+        else => return e,
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
     const io = init.io;
 
@@ -406,7 +417,11 @@ pub fn main(init: std.process.Init) !void {
     } else if (eq(cmd, "status")) {
         try cmdStatus(io, alloc, w, rest);
     } else if (eq(cmd, "diff")) {
-        try cmdDiff(io, alloc, w);
+        try cmdDiff(io, alloc, w, rest);
+    } else if (eq(cmd, "show")) {
+        try cmdShow(io, alloc, w, rest);
+    } else if (eq(cmd, "cat")) {
+        try cmdCat(io, alloc, w, rest);
     } else if (eq(cmd, "log")) {
         try cmdLog(io, alloc, w, rest);
     } else if (eq(cmd, "branch")) {
@@ -1134,6 +1149,7 @@ fn reportRewrite(
         try ui.hint(w, "fix the markers and `sdt save`, or `sdt undo` to put history back");
         return;
     }
+    try mirrorRewriteToGit(io, alloc, w, s);
     try ui.hint(w, "`sdt undo` puts the old history back");
 }
 
@@ -1699,7 +1715,7 @@ fn setSetting(
             try w.writeAll(settings.expected(item));
         }
         try w.print(", not {s}{s}{s}\n", .{ ui.on(.bold), raw, ui.off() });
-        return;
+        return error.InvalidUsage;
     };
     defer alloc.free(value);
 
@@ -1711,7 +1727,7 @@ fn setSetting(
                     ui.on(.red), ui.cross, ui.off(), item.name,
                 });
                 try ui.hint(w, "run `sdt init` here, or set it for every repo with --global");
-                return;
+                return error.InvalidUsage;
             };
             try config.set(repo, item.key, value);
         },
@@ -1799,7 +1815,7 @@ fn cmdConfig(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
             });
         }
         try ui.hint(w, "`sdt config` lists every setting there is");
-        return;
+        return error.InvalidUsage;
     };
 
     const effective = scope orelse item.scope;
@@ -1958,6 +1974,61 @@ fn maybeSyncGit(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
     git.syncColocated(s, ".") catch |e| {
         if (e == git.Error.NotFastForward) sync_blocked = true;
     };
+}
+
+/// A rewrite or an undo moved sdt's tip somewhere the colocated git branch
+/// cannot fast-forward to, so the ordinary save-time mirror would refuse and
+/// leave `git log` showing history sdt no longer has. Split a change and git
+/// kept the one commit; undo a save and git kept the commit, and the next save
+/// was then refused for being behind.
+///
+/// Mirror it anyway when every commit on that git branch is one sdt exported
+/// itself: those commits are sdt's own, still reachable through sdt, and still
+/// in git's reflog. When git holds anything of its own, stop and say exactly
+/// what, because a rewrite of sdt history is not permission to drop history sdt
+/// never had.
+fn mirrorRewriteToGit(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s: *Store) !void {
+    std.Io.Dir.cwd().access(io, ".git", .{}) catch return;
+    if (!configTruthy(s, alloc, "sync.git")) return;
+
+    const branch = s.headBranch() catch return;
+    defer alloc.free(branch);
+    if (!s.refExists(branch)) {
+        try w.print("{s}{s}{s} .git was left as it was: superdetermine has no changes on {s} to mirror\n", .{
+            ui.on(.yellow), ui.warn, ui.off(), branch,
+        });
+        try ui.hint(w, "`sdt redo` puts the change back; `sdt import .` takes git's commits instead");
+        return;
+    }
+
+    // The ordinary save-time mirror grafts onto whatever git already has, which
+    // is right for a save and wrong for a rewrite: it would leave `git log`
+    // showing the pre-split commit followed by commits that undo half of it.
+    // A rewrite has to rebuild the chain from sdt truth, and that is allowed
+    // only when every commit on the git branch is one sdt exported.
+    switch (git.colocatedState(s, ".", null)) {
+        .rewritten => {
+            git.syncColocatedRewrite(s, ".", null) catch |e| {
+                try w.print("{s}{s}{s} could not mirror into .git: {s}\n", .{
+                    ui.on(.yellow), ui.warn, ui.off(), @errorName(e),
+                });
+                return;
+            };
+            try w.print("{s}the colocated .git branch now matches{s}\n", .{ ui.on(.dim), ui.off() });
+        },
+        .foreign => {
+            const risk = &git.at_risk;
+            try w.print("{s}{s}{s} .git was left as it was: {d} commit(s) there are not in superdetermine\n", .{
+                ui.on(.yellow), ui.warn, ui.off(), risk.total,
+            });
+            var i: usize = 0;
+            while (i < risk.shown) : (i += 1) {
+                try w.print("  {s}  {s}\n", .{ risk.id(i)[0..12], risk.subject(i) });
+            }
+            try ui.hint(w, "`sdt pull` brings them in; `sdt sync . --force` makes git match anyway");
+        },
+        .in_step, .unavailable => git.syncColocated(s, ".") catch {},
+    }
 }
 
 // Set when the last save could not mirror into .git because doing so would have
@@ -2249,7 +2320,274 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     });
 }
 
-fn cmdDiff(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+/// `sdt diff` with no argument is the working tree against the last save.
+/// `sdt diff <ref>` is the working tree against a named state, and
+/// `sdt diff <a>..<b>` is two states against each other. The single-ref form
+/// used to be silently ignored, so it printed "no changes" on a clean tree and
+/// looked like the ref held nothing.
+fn cmdDiff(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var spec = flagValue(rest, "--at", "--at");
+    if (spec.len == 0) {
+        var i: usize = 0;
+        while (i < rest.len) : (i += 1) {
+            const a = rest[i];
+            if (eq(a, "--at")) {
+                i += 1;
+                continue;
+            }
+            if (a.len != 0 and a[0] == '-') continue;
+            spec = a;
+            break;
+        }
+    }
+    if (spec.len != 0) return diffSpec(io, alloc, w, spec);
+    return diffWorkingTree(io, alloc, w);
+}
+
+/// The entry list a target holds. `.live` is the working tree, captured the same
+/// way a save would capture it, so a diff against it sees exactly what a save
+/// would record.
+fn entriesFor(s: *Store, work: std.Io.Dir, t: revspec.Target) ![]object.TreeEntry {
+    return switch (t) {
+        .live => try workspace.captureEntries(s, work),
+        .at => |m| try moment.entriesOf(s, m),
+    };
+}
+
+/// Unified diff between two path-sorted entry lists. Every form of `sdt diff`
+/// that names a state, and `sdt show`, come through here, so they cannot
+/// disagree about what counts as a change.
+fn writeTreeDiff(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    old: []const object.TreeEntry,
+    new: []const object.TreeEntry,
+) !usize {
+    var i: usize = 0;
+    var j: usize = 0;
+    var shown: usize = 0;
+    while (i < old.len or j < new.len) {
+        var path: []const u8 = undefined;
+        var old_blob: ?Oid = null;
+        var new_blob: ?Oid = null;
+
+        if (j >= new.len or (i < old.len and std.mem.lessThan(u8, old[i].path, new[j].path))) {
+            path = old[i].path;
+            old_blob = old[i].blob;
+            i += 1;
+        } else if (i >= old.len or std.mem.lessThan(u8, new[j].path, old[i].path)) {
+            path = new[j].path;
+            new_blob = new[j].blob;
+            j += 1;
+        } else {
+            path = old[i].path;
+            old_blob = old[i].blob;
+            new_blob = new[j].blob;
+            i += 1;
+            j += 1;
+            if (old_blob.?.eql(new_blob.?)) continue;
+        }
+
+        const old_content: []u8 = if (old_blob) |b| try s.readFileContent(b) else try alloc.dupe(u8, "");
+        defer alloc.free(old_content);
+        const new_content: []u8 = if (new_blob) |b| try s.readFileContent(b) else try alloc.dupe(u8, "");
+        defer alloc.free(new_content);
+
+        shown += 1;
+        if (isBinary(old_content) or isBinary(new_content)) {
+            try w.print("Binary file {s} differs\n", .{path});
+            continue;
+        }
+        const ops = try diff.diffLines(alloc, old_content, new_content);
+        defer alloc.free(ops);
+        try diff.writeUnified(w, path, ops);
+    }
+    return shown;
+}
+
+fn diffSpec(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, spec: []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    var shown: usize = 0;
+    if (std.mem.indexOf(u8, spec, "..") != null) {
+        const range = resolveRangeOrFail(io, alloc, w, &s, spec, &ix, set);
+        defer range.deinit(alloc);
+
+        var old_entries: []object.TreeEntry = &.{};
+        var owned = false;
+        if (range.from) |f| {
+            old_entries = try entriesFor(&s, work, f.target);
+            owned = true;
+        }
+        defer if (owned) workspace.freeTreeEntries(alloc, old_entries);
+
+        const new_entries = try entriesFor(&s, work, range.to.target);
+        defer workspace.freeTreeEntries(alloc, new_entries);
+
+        shown = try writeTreeDiff(alloc, w, &s, old_entries, new_entries);
+    } else {
+        const resolved = resolveSpecOrFail(io, alloc, w, &s, spec, &ix, set);
+        defer resolved.deinit(alloc);
+
+        const old_entries = try entriesFor(&s, work, resolved.target);
+        defer workspace.freeTreeEntries(alloc, old_entries);
+        const new_entries = try workspace.captureEntries(&s, work);
+        defer workspace.freeTreeEntries(alloc, new_entries);
+
+        shown = try writeTreeDiff(alloc, w, &s, old_entries, new_entries);
+    }
+    if (shown == 0) try w.print("{s}{s}{s} no changes\n", .{ ui.on(.green), ui.check, ui.off() });
+}
+
+/// What a change or a moment contains: its own diff against the state one step
+/// before it, which is the question `sdt diff` cannot answer because it always
+/// has one foot in the working tree.
+fn cmdShow(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var spec: []const u8 = "";
+    for (rest) |a| {
+        if (a.len != 0 and a[0] != '-') {
+            spec = a;
+            break;
+        }
+    }
+    if (spec.len == 0) {
+        try w.writeAll("usage: sdt show <ref>\n");
+        try ui.hint(w, "try `sdt show @`, `sdt show @green`, or `sdt show <id>`");
+        return;
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const resolved = resolveSpecOrFail(io, alloc, w, &s, spec, &ix, set);
+    defer resolved.deinit(alloc);
+
+    const new_entries = try entriesFor(&s, work, resolved.target);
+    defer workspace.freeTreeEntries(alloc, new_entries);
+
+    switch (resolved.target) {
+        .live => try w.print("{s}@{s}  {s}the live tree{s}\n", .{ ui.on(.cyan), ui.off(), ui.on(.dim), ui.off() }),
+        .at => |m| {
+            var id_hex: [16]u8 = undefined;
+            _ = m.shortId(&id_hex);
+            try w.print("{s}@{s}{s}  {s}{s}{s}", .{
+                ui.on(.cyan), id_hex[0..12], ui.off(), ui.on(.dim), m.cause.label(), ui.off(),
+            });
+            if (resolved.verdict) |v| {
+                try w.print(" {s}({s} {s}){s}", .{ ui.on(.dim), v.result.label(), v.tier.label(), ui.off() });
+            }
+            try w.writeAll("\n");
+        },
+    }
+
+    // The state one step back along whatever line the spec selected. A root
+    // change has none, and then everything it holds is what it introduced.
+    const parent = revspec.resolveBack(specContext(io, alloc, &s, &ix, set), spec, 1) catch null;
+    defer if (parent) |pr| pr.deinit(alloc);
+
+    var old_entries: []object.TreeEntry = &.{};
+    var owned = false;
+    if (parent) |pr| {
+        old_entries = entriesFor(&s, work, pr.target) catch &.{};
+        owned = old_entries.len != 0;
+    }
+    defer if (owned) workspace.freeTreeEntries(alloc, old_entries);
+
+    const shown = try writeTreeDiff(alloc, w, &s, old_entries, new_entries);
+    if (shown == 0) try w.print("{s}{s}{s} nothing changed here\n", .{ ui.on(.dim), ui.bullet, ui.off() });
+}
+
+/// One file's content as of any state, without moving the working tree.
+///
+/// This is the recovery primitive the rest of the tool was missing: when a
+/// file's only good content lives in a moment, getting it back must not cost
+/// everyone else's concurrent work.
+fn cmdCat(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    var spec: []const u8 = "";
+    var path: []const u8 = "";
+    var positional: [2][]const u8 = .{ "", "" };
+    var np: usize = 0;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--at")) {
+            i += 1;
+            if (i < rest.len) spec = rest[i];
+            continue;
+        }
+        if (a.len != 0 and a[0] == '-') continue;
+        if (np < positional.len) {
+            positional[np] = a;
+            np += 1;
+        }
+    }
+
+    if (np == 2) {
+        spec = positional[0];
+        path = positional[1];
+    } else if (np == 1 and spec.len != 0) {
+        path = positional[0];
+    } else if (np == 1) {
+        // `<ref>:<path>`. Refs never contain a colon, so the first one splits.
+        const at = std.mem.indexOfScalar(u8, positional[0], ':') orelse 0;
+        if (at != 0) {
+            spec = positional[0][0..at];
+            path = positional[0][at + 1 ..];
+        }
+    }
+
+    if (spec.len == 0 or path.len == 0) {
+        try w.writeAll("usage: sdt cat <ref>:<path>\n");
+        try ui.hint(w, "also `sdt cat <ref> <path>` and `sdt cat <path> --at <ref>`");
+        return;
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const resolved = resolveSpecOrFail(io, alloc, w, &s, spec, &ix, set);
+    defer resolved.deinit(alloc);
+
+    const entries = try entriesFor(&s, work, resolved.target);
+    defer workspace.freeTreeEntries(alloc, entries);
+
+    for (entries) |e| {
+        if (!eq(e.path, path)) continue;
+        const content = try s.readFileContent(e.blob);
+        defer alloc.free(content);
+        try w.writeAll(content);
+        return;
+    }
+
+    try w.print("{s}{s}{s} {s} is not in {s}\n", .{ ui.on(.red), ui.cross, ui.off(), path, spec });
+    try ui.hint(w, "`sdt moments --path <file>` shows which states held it");
+}
+
+fn diffWorkingTree(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
 
@@ -2570,6 +2908,18 @@ fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     try w.print("switched to {s}\n", .{rest[0]});
 }
 
+/// A failed worktree says which syscall failed, on which two paths, and with
+/// which errno. `CloneFailed` on its own left nothing to act on.
+fn reportWorktreeFailure(w: *std.Io.Writer, e: anyerror) !void {
+    const why = branches.lastCloneError();
+    if (why.len == 0) {
+        try w.print("could not create worktree: {s}\n", .{@errorName(e)});
+    } else {
+        try w.print("could not create worktree: {s}\n", .{why});
+    }
+    try ui.hint(w, "the destination's parent must exist and be writable, and nothing may sit at the destination itself");
+}
+
 fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
         try w.writeAll("usage: sdt work <new-dir>\n");
@@ -2612,7 +2962,7 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         }
 
         fork.workAt(&s, work, dst_abs, resolved.target.at) catch |e| {
-            try w.print("could not create worktree: {s}\n", .{@errorName(e)});
+            try reportWorktreeFailure(w, e);
             return;
         };
         var id_hex: [16]u8 = undefined;
@@ -2626,30 +2976,148 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     }
 
     branches.work(io, src_abs, dst_abs) catch |e| {
-        try w.print("could not create worktree: {s}\n", .{@errorName(e)});
+        try reportWorktreeFailure(w, e);
         return;
     };
     try w.print("instant copy-on-write worktree at {s}\n", .{dst});
 }
 
 fn cmdRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    if (rest.len < 1) {
-        try w.writeAll("usage: sdt restore <file>\n");
+    const at = flagValue(rest, "--at", "--at");
+    const dry_run = hasFlag(rest, "--dry-run") or hasFlag(rest, "-n");
+
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(alloc);
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (eq(a, "--at")) {
+            i += 1;
+            continue;
+        }
+        if (a.len != 0 and a[0] == '-') continue;
+        try files.append(alloc, a);
+    }
+
+    if (files.items.len == 0) {
+        try w.writeAll("usage: sdt restore <file>... [--at <ref>] [--dry-run]\n");
+        try ui.hint(w, "--at pulls the file out of any state, moment or change, leaving the rest of the tree alone");
         return;
     }
+
+    if (at.len != 0) return restoreAt(io, alloc, w, at, files.items, dry_run);
+
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     captureBefore(io, alloc, &s);
     var work = try openWork(io);
     defer work.close(io);
-    workspace.restoreFile(&s, work, rest[0]) catch |e| switch (e) {
-        error.PathNotInHead => {
-            try w.print("{s} is not in the last save\n", .{rest[0]});
+    for (files.items) |f| {
+        workspace.restoreFile(&s, work, f) catch |e| switch (e) {
+            error.PathNotInHead => {
+                try w.print("{s} is not in the last save\n", .{f});
+                try ui.hint(w, "`sdt moments --path <file>` shows which states held it; `--at` pulls it from one");
+                continue;
+            },
+            else => return e,
+        };
+        try w.print("restored {s}\n", .{f});
+    }
+}
+
+/// Put named paths back to what a state held, and touch nothing else.
+///
+/// This is the case a whole-tree rewind cannot serve: several agents are mid-run
+/// in one worktree, one file's only good content lives in a moment, and getting
+/// it back must not discard everyone else's concurrent work.
+fn restoreAt(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    spec: []const u8,
+    files: []const []const u8,
+    dry_run: bool,
+) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const resolved = resolveSpecOrFail(io, alloc, w, &s, spec, &ix, set);
+    defer resolved.deinit(alloc);
+
+    const target = switch (resolved.target) {
+        .live => {
+            try w.writeAll("@ is the live tree, which is what the file already holds\n");
             return;
         },
-        else => return e,
+        .at => |m| m,
     };
-    try w.print("restored {s}\n", .{rest[0]});
+
+    const entries = try moment.entriesOf(&s, target);
+    defer workspace.freeTreeEntries(alloc, entries);
+
+    var id_hex: [16]u8 = undefined;
+    _ = target.shortId(&id_hex);
+
+    // Refuse before writing anything if a named path is not in that state.
+    // Restoring a file the state never held means deleting it, which is the
+    // opposite of what the word promises.
+    var missing: usize = 0;
+    for (files) |f| {
+        var found = false;
+        for (entries) |e| {
+            if (eq(e.path, f)) {
+                found = true;
+                break;
+            }
+            if (e.path.len > f.len and std.mem.startsWith(u8, e.path, f) and e.path[f.len] == '/') {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try w.print("{s}{s}{s} {s} is not in {s}@{s}{s}\n", .{
+                ui.on(.red), ui.cross, ui.off(), f, ui.on(.cyan), id_hex[0..12], ui.off(),
+            });
+            missing += 1;
+        }
+    }
+    if (missing != 0) {
+        try ui.hint(w, "`sdt moments --path <file>` shows which states held it");
+        return;
+    }
+
+    if (dry_run) {
+        const pv = try rewind.preview(&s, alloc, work, entries, files);
+        defer pv.deinit(alloc);
+        if (pv.changes.len == 0) {
+            try w.print("already matches {s}@{s}{s}\n", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
+            return;
+        }
+        try w.print("would restore from {s}@{s}{s}\n", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
+        for (pv.changes) |c| {
+            try w.print("  {s}{s}{s} {s}\n", .{ ui.on(.dim), c.label(), ui.off(), c.path });
+        }
+        return;
+    }
+
+    const applied = try rewind.apply(&s, work, entries, momentSettings(&s, alloc), files);
+    try w.print("{s}{s}{s} restored {d} path{s} from {s}@{s}{s}", .{
+        ui.on(.green),   ui.check,                              ui.off(),
+        applied.changed, if (applied.changed == 1) "" else "s", ui.on(.cyan),
+        id_hex[0..12],   ui.off(),
+    });
+    if (resolved.verdict) |v| {
+        try w.print(" {s}({s} {s}){s}", .{ ui.on(.dim), v.result.label(), v.tier.label(), ui.off() });
+    }
+    try w.writeAll("\n");
+    try ui.hint(w, "`sdt undo` puts it back; nothing else in the tree was touched");
 }
 
 fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -3182,6 +3650,33 @@ fn resolveRangeOrFail(
         failSpec(io, alloc, w, s, spec, ix, set, e);
 }
 
+/// A moment's age, in the same units the revspecs use, so a row reads straight
+/// across into `sdt rewind @2h`. Without it there is no way to pick the state
+/// from just before something broke short of dry-running every moment.
+fn writeAge(w: *std.Io.Writer, now_ms: i64, then_ms: i64) !void {
+    const secs = @divTrunc(@max(now_ms - then_ms, 0), 1000);
+    var buf: [16]u8 = undefined;
+    const text = if (secs < 60)
+        try std.fmt.bufPrint(&buf, "{d}s", .{secs})
+    else if (secs < 60 * 60)
+        try std.fmt.bufPrint(&buf, "{d}m", .{@divTrunc(secs, 60)})
+    else if (secs < 24 * 60 * 60)
+        try std.fmt.bufPrint(&buf, "{d}h", .{@divTrunc(secs, 60 * 60)})
+    else
+        try std.fmt.bufPrint(&buf, "{d}d", .{@divTrunc(secs, 24 * 60 * 60)});
+    try w.print("{s}{s: >4} ago{s}  ", .{ ui.on(.dim), text, ui.off() });
+}
+
+/// The blob a moment held at `path`, or null when it held no such file.
+fn blobAt(s: *Store, m: moment.Moment, path: []const u8) ?Oid {
+    const entries = moment.entriesOf(s, m) catch return null;
+    defer workspace.freeTreeEntries(s.alloc, entries);
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.path, path)) return e.blob;
+    }
+    return null;
+}
+
 fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
@@ -3190,6 +3685,7 @@ fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     if (flagValue(rest, "-n", "--number").len != 0) {
         limit = std.fmt.parseInt(usize, flagValue(rest, "-n", "--number"), 10) catch 20;
     }
+    const path_filter = flagValue(rest, "--path", "--path");
 
     const all = try moment.readAll(&s, alloc);
     defer moment.freeMoments(alloc, all);
@@ -3199,13 +3695,40 @@ fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
         return;
     }
 
+    // With `--path`, keep only the moments where that file's content actually
+    // moved. "Which states held a different version of this file" is the
+    // question you have when you are trying to get one file back, and it is not
+    // the same question as "which states differ from the tree I have now".
+    var picked: std.ArrayList(moment.Moment) = .empty;
+    defer picked.deinit(alloc);
+    if (path_filter.len != 0) {
+        var prev: ?Oid = null;
+        for (all) |m| {
+            const cur = blobAt(&s, m, path_filter);
+            const moved = if (prev) |p|
+                (if (cur) |c| !p.eql(c) else true)
+            else
+                cur != null;
+            prev = cur;
+            if (moved) try picked.append(alloc, m);
+        }
+        if (picked.items.len == 0) {
+            try w.print("no captured moment holds a version of {s}\n", .{path_filter});
+            return;
+        }
+    } else {
+        try picked.appendSlice(alloc, all);
+    }
+
     const set = checks.settings(&s, alloc);
     defer set.deinit(alloc);
     var ix = try verdict.Index.load(&s, alloc);
     defer ix.deinit();
 
-    const start = if (all.len > limit) all.len - limit else 0;
-    for (all[start..]) |m| {
+    const now_ms = nowMillis(io);
+    const rows = picked.items;
+    const start = if (rows.len > limit) rows.len - limit else 0;
+    for (rows[start..]) |m| {
         var id_hex: [16]u8 = undefined;
         _ = m.shortId(&id_hex);
         const v = ix.best(
@@ -3214,6 +3737,7 @@ fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
             verdict.commandHash(set.command(.full)),
         );
         try w.print("{s}@{s}{s}  ", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
+        try writeAge(w, now_ms, m.ms);
         if (v) |got| {
             const colour: ui.Color = if (got.result == .green) .green else .red;
             try w.print("{s}{s}{s} {s}{s}{s}", .{
@@ -4361,6 +4885,7 @@ fn cmdUndo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         else => return e,
     };
     try w.writeAll("undone\n");
+    try mirrorRewriteToGit(io, alloc, w, &s);
 }
 
 fn cmdRedo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -4377,6 +4902,7 @@ fn cmdRedo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         else => return e,
     };
     try w.writeAll("redone\n");
+    try mirrorRewriteToGit(io, alloc, w, &s);
 }
 
 const GitOp = enum { import, export_, sync };
@@ -6373,6 +6899,122 @@ test "amend sends a hunk of the working tree back into a named change" {
     f.clear();
     try cmdStatus(io, alloc, f.w(), &.{});
     try std.testing.expect(std.mem.indexOf(u8, f.said(), "app.zig") != null);
+}
+
+test "restore --at pulls one file out of a state and leaves the rest alone" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("keep.txt", "mine\n");
+    try f.write("lost.txt", "the good version\n");
+    const good = try f.save("both");
+
+    // Another agent's concurrent edit, plus the file we are about to wreck.
+    try f.write("keep.txt", "someone else was here\n");
+    try f.write("lost.txt", "destroyed\n");
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = good.toHex(&hex);
+    try cmdRestore(io, alloc, f.w(), &.{ "lost.txt", "--at", hex[0..12] });
+
+    const lost = try f.read("lost.txt");
+    defer alloc.free(lost);
+    try std.testing.expectEqualStrings("the good version\n", lost);
+
+    const keep = try f.read("keep.txt");
+    defer alloc.free(keep);
+    try std.testing.expectEqualStrings("someone else was here\n", keep);
+}
+
+test "restore --at refuses a path the state never held rather than deleting it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    const first = try f.save("first");
+    try f.write("later.txt", "added afterwards\n");
+    _ = try f.save("second");
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = first.toHex(&hex);
+    try cmdRestore(io, alloc, f.w(), &.{ "later.txt", "--at", hex[0..12] });
+
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "is not in") != null);
+    const still = try f.read("later.txt");
+    defer alloc.free(still);
+    try std.testing.expectEqualStrings("added afterwards\n", still);
+}
+
+test "cat reads a file out of a change without touching the working tree" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "old\n");
+    const first = try f.save("first");
+    try f.write("f.txt", "new\n");
+    _ = try f.save("second");
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = first.toHex(&hex);
+    const spec = try std.fmt.allocPrint(alloc, "{s}:f.txt", .{hex[0..12]});
+    defer alloc.free(spec);
+    try cmdCat(io, alloc, f.w(), &.{spec});
+    try std.testing.expectEqualStrings("old\n", f.said());
+
+    const on_disk = try f.read("f.txt");
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("new\n", on_disk);
+}
+
+test "show prints what a change introduced, not the tree against the working copy" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "one\n");
+    _ = try f.save("first");
+    try f.write("f.txt", "one\ntwo\n");
+    const second = try f.save("second");
+
+    var hex: [Oid.len * 2]u8 = undefined;
+    _ = second.toHex(&hex);
+    // A clean tree: this is exactly the case where `diff` correctly says
+    // nothing changed and `show` must still describe the change.
+    try cmdShow(io, alloc, f.w(), &.{hex[0..12]});
+
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "+two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "-one") == null);
+}
+
+test "diff between two changes ignores the working tree entirely" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "one\n");
+    const first = try f.save("first");
+    try f.write("f.txt", "one\ntwo\n");
+    const second = try f.save("second");
+    try f.write("f.txt", "something else entirely\n");
+
+    var a: [Oid.len * 2]u8 = undefined;
+    var b: [Oid.len * 2]u8 = undefined;
+    _ = first.toHex(&a);
+    _ = second.toHex(&b);
+    const spec = try std.fmt.allocPrint(alloc, "{s}..{s}", .{ a[0..12], b[0..12] });
+    defer alloc.free(spec);
+    try cmdDiff(io, alloc, f.w(), &.{spec});
+
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "+two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "something else") == null);
 }
 
 test "init tells a colocated git repo to ignore the repo dir, once" {
