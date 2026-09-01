@@ -1,0 +1,250 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - build.zig.zon
+      - build.zig
+      - .github/workflows/release.yml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (e.g. 1.2.3, without leading v)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version and release decision
+        id: version
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch requested for v${VERSION}"
+            exit 0
+          fi
+
+          CURRENT_VERSION="$(grep -E '\.version' build.zig.zon | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          echo "Current version: ${CURRENT_VERSION}"
+
+          # The released tags are the source of truth, not a diff against the
+          # previous commit: a push carrying several commits can bump the version
+          # anywhere but the tip, and comparing HEAD to HEAD^ misses that bump and
+          # strands the release for good.
+          if git ls-remote --tags origin "refs/tags/v${CURRENT_VERSION}" | grep -q "refs/tags/v${CURRENT_VERSION}"; then
+            echo "Tag v${CURRENT_VERSION} already exists on origin; skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  generate-notes:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate AI release notes
+        id: notes
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "${PREV_TAG}" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          else
+            RANGE=""
+          fi
+
+          if [ -n "${RANGE}" ]; then
+            DIFF="$(git diff "${PREV_TAG}" HEAD -- '*.zig' 'build.zig.zon' 'build.zig' 'README.md' | head -c 60000 || true)"
+            LOG="$(git log "${RANGE}" --pretty=format:'- %s' || true)"
+          else
+            DIFF="$(git diff HEAD -- '*.zig' 'build.zig.zon' 'build.zig' 'README.md' | head -c 60000 || true)"
+            LOG="$(git log --pretty=format:'- %s' | head -50 || true)"
+          fi
+
+          FALLBACK_NOTES="Release v${VERSION}
+
+          ## Changes
+
+          ${LOG}"
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "No OPENAI_API_KEY set; using fallback notes."
+            {
+              echo "notes<<SDT_NOTES_EOF"
+              echo "${FALLBACK_NOTES}"
+              echo "SDT_NOTES_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SYSTEM_PROMPT="You are writing release notes for sdt (superdetermine), a version control system written in Zig that records what worked, not just what changed, with full git interop. Write concise, professional release notes. Do not use emojis. Do not include a title or version header. Use markdown with ## sections chosen from: Features, Fixes, Improvements, Breaking Changes. Only include sections that apply. Be concise and factual."
+
+          USER_CONTENT="Commit log:
+          ${LOG}
+
+          Diff:
+          ${DIFF}"
+
+          PAYLOAD="$(jq -n \
+            --arg system "${SYSTEM_PROMPT}" \
+            --arg user "${USER_CONTENT}" \
+            '{
+              model: "gpt-5.2",
+              messages: [
+                { role: "system", content: $system },
+                { role: "user", content: $user }
+              ]
+            }')"
+
+          RESPONSE="$(curl -sS --fail-with-body https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" 2>/dev/null || true)"
+
+          NOTES="$(printf '%s' "${RESPONSE}" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)"
+
+          if [ -z "${NOTES}" ]; then
+            echo "OpenAI request failed or returned empty; using fallback notes."
+            NOTES="${FALLBACK_NOTES}"
+          fi
+
+          {
+            echo "notes<<SDT_NOTES_EOF"
+            echo "${NOTES}"
+            echo "SDT_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  create-tag:
+    needs: [check-version, generate-notes]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create and push tag
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists locally; skipping tag creation."
+            exit 0
+          fi
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+
+  create-release:
+    needs: [check-version, generate-notes, create-tag]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }}
+          body: ${{ needs.generate-notes.outputs.notes }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: [check-version, create-release]
+    if: always() && (needs.check-version.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            asset: sdt-macos-arm64
+            os: macos
+            zig: aarch64-macos
+          - runner: macos-13
+            asset: sdt-macos-x64
+            os: macos
+            zig: x86_64-macos
+          - runner: ubuntu-latest
+            asset: sdt-linux-x64
+            os: linux
+            zig: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            asset: sdt-linux-arm64
+            os: linux
+            zig: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Download Zig 0.16.0 directly from ziglang.org (setup-zig's index does not
+      # list 0.16.0 and mis-routes it to the nightly path). libgit2 is built
+      # statically from source by `zig build`, so no system libgit2 is needed.
+      - name: Install Zig 0.16.0
+        run: |
+          ZIG="zig-${{ matrix.zig }}-0.16.0"
+          curl -fsSL "https://ziglang.org/download/0.16.0/${ZIG}.tar.xz" -o zig.tar.xz
+          tar xf zig.tar.xz
+          echo "$PWD/${ZIG}" >> "$GITHUB_PATH"
+
+      # build.zig defaults the optimize mode to ReleaseFast, so a plain
+      # `zig build` produces the release binary.
+      - name: Build
+        run: zig build
+
+      - name: Package binary
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          cp zig-out/bin/sdt "${ASSET}"
+          chmod +x "${ASSET}"
+          shasum -a 256 "${ASSET}" | awk '{print $1}' > "${ASSET}.sha256"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version || github.event.inputs.version }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

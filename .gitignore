@@ -1,0 +1,15 @@
+.sdt/
+.zig-cache/
+zig-cache/
+zig-out/
+
+.DS_Store
+
+*.swp
+*.swo
+*~
+
+.env
+.env.*
+!.env.example
+zig-pkg/

@@ -1,0 +1,108 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prep:
+    name: Prepare nightly release
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide + (re)create the rolling nightly release
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          echo "sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+          PREV=$(git rev-list -n1 nightly 2>/dev/null || echo none)
+
+          # On the nightly cron, skip if master hasn't moved since the last nightly.
+          if [ "$PREV" = "$HEAD_SHA" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "No new commits since last nightly ($SHORT); skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+          NOTES="Rolling nightly build from \`$SHORT\` — $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          Prerelease built from the tip of master; may be unstable. Get it with \`sdt update --nightly\`."
+
+          gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
+          gh release create nightly \
+            --prerelease \
+            --target "$HEAD_SHA" \
+            --title "Nightly ($SHORT)" \
+            --notes "$NOTES"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: prep
+    if: needs.prep.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            asset: sdt-macos-arm64
+            zig: aarch64-macos
+          - runner: macos-13
+            asset: sdt-macos-x64
+            zig: x86_64-macos
+          - runner: ubuntu-latest
+            asset: sdt-linux-x64
+            zig: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            asset: sdt-linux-arm64
+            zig: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        run: |
+          ZIG="zig-${{ matrix.zig }}-0.16.0"
+          curl -fsSL "https://ziglang.org/download/0.16.0/${ZIG}.tar.xz" -o zig.tar.xz
+          tar xf zig.tar.xz
+          echo "$PWD/${ZIG}" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: zig build
+
+      - name: Package binary
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          cp zig-out/bin/sdt "${ASSET}"
+          chmod +x "${ASSET}"
+          shasum -a 256 "${ASSET}" | awk '{print $1}' > "${ASSET}.sha256"
+
+      - name: Upload to nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
