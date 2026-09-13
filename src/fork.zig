@@ -57,13 +57,35 @@ pub fn workAt(
     dst_abs: []const u8,
     m: moment.Moment,
 ) !void {
-    const io = store.io;
     const alloc = store.alloc;
 
     // Reconstruct (and verify) the target content before anything is cloned, so
     // a corrupt moment fails without leaving a half-built workspace behind.
     const entries = try moment.entriesOf(store, m);
     defer workspace.freeTreeEntries(alloc, entries);
+
+    try workAtEntries(store, work_dir, dst_abs, entries);
+}
+
+pub fn workAtTree(
+    store: *Store,
+    work_dir: std.Io.Dir,
+    dst_abs: []const u8,
+    tree_oid: Oid,
+) !void {
+    const tree = try store.readTree(tree_oid);
+    defer object.freeTree(store.alloc, tree);
+    try workAtEntries(store, work_dir, dst_abs, tree.entries);
+}
+
+fn workAtEntries(
+    store: *Store,
+    work_dir: std.Io.Dir,
+    dst_abs: []const u8,
+    entries: []const object.TreeEntry,
+) !void {
+    const io = store.io;
+    const alloc = store.alloc;
 
     const src_abs = try work_dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(src_abs);

@@ -174,7 +174,7 @@ pub const Key = struct {
 
 // --- encoding ---
 
-fn formatLine(alloc: std.mem.Allocator, v: Verdict) ![]u8 {
+pub fn formatLine(alloc: std.mem.Allocator, v: Verdict) ![]u8 {
     var tree_hex: [Oid.len * 2]u8 = undefined;
     var cmd_hex: [Oid.len * 2]u8 = undefined;
     var rs_hex: [Oid.len * 2]u8 = undefined;
@@ -206,7 +206,7 @@ fn formatLine(alloc: std.mem.Allocator, v: Verdict) ![]u8 {
     );
 }
 
-fn parseLine(line: []const u8) !Verdict {
+pub fn parseLine(line: []const u8) !Verdict {
     var it = std.mem.splitScalar(u8, line, ' ');
     const tree_s = it.next() orelse return error.InvalidVerdict;
     const tier_s = it.next() orelse return error.InvalidVerdict;

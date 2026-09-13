@@ -536,6 +536,13 @@ pub const Launch = struct {
     /// run `exit 0` want and what nothing in production should ask for.
     timeout_ms: i64 = 0,
     kill_grace_ms: i64 = default_kill_grace_ms,
+    stdio: Stdio = .silent,
+};
+
+pub const Stdio = enum {
+    silent,
+    inherit,
+    stderr_only,
 };
 
 /// Run `command` with `/bin/sh -c` inside `cwd_path`. A shell is used on
@@ -588,8 +595,14 @@ pub fn run(
         const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
         if (devnull >= 0) {
             _ = std.c.dup2(devnull, 0);
-            _ = std.c.dup2(devnull, 1);
-            _ = std.c.dup2(devnull, 2);
+            switch (launch.stdio) {
+                .silent => {
+                    _ = std.c.dup2(devnull, 1);
+                    _ = std.c.dup2(devnull, 2);
+                },
+                .inherit => {},
+                .stderr_only => _ = std.c.dup2(2, 1),
+            }
         }
         _ = execvp(cargv[0].?, cargv.ptr);
         _exit(127);

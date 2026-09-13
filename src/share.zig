@@ -2,6 +2,7 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const store = @import("store.zig");
+const verdict = @import("verdict.zig");
 const Oid = oid.Oid;
 const Store = store.Store;
 
@@ -158,6 +159,57 @@ pub fn freeRefs(alloc: std.mem.Allocator, refs: []Ref) void {
     alloc.free(refs);
 }
 
+pub const State = struct {
+    tree: Oid,
+    check: []const u8 = "",
+    verdict: ?verdict.Verdict = null,
+
+    pub fn deinit(self: State, alloc: std.mem.Allocator) void {
+        if (self.check.len != 0) alloc.free(self.check);
+    }
+};
+
+const state_lead = "version 1\nstate ";
+
+fn renderStateRoot(alloc: std.mem.Allocator, state: State) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var hex: [Oid.len * 2]u8 = undefined;
+    try out.print(alloc, "version 1\nstate {s}\n", .{state.tree.toHex(&hex)});
+    if (state.check.len != 0) try out.print(alloc, "check {s}\n", .{state.check});
+    if (state.verdict) |v| {
+        const line = try verdict.formatLine(alloc, v);
+        defer alloc.free(line);
+        try out.print(alloc, "verdict {s}\n", .{std.mem.trimEnd(u8, line, "\n")});
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn parseStateRoot(alloc: std.mem.Allocator, text: []const u8) !?State {
+    if (!std.mem.startsWith(u8, text, state_lead)) return null;
+    var state = State{ .tree = Oid.zero() };
+    errdefer state.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    _ = lines.next();
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return Error.BadRoot;
+        const key = line[0..sp];
+        const value = line[sp + 1 ..];
+        if (std.mem.eql(u8, key, "state")) {
+            state.tree = Oid.fromHex(value) catch return Error.BadRoot;
+        } else if (std.mem.eql(u8, key, "check")) {
+            if (state.check.len != 0) alloc.free(state.check);
+            state.check = try alloc.dupe(u8, value);
+        } else if (std.mem.eql(u8, key, "verdict")) {
+            state.verdict = verdict.parseLine(value) catch return Error.BadRoot;
+        }
+    }
+    if (state.tree.isZero()) return Error.BadRoot;
+    return state;
+}
+
 fn refsFor(st: *Store, alloc: std.mem.Allocator, branches: []const []const u8) ![]Ref {
     var out: std.ArrayList(Ref) = .empty;
     errdefer {
@@ -261,6 +313,37 @@ pub fn collectReachable(st: *Store, alloc: std.mem.Allocator, roots: []const Ref
     return list;
 }
 
+pub fn collectTree(st: *Store, alloc: std.mem.Allocator, tree_oid: Oid) ![]Oid {
+    var seen = Seen.init(alloc);
+    defer seen.deinit();
+
+    var out: std.ArrayList(Oid) = .empty;
+    errdefer out.deinit(alloc);
+
+    try seen.put(tree_oid.bytes, {});
+    try out.append(alloc, tree_oid);
+
+    const tree = try st.readTree(tree_oid);
+    defer object.freeTree(st.alloc, tree);
+    for (tree.entries) |e| {
+        if ((try seen.getOrPut(e.blob.bytes)).found_existing) continue;
+        try out.append(alloc, e.blob);
+
+        const raw = try st.readRaw(e.blob);
+        defer st.alloc.free(raw);
+        const blob = try object.Blob.decode(st.alloc, raw);
+        defer st.alloc.free(blob.chunks);
+        for (blob.chunks) |c| {
+            if ((try seen.getOrPut(c.bytes)).found_existing) continue;
+            try out.append(alloc, c);
+        }
+    }
+
+    const list = try out.toOwnedSlice(alloc);
+    std.mem.sort(Oid, list, {}, oidLessThan);
+    return list;
+}
+
 fn obtain(st: *Store, alloc: std.mem.Allocator, src: anytype, o: Oid) ![]u8 {
     if (st.has(o)) return st.readRaw(o);
     const raw = try src.fetch(alloc, o);
@@ -309,6 +392,48 @@ fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const
     }
 
     for (refs) |r| try st.updateRef(r.name, r.target);
+}
+
+fn importTree(st: *Store, alloc: std.mem.Allocator, src: anytype, tree_oid: Oid) !void {
+    var seen = Seen.init(alloc);
+    defer seen.deinit();
+
+    const tree_raw = try obtain(st, alloc, src, tree_oid);
+    defer alloc.free(tree_raw);
+    const tree = try object.Tree.decode(alloc, tree_raw);
+    defer object.freeTree(alloc, tree);
+
+    for (tree.entries) |e| {
+        if ((try seen.getOrPut(e.blob.bytes)).found_existing) continue;
+        const blob_raw = try obtain(st, alloc, src, e.blob);
+        defer alloc.free(blob_raw);
+        const blob = try object.Blob.decode(alloc, blob_raw);
+        defer alloc.free(blob.chunks);
+        for (blob.chunks) |c| {
+            if ((try seen.getOrPut(c.bytes)).found_existing) continue;
+            const chunk = try obtain(st, alloc, src, c);
+            alloc.free(chunk);
+        }
+    }
+}
+
+const Payload = union(enum) {
+    refs: []const Ref,
+    state: State,
+};
+
+fn rootTextOf(alloc: std.mem.Allocator, payload: Payload) ![]u8 {
+    return switch (payload) {
+        .refs => |refs| renderRoot(alloc, refs),
+        .state => |state| renderStateRoot(alloc, state),
+    };
+}
+
+fn reachableOf(st: *Store, alloc: std.mem.Allocator, payload: Payload) ![]Oid {
+    return switch (payload) {
+        .refs => |refs| collectReachable(st, alloc, refs),
+        .state => |state| collectTree(st, alloc, state.tree),
+    };
 }
 
 pub fn encodeUrl(alloc: std.mem.Allocator, base_url: []const u8, s: ShareKey) ![]u8 {
@@ -389,7 +514,28 @@ pub fn exportDir(
 ) !void {
     const refs = try refsFor(st, alloc, branches);
     defer freeRefs(alloc, refs);
+    try exportPayload(st, alloc, io, s, dest, .{ .refs = refs });
+}
 
+pub fn exportStateDir(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    s: ShareKey,
+    dest: std.Io.Dir,
+    state: State,
+) !void {
+    try exportPayload(st, alloc, io, s, dest, .{ .state = state });
+}
+
+fn exportPayload(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    s: ShareKey,
+    dest: std.Io.Dir,
+    payload: Payload,
+) !void {
     const prk = prkOf(s);
     const nk = nameKey(prk);
     var idbuf: [id_len]u8 = undefined;
@@ -399,7 +545,7 @@ pub fn exportDir(
     const objects_dir = std.fmt.bufPrint(&dirbuf, "r/{s}/{s}", .{ id, objects_leaf }) catch unreachable;
     try dest.createDirPath(io, objects_dir);
 
-    const root_text = try renderRoot(alloc, refs);
+    const root_text = try rootTextOf(alloc, payload);
     defer alloc.free(root_text);
     const root_record = try sealRecord(alloc, rootKey(prk), root_aad, root_text);
     defer alloc.free(root_record);
@@ -410,7 +556,7 @@ pub fn exportDir(
         .data = root_record,
     });
 
-    const oids = try collectReachable(st, alloc, refs);
+    const oids = try reachableOf(st, alloc, payload);
     defer alloc.free(oids);
 
     for (oids) |o| {
@@ -444,7 +590,37 @@ pub fn buildBundle(
 ) ![]u8 {
     const refs = try refsFor(st, alloc, branches);
     defer freeRefs(alloc, refs);
+    return bundlePayload(st, alloc, s, .{ .refs = refs });
+}
 
+pub fn buildStateBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    s: ShareKey,
+    state: State,
+) ![]u8 {
+    return bundlePayload(st, alloc, s, .{ .state = state });
+}
+
+pub fn writeStateBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    s: ShareKey,
+    out_path: []const u8,
+    state: State,
+) !void {
+    const bytes = try buildStateBundle(st, alloc, s, state);
+    defer alloc.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+}
+
+fn bundlePayload(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    s: ShareKey,
+    what: Payload,
+) ![]u8 {
     const prk = prkOf(s);
     const nk = nameKey(prk);
     var idbuf: [id_len]u8 = undefined;
@@ -455,13 +631,13 @@ pub fn buildBundle(
     try out.appendSlice(alloc, bundle_magic);
     try out.appendSlice(alloc, id);
 
-    const root_text = try renderRoot(alloc, refs);
+    const root_text = try rootTextOf(alloc, what);
     defer alloc.free(root_text);
     const root_record = try sealRecord(alloc, rootKey(prk), root_aad, root_text);
     defer alloc.free(root_record);
     try appendRecord(alloc, &out, root_record);
 
-    const oids = try collectReachable(st, alloc, refs);
+    const oids = try reachableOf(st, alloc, what);
     defer alloc.free(oids);
 
     for (oids) |o| {
@@ -496,23 +672,80 @@ pub fn writeBundle(
 
 const RecordMap = std.AutoHashMap([name_raw_len]u8, []const u8);
 
-const BundleSource = struct {
-    prk: Prk,
-    nk: [32]u8,
-    map: *const RecordMap,
+pub const Kind = enum { refs, state };
 
-    fn fetch(self: BundleSource, alloc: std.mem.Allocator, o: Oid) ![]u8 {
-        const record = self.map.get(blindedRaw(self.nk, o)) orelse return Error.BadBundle;
-        return openObject(alloc, self.prk, o, record);
+pub const Received = union(enum) {
+    refs,
+    state: State,
+
+    pub fn deinit(self: Received, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .refs => {},
+            .state => |st| st.deinit(alloc),
+        }
     }
 };
 
-pub fn importBundle(
-    st: *Store,
+pub const Opened = struct {
+    prk: Prk,
+    nk: [32]u8,
+    root_text: []u8,
+    source: union(enum) {
+        bundle: RecordMap,
+        http: struct {
+            io: std.Io,
+            parsed: ParsedUrl,
+        },
+    },
+
+    pub fn deinit(self: *Opened, alloc: std.mem.Allocator) void {
+        alloc.free(self.root_text);
+        switch (self.source) {
+            .bundle => |*map| map.deinit(),
+            .http => |h| h.parsed.deinit(alloc),
+        }
+    }
+
+    pub fn kind(self: *const Opened) Kind {
+        return if (std.mem.startsWith(u8, self.root_text, state_lead)) .state else .refs;
+    }
+
+    pub fn state(self: *const Opened, alloc: std.mem.Allocator) !?State {
+        return parseStateRoot(alloc, self.root_text);
+    }
+
+    fn fetch(self: *const Opened, alloc: std.mem.Allocator, o: Oid) ![]u8 {
+        switch (self.source) {
+            .bundle => |map| {
+                const record = map.get(blindedRaw(self.nk, o)) orelse return Error.BadBundle;
+                return openObject(alloc, self.prk, o, record);
+            },
+            .http => |h| {
+                const a = try splitAuthority(h.parsed.base);
+                var namebuf: [name_len]u8 = undefined;
+                const raw_name = blindedRaw(self.nk, o);
+                _ = b64.Encoder.encode(&namebuf, &raw_name);
+
+                const path = try std.fmt.allocPrint(
+                    alloc,
+                    "{s}{s}{s}/{s}/{s}",
+                    .{ a.prefix, path_segment, h.parsed.id, objects_leaf, namebuf },
+                );
+                defer alloc.free(path);
+
+                const record = try httpGet(h.io, alloc, h.parsed.base, path);
+                defer alloc.free(record);
+                return openObject(alloc, self.prk, o, record);
+            },
+        }
+    }
+};
+
+pub fn openBundle(
     alloc: std.mem.Allocator,
     s: ShareKey,
     bytes: []const u8,
-) !void {
+) !Opened {
     if (bytes.len < bundle_magic.len + id_len) return Error.BadBundle;
     if (!std.mem.eql(u8, bytes[0..bundle_magic.len], bundle_magic)) return Error.BadBundle;
 
@@ -522,7 +755,7 @@ pub fn importBundle(
 
     const prk = prkOf(s);
     var map = RecordMap.init(alloc);
-    defer map.deinit();
+    errdefer map.deinit();
 
     var pos: usize = bundle_magic.len + id_len;
     var root_record: ?[]const u8 = null;
@@ -544,12 +777,36 @@ pub fn importBundle(
 
     const root = root_record orelse return Error.BadBundle;
     const root_text = try openRecord(alloc, rootKey(prk), root_aad, root);
-    defer alloc.free(root_text);
-    const refs = try parseRoot(alloc, root_text);
-    defer freeRefs(alloc, refs);
+    return .{
+        .prk = prk,
+        .nk = nameKey(prk),
+        .root_text = root_text,
+        .source = .{ .bundle = map },
+    };
+}
 
-    const src = BundleSource{ .prk = prk, .nk = nameKey(prk), .map = &map };
-    try importGraph(st, alloc, src, refs);
+pub fn importOpened(st: *Store, alloc: std.mem.Allocator, opened: *const Opened) !Received {
+    if (try parseStateRoot(alloc, opened.root_text)) |state| {
+        errdefer state.deinit(alloc);
+        try importTree(st, alloc, opened, state.tree);
+        return .{ .state = state };
+    }
+    const refs = try parseRoot(alloc, opened.root_text);
+    defer freeRefs(alloc, refs);
+    try importGraph(st, alloc, opened, refs);
+    return .refs;
+}
+
+pub fn importBundle(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    s: ShareKey,
+    bytes: []const u8,
+) !void {
+    var opened = try openBundle(alloc, s, bytes);
+    defer opened.deinit(alloc);
+    const got = try importOpened(st, alloc, &opened);
+    got.deinit(alloc);
 }
 
 pub fn readBundle(
@@ -676,35 +933,9 @@ fn httpGet(io: std.Io, alloc: std.mem.Allocator, base: []const u8, path: []const
     return plainGet(io, alloc, a, path);
 }
 
-const HttpSource = struct {
-    io: std.Io,
-    base: []const u8,
-    id: []const u8,
-    prefix: []const u8,
-    prk: Prk,
-    nk: [32]u8,
-
-    fn fetch(self: HttpSource, alloc: std.mem.Allocator, o: Oid) ![]u8 {
-        var namebuf: [name_len]u8 = undefined;
-        const raw_name = blindedRaw(self.nk, o);
-        _ = b64.Encoder.encode(&namebuf, &raw_name);
-
-        const path = try std.fmt.allocPrint(
-            alloc,
-            "{s}{s}{s}/{s}/{s}",
-            .{ self.prefix, path_segment, self.id, objects_leaf, namebuf },
-        );
-        defer alloc.free(path);
-
-        const record = try httpGet(self.io, alloc, self.base, path);
-        defer alloc.free(record);
-        return openObject(alloc, self.prk, o, record);
-    }
-};
-
-pub fn fetchHttp(st: *Store, alloc: std.mem.Allocator, io: std.Io, url: []const u8) !void {
+pub fn openHttp(alloc: std.mem.Allocator, io: std.Io, url: []const u8) !Opened {
     const parsed = try parseUrl(alloc, url);
-    defer parsed.deinit(alloc);
+    errdefer parsed.deinit(alloc);
 
     const a = try splitAuthority(parsed.base);
     const prk = prkOf(parsed.key);
@@ -720,19 +951,19 @@ pub fn fetchHttp(st: *Store, alloc: std.mem.Allocator, io: std.Io, url: []const 
     defer alloc.free(root_record);
 
     const root_text = try openRecord(alloc, rootKey(prk), root_aad, root_record);
-    defer alloc.free(root_text);
-    const refs = try parseRoot(alloc, root_text);
-    defer freeRefs(alloc, refs);
-
-    const src = HttpSource{
-        .io = io,
-        .base = parsed.base,
-        .id = parsed.id,
-        .prefix = a.prefix,
+    return .{
         .prk = prk,
         .nk = nameKey(prk),
+        .root_text = root_text,
+        .source = .{ .http = .{ .io = io, .parsed = parsed } },
     };
-    try importGraph(st, alloc, src, refs);
+}
+
+pub fn fetchHttp(st: *Store, alloc: std.mem.Allocator, io: std.Io, url: []const u8) !void {
+    var opened = try openHttp(alloc, io, url);
+    defer opened.deinit(alloc);
+    const got = try importOpened(st, alloc, &opened);
+    got.deinit(alloc);
 }
 
 fn safeName(name: []const u8) bool {
@@ -1213,4 +1444,99 @@ test "http share roundtrip over a live socket" {
         const content = try dst.readFileContent(e.blob);
         alloc.free(content);
     }
+}
+
+test "state root text roundtrip carries the check and the verdict" {
+    const alloc = testing.allocator;
+    const v = verdict.Verdict{
+        .tree = Oid.ofBytes("tree"),
+        .tier = .full,
+        .command = verdict.commandHash("zig build test"),
+        .result = .red,
+        .exit_code = 3,
+        .duration_ms = 1200,
+        .ms = 1_700_000_000_000,
+        .readset = Oid.zero(),
+        .independence = .independent,
+        .relevance_hit = 2,
+        .relevance_total = 3,
+        .discrimination = .unknown,
+        .ran_ms = 1_700_000_001_000,
+        .outcome = .fail,
+    };
+    const text = try renderStateRoot(alloc, .{
+        .tree = Oid.ofBytes("tree"),
+        .check = "zig build test",
+        .verdict = v,
+    });
+    defer alloc.free(text);
+
+    const back = (try parseStateRoot(alloc, text)) orelse return error.TestUnexpectedResult;
+    defer back.deinit(alloc);
+    try testing.expect(back.tree.eql(Oid.ofBytes("tree")));
+    try testing.expectEqualStrings("zig build test", back.check);
+    try testing.expectEqual(@as(i32, 3), back.verdict.?.exit_code);
+    try testing.expectEqual(verdict.Result.red, back.verdict.?.result);
+    try testing.expectEqual(@as(u16, 2), back.verdict.?.relevance_hit);
+    try testing.expect(back.verdict.?.command.eql(verdict.commandHash("zig build test")));
+
+    const bare = (try parseStateRoot(alloc, "version 1\nstate " ++ ("1f" ** Oid.len) ++ "\n")) orelse
+        return error.TestUnexpectedResult;
+    defer bare.deinit(alloc);
+    try testing.expectEqualStrings("", bare.check);
+    try testing.expect(bare.verdict == null);
+
+    try testing.expect((try parseStateRoot(alloc, "version 1\nmain abc\n")) == null);
+    try testing.expectError(Error.BadRoot, parseStateRoot(alloc, "version 1\nstate zz\n"));
+    try testing.expectError(Error.BadRoot, parseStateRoot(alloc, "version 1\nstate " ++ ("00" ** Oid.len) ++ "\n"));
+}
+
+test "a state bundle carries one tree and arrives as a state, not a branch" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var repo = std.testing.tmpDir(.{});
+    defer repo.cleanup();
+    var clone = std.testing.tmpDir(.{});
+    defer clone.cleanup();
+
+    var src = try Store.init(io, alloc, repo.dir);
+    defer src.deinit();
+    const tip = try seedRepo(&src);
+    const change = try src.readChange(tip);
+    defer object.freeChange(alloc, change);
+
+    const s: ShareKey = [_]u8{9} ** key_len;
+    const bytes = try buildStateBundle(&src, alloc, s, .{
+        .tree = change.tree,
+        .check = "zig build test",
+    });
+    defer alloc.free(bytes);
+
+    var opened = try openBundle(alloc, s, bytes);
+    defer opened.deinit(alloc);
+    try testing.expectEqual(Kind.state, opened.kind());
+
+    var dst = try Store.init(io, alloc, clone.dir);
+    defer dst.deinit();
+    const got = try importOpened(&dst, alloc, &opened);
+    defer got.deinit(alloc);
+    try testing.expect(got == .state);
+    try testing.expect(got.state.tree.eql(change.tree));
+    try testing.expectEqualStrings("zig build test", got.state.check);
+    try testing.expect(!dst.refExists("main"));
+
+    const tree = try dst.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+    try testing.expectEqual(@as(usize, 3), tree.entries.len);
+    for (tree.entries) |e| {
+        const content = try dst.readFileContent(e.blob);
+        alloc.free(content);
+    }
+
+    const whole = try buildBundle(&src, alloc, s, &.{"main"});
+    defer alloc.free(whole);
+    var opened_whole = try openBundle(alloc, s, whole);
+    defer opened_whole.deinit(alloc);
+    try testing.expectEqual(Kind.refs, opened_whole.kind());
 }

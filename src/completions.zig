@@ -81,7 +81,7 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a undo -d 'revert the last change-making operation'
     \\complete -c sdt -n __fish_use_subcommand -a redo -d 'reapply what you just undid'
     \\complete -c sdt -n __fish_use_subcommand -a serve -d 'share this repo over TCP'
-    \\complete -c sdt -n __fish_use_subcommand -a send -d 'hand this repo to someone'
+    \\complete -c sdt -n __fish_use_subcommand -a send -d 'hand this repo, or one state, to someone'
     \\complete -c sdt -n __fish_use_subcommand -a get -d 'pick up a code, link, or bundle'
     \\complete -c sdt -n __fish_use_subcommand -a relay -d 'run a meeting point for transfers'
     \\complete -c sdt -n __fish_use_subcommand -a fetch -d 'sparse-pull a branch'
@@ -98,6 +98,11 @@ const fish_script =
     \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l fast -d 'use the fast tier'
     \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l full -d 'use the full tier'
     \\complete -c sdt -n '__fish_seen_subcommand_from grade gd' -l json -d 'machine-readable output'
+    \\complete -c sdt -n __fish_use_subcommand -a probe -d 'run a command against a state in a clone; a range bisects'
+    \\complete -c sdt -n __fish_use_subcommand -a pb -d 'run a command against a state in a clone; a range bisects'
+    \\complete -c sdt -n '__fish_seen_subcommand_from probe pb' -l json -d 'machine-readable output'
+    \\complete -c sdt -n '__fish_seen_subcommand_from probe pb' -l rerun -d 'run even when the verdict cache already answers'
+    \\complete -c sdt -n '__fish_seen_subcommand_from probe pb' -s j -l jobs -d 'clones to run at once when bisecting' -r
     \\complete -c sdt -n __fish_use_subcommand -a doctor -d 'what is on, what is degraded, and why'
     \\complete -c sdt -n __fish_use_subcommand -a recap -d 'green and red spans, and what thrashed'
     \\complete -c sdt -n __fish_use_subcommand -a super -d 'paths holding more than one version'
@@ -176,7 +181,7 @@ const zsh_script =
     \\    'undo:revert the last change-making operation'
     \\    'redo:reapply what you just undid'
     \\    'serve:share this repo over TCP'
-    \\    'send:hand this repo to someone'
+    \\    'send:hand this repo, or one state, to someone'
     \\    'get:pick up a code, link, or bundle'
     \\    'relay:run a meeting point for transfers'
     \\    'fetch:sparse-pull a branch'
@@ -191,6 +196,8 @@ const zsh_script =
     \\    'rewind:rewind to any @ref'
     \\    'moments:captured states, their age and their verdicts'
     \\    'grade:run checks now, or grade a git ref'
+    \\    'probe:run a command against a state in a clone; a range bisects'
+    \\    'pb:run a command against a state in a clone; a range bisects'
     \\    'doctor:what is on, what is degraded, and why'
     \\    'recap:green and red spans, and what thrashed'
     \\    'super:paths holding more than one version'
@@ -224,6 +231,8 @@ const zsh_script =
 ++ "\n  elif (( CURRENT == 3 )) && [[ ${words[2]} == (config|cfg) ]]; then\n    compadd " ++ setting_names ++ "\n" ++
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (grade|gd) ]]; then
     \\    compadd -- --repo --fast --full --json
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (probe|pb) ]]; then
+    \\    compadd -- --json --rerun -j --jobs --
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (attest|at) ]]; then
     \\    compadd -- --remote --dry-run --fast --full --json
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (squash|sq) ]]; then
@@ -249,7 +258,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pb pl point probe prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
@@ -261,6 +270,10 @@ const bash_script =
 ++ "\n  if [[ \"${COMP_WORDS[1]}\" == \"config\" || \"${COMP_WORDS[1]}\" == \"cfg\" ]]; then\n    COMPREPLY=( $(compgen -W \"" ++ setting_names ++ " --global --unset\" -- \"$cur\") )\n    return 0\n  fi\n" ++
     \\  if [[ "${COMP_WORDS[1]}" == "grade" || "${COMP_WORDS[1]}" == "gd" ]]; then
     \\    COMPREPLY=( $(compgen -W "--repo --fast --full --json" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "probe" || "${COMP_WORDS[1]}" == "pb" ]]; then
+    \\    COMPREPLY=( $(compgen -W "--json --rerun -j --jobs --" -- "$cur") )
     \\    return 0
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "attest" || "${COMP_WORDS[1]}" == "at" ]]; then
