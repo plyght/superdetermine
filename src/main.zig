@@ -71,6 +71,17 @@ const version = @import("build_options").version;
 const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
 const Section = struct { title: []const u8, entries: []const Entry };
 
+const usage_col: usize = blk: {
+    var widest: usize = 0;
+    for (sections) |section| {
+        for (section.entries) |e| {
+            const used = e.name.len + (if (e.args.len != 0) 1 + e.args.len else 0);
+            if (used > widest) widest = used;
+        }
+    }
+    break :blk widest + 2;
+};
+
 const sections = [_]Section{
     .{ .title = "the everyday loop", .entries = &.{
         .{ .name = "save", .alias = "sv", .args = "[-m msg]", .desc = "checkpoint the working tree" },
@@ -110,7 +121,7 @@ const sections = [_]Section{
         .{ .name = "rebase", .alias = "rb", .args = "<ref>", .desc = "replay this branch onto a new base" },
         .{ .name = "amend", .alias = "am", .args = "[--at ref]", .desc = "fold working edits into a named change" },
         .{ .name = "squash", .alias = "sq", .args = "[n] [--at] [-m]", .desc = "collapse adjacent changes into one" },
-        .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths> | --hunk p:n", .desc = "split one change in two, by path or hunk" },
+        .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths>", .desc = "split one change in two, by path or hunk" },
         .{ .name = "drop", .alias = "dr", .args = "[ref]", .desc = "remove a change, keep its edits in the tree" },
         .{ .name = "reorder", .alias = "ro", .args = "<order...>", .desc = "reorder the last changes, 1 = oldest" },
         .{ .name = "take", .alias = "tk", .args = "<ref>", .desc = "copy a change from another branch onto this one" },
@@ -163,14 +174,14 @@ const sections = [_]Section{
         .{ .name = "serve --link", .args = "<dir>", .desc = "host a `send --link` export over HTTP" },
         .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
         .{ .name = "watch", .desc = "experimental: auto-save on every change" },
-        .{ .name = "hook", .args = "[install [--write <path>]]", .desc = "tell a coding agent whether its work passed" },
+        .{ .name = "hook", .args = "[install]", .desc = "tell a coding agent whether its work passed" },
     } },
     .{ .title = "git, side by side", .entries = &.{
         .{ .name = "clone", .alias = "cl", .args = "<src> [dir]", .desc = "a git repo, a share URL, or a bundle" },
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
         .{ .name = "export", .args = "<repo> [--force]", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
-        .{ .name = "push", .alias = "ps", .args = "[remote] [branch] [--require-green]", .desc = "uses your existing git credentials" },
+        .{ .name = "push", .alias = "ps", .args = "[remote] [branch]", .desc = "uses your existing git credentials; --require-green holds a red tree back" },
         .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
         .{ .name = "attest", .alias = "at", .args = "[ref] [--dry-run]", .desc = "post the warrant as a GitHub commit status" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
@@ -178,12 +189,12 @@ const sections = [_]Section{
     .{ .title = "housekeeping", .entries = &.{
         .{ .name = "init", .desc = "create a superdetermine repo here" },
         .{ .name = "gc", .args = "[--dry-run]", .desc = "reclaim unreachable objects" },
-        .{ .name = "purge", .args = "<path...> [--dry-run] [--force]", .desc = "erase a path from all history, then gc" },
+        .{ .name = "purge", .args = "<path...>", .desc = "erase a path from all history, then gc" },
         .{ .name = "setup", .desc = "answer three questions and be configured" },
         .{ .name = "config", .alias = "cfg", .args = "[name] [value]", .desc = "every setting, by name" },
         .{ .name = "completions", .alias = "comp", .args = "<shell>", .desc = "fish | zsh | bash" },
         .{ .name = "update", .desc = "update sdt (--nightly for the latest build)" },
-        .{ .name = "version", .desc = "" },
+        .{ .name = "version", .desc = "print the version" },
     } },
 };
 
@@ -238,7 +249,7 @@ fn printUsage(w: *std.Io.Writer) !void {
                 try w.print(" {s}{s}{s}", .{ ui.on(.dim), e.args, ui.off() });
                 used += 1 + e.args.len;
             }
-            try padTo(w, used, 26);
+            try padTo(w, used, usage_col);
             if (e.alias.len != 0) {
                 try w.print("{s}{s}{s}", .{ ui.on(.magenta), e.alias, ui.off() });
                 try padTo(w, e.alias.len, 6);
@@ -248,7 +259,7 @@ fn printUsage(w: *std.Io.Writer) !void {
             try w.print("{s}\n", .{e.desc});
         }
     }
-    try w.print("\n  {s}status, log, and work list take --json. NO_COLOR is respected.{s}\n", .{ ui.on(.dim), ui.off() });
+    try w.print("\n  {s}--json: status, log, moments, stack, probe, work list, resolve --list. NO_COLOR is respected.{s}\n", .{ ui.on(.dim), ui.off() });
 }
 
 fn padTo(w: *std.Io.Writer, used: usize, target: usize) !void {
@@ -5561,7 +5572,7 @@ fn cmdProbe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer resolved.deinit(alloc);
     const m = switch (resolved.target) {
         .live => {
-            try w.writeAll("@ is the live tree; run the command here instead\n");
+            try w.writeAll("@ is the live tree; run the command here instead, or `@save` for the last save\n");
             return 2;
         },
         .at => |m| m,
@@ -5663,12 +5674,14 @@ fn probeRange(
         try w.print("{s}{s}{s} the start of {s}{s}{s} is not a captured moment\n", .{
             ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
         });
+        try ui.hint(w, "`sdt moments` lists what was captured; @save and @green always are");
         return 1;
     } else 0;
     const to_ix = momentIndex(all, range.to) orelse {
         try w.print("{s}{s}{s} the end of {s}{s}{s} is not a captured moment\n", .{
             ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
         });
+        try ui.hint(w, "`sdt moments` lists what was captured; @save and @green always are");
         return 1;
     };
     const lo = @min(from_ix, to_ix);
@@ -5801,15 +5814,27 @@ fn probeRange(
     var fail_hex: [16]u8 = undefined;
     _ = all[passing.?].shortId(&pass_hex);
     _ = all[failing.?].shortId(&fail_hex);
-    try w.print("last passing {s}@{s}{s}, first failing {s}@{s}{s}  {s}({d} run{s}, {d} from the cache){s}\n", .{
-        ui.on(.cyan), pass_hex[0..12], ui.off(),
-        ui.on(.cyan), fail_hex[0..12], ui.off(),
-        ui.on(.dim),  ran,             if (ran == 1) "" else "s",
-        cached,       ui.off(),
-    });
-    try w.print("{s}hint:{s} `sdt probe @{s} -- {s}` shows the failing output; `sdt rewind @{s}` goes back to the passing state\n", .{
-        ui.on(.dim), ui.off(), fail_hex[0..12], command, pass_hex[0..12],
-    });
+    if (passing.? < failing.?) {
+        try w.print("last passing {s}@{s}{s}, first failing {s}@{s}{s}  {s}({d} run{s}, {d} from the cache){s}\n", .{
+            ui.on(.cyan), pass_hex[0..12], ui.off(),
+            ui.on(.cyan), fail_hex[0..12], ui.off(),
+            ui.on(.dim),  ran,             if (ran == 1) "" else "s",
+            cached,       ui.off(),
+        });
+        try w.print("{s}hint:{s} `sdt probe @{s} -- {s}` shows the failing output; `sdt rewind @{s}` goes back to the passing state\n", .{
+            ui.on(.dim), ui.off(), fail_hex[0..12], command, pass_hex[0..12],
+        });
+    } else {
+        try w.print("last failing {s}@{s}{s}, first passing {s}@{s}{s}  {s}({d} run{s}, {d} from the cache){s}\n", .{
+            ui.on(.cyan), fail_hex[0..12], ui.off(),
+            ui.on(.cyan), pass_hex[0..12], ui.off(),
+            ui.on(.dim),  ran,             if (ran == 1) "" else "s",
+            cached,       ui.off(),
+        });
+        try w.print("{s}hint:{s} `sdt show @{s}` is the change that made it pass; `sdt probe @{s} -- {s}` shows the last failing output\n", .{
+            ui.on(.dim), ui.off(), pass_hex[0..12], fail_hex[0..12], command,
+        });
+    }
     return 0;
 }
 
@@ -7319,7 +7344,7 @@ fn stateToSend(
     defer resolved.deinit(alloc);
     const m = switch (resolved.target) {
         .live => {
-            try w.writeAll("@ is the live tree; `sdt save` first, or name a moment\n");
+            try w.writeAll("@ is the live tree; `@save` sends the last save, or name a moment\n");
             return null;
         },
         .at => |m| m,
