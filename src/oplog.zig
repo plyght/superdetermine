@@ -16,6 +16,7 @@ pub const OpKind = enum {
     /// Oids rather than change Oids, because a rewind moves the working tree
     /// and not a branch pointer. Undoing one materializes `prev` back.
     rewind,
+    stack,
     other,
 
     pub fn label(self: OpKind) []const u8 {
@@ -25,6 +26,7 @@ pub const OpKind = enum {
             .redo => "redo",
             .import => "import",
             .rewind => "rewind",
+            .stack => "stack",
             .other => "other",
         };
     }
@@ -35,9 +37,53 @@ pub const OpKind = enum {
         if (std.mem.eql(u8, s, "redo")) return .redo;
         if (std.mem.eql(u8, s, "import")) return .import;
         if (std.mem.eql(u8, s, "rewind")) return .rewind;
+        if (std.mem.eql(u8, s, "stack")) return .stack;
         return .other;
     }
 };
+
+pub const Move = struct {
+    branch: []const u8,
+    prev: Oid,
+    new: Oid,
+};
+
+pub fn recordStack(store: *Store, moves: []const Move, timestamp: i64) !void {
+    if (moves.len == 0) return;
+    const alloc = store.alloc;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+    for (moves, 0..) |m, i| {
+        if (i != 0) try payload.append(alloc, '\t');
+        var prev_hex: [Oid.len * 2]u8 = undefined;
+        var new_hex: [Oid.len * 2]u8 = undefined;
+        try payload.print(alloc, "{s}\t{s}\t{s}", .{ m.branch, m.prev.toHex(&prev_hex), m.new.toHex(&new_hex) });
+    }
+    try record(store, .{
+        .kind = .stack,
+        .branch = payload.items,
+        .prev = moves[0].prev,
+        .new = moves[0].new,
+        .timestamp = timestamp,
+    });
+}
+
+pub fn stackMoves(alloc: std.mem.Allocator, op: OpRecord) ![]Move {
+    var out: std.ArrayList(Move) = .empty;
+    errdefer out.deinit(alloc);
+    if (op.kind != .stack) return out.toOwnedSlice(alloc);
+    var it = std.mem.splitScalar(u8, op.branch, '\t');
+    while (it.next()) |name| {
+        const prev_s = it.next() orelse return error.InvalidOpRecord;
+        const new_s = it.next() orelse return error.InvalidOpRecord;
+        try out.append(alloc, .{
+            .branch = name,
+            .prev = try Oid.fromHex(prev_s),
+            .new = try Oid.fromHex(new_s),
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
 
 /// One append-only op-log entry. `branch` is borrowed on write; on read via
 /// `lastOp` it is heap-allocated and the caller frees it.
@@ -144,6 +190,13 @@ fn nowSeconds(store: *Store) i64 {
 /// a branch; a rewind puts the working tree back, which is what makes rewinding
 /// something people reach for rather than fear.
 fn applyOp(store: *Store, op: OpRecord, target: Oid, work_dir: ?std.Io.Dir) !void {
+    if (op.kind == .stack) {
+        const moves = try stackMoves(store.alloc, op);
+        defer store.alloc.free(moves);
+        const forward = target.eql(op.new);
+        for (moves) |m| try applyRef(store, m.branch, if (forward) m.new else m.prev);
+        return;
+    }
     if (op.kind != .rewind) return applyRef(store, op.branch, target);
 
     const wd = work_dir orelse return error.WorktreeRequired;
@@ -430,4 +483,41 @@ test "lastOp is null on empty log" {
     defer store.deinit();
 
     try testing.expect((try lastOp(&store, alloc)) == null);
+}
+
+test "a stack record moves every branch it names on undo and redo" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const a_old = Oid.ofBytes("a old");
+    const a_new = Oid.ofBytes("a new");
+    const b_old = Oid.ofBytes("b old");
+    const b_new = Oid.ofBytes("b new");
+    try store.updateRef("a", a_new);
+    try store.updateRef("b", b_new);
+    const moves = [_]Move{
+        .{ .branch = "a", .prev = a_old, .new = a_new },
+        .{ .branch = "b", .prev = b_old, .new = b_new },
+    };
+    try recordStack(&store, &moves, 1);
+
+    const last = (try lastOp(&store, alloc)).?;
+    defer alloc.free(last.branch);
+    try testing.expectEqual(OpKind.stack, last.kind);
+    const parsed = try stackMoves(alloc, last);
+    defer alloc.free(parsed);
+    try testing.expectEqual(@as(usize, 2), parsed.len);
+    try testing.expectEqualStrings("b", parsed[1].branch);
+    try testing.expect(parsed[1].prev.eql(b_old));
+
+    try undo(&store, null);
+    try testing.expect((try store.readRef("a")).eql(a_old));
+    try testing.expect((try store.readRef("b")).eql(b_old));
+    try redo(&store, null);
+    try testing.expect((try store.readRef("a")).eql(a_new));
+    try testing.expect((try store.readRef("b")).eql(b_new));
 }

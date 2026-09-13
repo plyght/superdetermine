@@ -169,6 +169,12 @@ fn changeRoots(ctx: Context, out: *std.ArrayList(Oid)) !void {
     for (records) |r| {
         try out.append(ctx.alloc, r.prev);
         try out.append(ctx.alloc, r.new);
+        const moves = oplog.stackMoves(ctx.alloc, r) catch continue;
+        defer ctx.alloc.free(moves);
+        for (moves) |m| {
+            try out.append(ctx.alloc, m.prev);
+            try out.append(ctx.alloc, m.new);
+        }
     }
 
     const op_heads = opdag.heads(ctx.store, ctx.alloc) catch &[_]Oid{};

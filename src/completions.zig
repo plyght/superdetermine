@@ -61,6 +61,13 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a absorb -d 'fold edits into the changes they belong to'
     \\complete -c sdt -n __fish_use_subcommand -a point -d "move this branch's tip to any ref"
     \\complete -c sdt -n __fish_use_subcommand -a rebase -d 'replay this branch onto a new base'
+    \\complete -c sdt -n __fish_use_subcommand -a stack -d 'this stack, base to tip, with each branch grade'
+    \\complete -c sdt -n __fish_use_subcommand -a sk -d 'this stack, base to tip, with each branch grade'
+    \\complete -c sdt -n '__fish_seen_subcommand_from stack sk' -a 'add remove rebase merge squash' -d 'stack command'
+    \\complete -c sdt -n '__fish_seen_subcommand_from stack sk' -l on -d 'the parent to stack a branch on' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from stack sk' -l into -d 'the base branch to merge the stack into' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from stack sk' -s m -d 'message for the collapsed level' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from stack sk' -l json -d 'machine-readable output'
     \\complete -c sdt -n __fish_use_subcommand -a amend -d 'fold working edits into a named change'
     \\complete -c sdt -n __fish_use_subcommand -a squash -d 'collapse adjacent changes into one'
     \\complete -c sdt -n __fish_use_subcommand -a split -d 'split one change in two, by path or hunk'
@@ -131,6 +138,10 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a gc -d 'garbage-collect unreachable objects'
     \\complete -c sdt -n __fish_use_subcommand -a blame -d 'per-line authorship of a file'
     \\complete -c sdt -n __fish_use_subcommand -a resolve -d 'resolve merge conflicts'
+    \\complete -c sdt -n '__fish_seen_subcommand_from resolve res' -l abort -d 'abandon the merge, restore the tree'
+    \\complete -c sdt -n '__fish_seen_subcommand_from resolve res' -l list -d 'every recorded resolution'
+    \\complete -c sdt -n '__fish_seen_subcommand_from resolve res' -l forget -d 'drop a recorded resolution by id' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from resolve res' -l json -d 'machine-readable output'
     \\complete -c sdt -n __fish_use_subcommand -a completions -d 'print shell completion script'
     \\complete -c sdt -n __fish_use_subcommand -a version -d 'print version'
     \\complete -c sdt -n __fish_use_subcommand -a help -d 'show help'
@@ -166,6 +177,8 @@ const zsh_script =
     \\    'absorb:fold edits into the changes they belong to'
     \\    'point:move this branch tip to any ref'
     \\    'rebase:replay this branch onto a new base'
+    \\    'stack:this stack, base to tip, with each branch grade'
+    \\    'sk:this stack, base to tip, with each branch grade'
     \\    'amend:fold working edits into a named change'
     \\    'squash:collapse adjacent changes into one'
     \\    'split:split one change in two, by path or hunk'
@@ -226,6 +239,12 @@ const zsh_script =
     \\    compadd -- --repo --fast --full --json
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (attest|at) ]]; then
     \\    compadd -- --remote --dry-run --fast --full --json
+    \\  elif (( CURRENT == 3 )) && [[ ${words[2]} == (stack|sk) ]]; then
+    \\    compadd add remove rebase merge squash --json
+    \\  elif (( CURRENT >= 4 )) && [[ ${words[2]} == (stack|sk) ]]; then
+    \\    compadd -- --on --into -m
+    \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (resolve|res) ]]; then
+    \\    compadd -- --abort --list --forget --json
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (squash|sq) ]]; then
     \\    compadd -- -m --at
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (split|spl) ]]; then
@@ -249,7 +268,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sk sl snap snapshot snd sp spl split sq squash srv st stack status super sv sw switch sync u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
@@ -265,6 +284,18 @@ const bash_script =
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "attest" || "${COMP_WORDS[1]}" == "at" ]]; then
     \\    COMPREPLY=( $(compgen -W "--remote --dry-run --fast --full --json" -- "$cur") )
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "stack" || "${COMP_WORDS[1]}" == "sk" ]]; then
+    \\    if [[ $COMP_CWORD -eq 2 ]]; then
+    \\      COMPREPLY=( $(compgen -W "add remove rebase merge squash --json" -- "$cur") )
+    \\    else
+    \\      COMPREPLY=( $(compgen -W "--on --into -m" -- "$cur") )
+    \\    fi
+    \\    return 0
+    \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "resolve" || "${COMP_WORDS[1]}" == "res" ]]; then
+    \\    COMPREPLY=( $(compgen -W "--abort --list --forget --json" -- "$cur") )
     \\    return 0
     \\  fi
     \\  if [[ "${COMP_WORDS[1]}" == "squash" || "${COMP_WORDS[1]}" == "sq" ]]; then
@@ -302,4 +333,12 @@ test "parse maps known shells" {
 test "script contents" {
     try std.testing.expect(std.mem.indexOf(u8, script(.fish), "save") != null);
     try std.testing.expect(script(.bash).len > 0);
+}
+
+test "every shell completes stack and resolve" {
+    inline for (.{ Shell.fish, Shell.zsh, Shell.bash }) |shell| {
+        try std.testing.expect(std.mem.indexOf(u8, script(shell), "stack") != null);
+        try std.testing.expect(std.mem.indexOf(u8, script(shell), "forget") != null);
+        try std.testing.expect(std.mem.indexOf(u8, script(shell), "rebase merge squash") != null);
+    }
 }
