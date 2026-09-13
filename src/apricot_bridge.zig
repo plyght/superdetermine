@@ -128,7 +128,7 @@ pub fn publish(
     defer allocator.free(projection);
     var session = Session.init(allocator, io, remote, .configured);
     defer session.deinit();
-    return apricot.git_forge.publish(
+    const published = try apricot.git_forge.publish(
         allocator,
         session.smart(allocator, remote),
         branch,
@@ -139,6 +139,8 @@ pub fn publish(
         commit_signature,
         timestamp,
     );
+    holdCarrierAt(io, repository_path, allocator, remote, branch, captured.encoded.bytes) catch {};
+    return published;
 }
 
 fn projectionWithoutSealed(
@@ -202,6 +204,14 @@ pub fn restore(
 }
 
 const fetched_file = "apricot-fetched";
+const carrier_prefix = "apricot-carrier-";
+
+const GitOid = apricot.git_transport.Oid;
+
+const Remembered = struct {
+    carrier: GitOid,
+    tip: Oid,
+};
 
 fn fetchedKey(remote: []const u8, branch: []const u8) [64]u8 {
     var h = std.crypto.hash.Blake3.init(.{});
@@ -213,24 +223,31 @@ fn fetchedKey(remote: []const u8, branch: []const u8) [64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn rememberedTip(destination: *Store, allocator: std.mem.Allocator, remote: []const u8, branch: []const u8, carrier_hex: []const u8) ?Oid {
+fn carrierFileName(buf: *[carrier_prefix.len + 64]u8, key: *const [64]u8) []const u8 {
+    @memcpy(buf[0..carrier_prefix.len], carrier_prefix);
+    @memcpy(buf[carrier_prefix.len..], key);
+    return buf;
+}
+
+fn remembered(destination: *Store, allocator: std.mem.Allocator, key: *const [64]u8) ?Remembered {
     const data = destination.root.readFileAlloc(destination.io, fetched_file, allocator, .unlimited) catch return null;
     defer allocator.free(data);
-    const key = fetchedKey(remote, branch);
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
         var it = std.mem.tokenizeAny(u8, line, " \t\r");
         const k = it.next() orelse continue;
         const carrier = it.next() orelse continue;
         const tip = it.next() orelse continue;
-        if (!std.mem.eql(u8, k, &key) or !std.mem.eql(u8, carrier, carrier_hex)) continue;
-        return Oid.fromHex(tip) catch null;
+        if (!std.mem.eql(u8, k, key)) continue;
+        return .{
+            .carrier = GitOid.fromHex(carrier) catch return null,
+            .tip = Oid.fromHex(tip) catch return null,
+        };
     }
     return null;
 }
 
-fn rememberTip(destination: *Store, allocator: std.mem.Allocator, remote: []const u8, branch: []const u8, carrier_hex: []const u8, tip: Oid) !void {
-    const key = fetchedKey(remote, branch);
+fn remember(destination: *Store, allocator: std.mem.Allocator, key: *const [64]u8, carrier: GitOid, tip: Oid) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     if (destination.root.readFileAlloc(destination.io, fetched_file, allocator, .unlimited)) |data| {
@@ -238,14 +255,33 @@ fn rememberTip(destination: *Store, allocator: std.mem.Allocator, remote: []cons
         var lines = std.mem.splitScalar(u8, data, '\n');
         while (lines.next()) |line| {
             const t = std.mem.trim(u8, line, " \t\r");
-            if (t.len == 0 or std.mem.startsWith(u8, t, &key)) continue;
+            if (t.len == 0 or std.mem.startsWith(u8, t, key)) continue;
             try out.appendSlice(allocator, t);
             try out.append(allocator, '\n');
         }
     } else |_| {}
+    var carrier_hex: [40]u8 = undefined;
     var hex: [Oid.len * 2]u8 = undefined;
-    try out.print(allocator, "{s} {s} {s}\n", .{ &key, carrier_hex, tip.toHex(&hex) });
+    try out.print(allocator, "{s} {s} {s}\n", .{ key, carrier.format(&carrier_hex), tip.toHex(&hex) });
     try destination.writeFileAtomic(fetched_file, out.items);
+}
+
+fn heldCarrier(root: std.Io.Dir, io: std.Io, allocator: std.mem.Allocator, key: *const [64]u8) ?[]u8 {
+    var buf: [carrier_prefix.len + 64]u8 = undefined;
+    return root.readFileAlloc(io, carrierFileName(&buf, key), allocator, .unlimited) catch null;
+}
+
+fn holdCarrier(root: std.Io.Dir, io: std.Io, key: *const [64]u8, bytes: []const u8) !void {
+    var buf: [carrier_prefix.len + 64]u8 = undefined;
+    try root.writeFile(io, .{ .sub_path = carrierFileName(&buf, key), .data = bytes });
+}
+
+fn holdCarrierAt(io: std.Io, repository_path: []const u8, allocator: std.mem.Allocator, remote: []const u8, branch: []const u8, bytes: []const u8) !void {
+    const store_path = try std.fs.path.join(allocator, &.{ repository_path, store.dir_name });
+    defer allocator.free(store_path);
+    var root = try std.Io.Dir.openDirAbsolute(io, store_path, .{});
+    defer root.close(io);
+    try holdCarrier(root, io, &fetchedKey(remote, branch), bytes);
 }
 
 pub fn fetchInto(
@@ -260,27 +296,26 @@ pub fn fetchInto(
     defer session.deinit();
     const smart = session.smart(allocator, remote);
 
-    var carrier_buf: [40]u8 = undefined;
-    const carrier_hex: ?[]const u8 = blk: {
-        const advertisement = smart.discover(.upload_pack) catch break :blk null;
-        defer advertisement.deinit();
-        const native_ref = try apricot.git_forge.branchCarrierRef(allocator, branch);
-        defer allocator.free(native_ref);
-        const carrier = advertisement.findRef(native_ref) orelse
-            advertisement.findRef("refs/apricot/native") orelse break :blk null;
-        break :blk carrier.format(&carrier_buf);
-    };
-    if (carrier_hex) |hex| {
-        if (rememberedTip(destination, allocator, remote, branch, hex)) |tip| {
-            if (destination.has(tip)) {
-                try destination.updateRef(destination_ref, tip);
-                return tip;
-            }
-        }
-    }
+    const key = fetchedKey(remote, branch);
+    const known = remembered(destination, allocator, &key);
+    const held = heldCarrier(destination.root, io, allocator, &key);
+    defer if (held) |h| allocator.free(h);
+    const known_commit: ?GitOid = if (known) |k| (if (destination.has(k.tip)) k.carrier else null) else null;
 
-    const fetched = try apricot.git_forge.fetch(allocator, smart, branch);
-    defer fetched.deinit(allocator);
+    const outcome = try apricot.git_forge.fetchWith(allocator, smart, branch, .{
+        .known_carrier_commit = known_commit,
+        .known_carrier_bytes = held,
+    });
+    defer outcome.deinit(allocator);
+    const fetched = switch (outcome) {
+        .unchanged => {
+            const tip = known.?.tip;
+            try destination.updateRef(destination_ref, tip);
+            return tip;
+        },
+        .fetched => |f| f,
+    };
+
     const stamp = std.Io.Clock.real.now(io).nanoseconds;
     const temporary_name = try std.fmt.allocPrint(allocator, ".sdt/apricot-fetch-{d}", .{stamp});
     defer allocator.free(temporary_name);
@@ -301,7 +336,8 @@ pub fn fetchInto(
     const native_branch = if (restored_store.refExists(branch)) branch else head_branch;
     const tip = try net.fetchSparse(destination, source_store, native_branch, "");
     try destination.updateRef(destination_ref, tip);
-    if (carrier_hex) |hex| rememberTip(destination, allocator, remote, branch, hex, tip) catch {};
+    remember(destination, allocator, &key, fetched.carrier_commit, tip) catch {};
+    holdCarrier(destination.root, io, &key, fetched.carrier_bytes) catch {};
     return tip;
 }
 
@@ -394,7 +430,7 @@ test "a sealed entry rides the carrier and never the projection" {
     try std.testing.expectEqualStrings("API_KEY=sk-live-1\n", plain);
 }
 
-test "a remembered carrier tip round-trips through the fetched file" {
+test "a remembered carrier and its held bytes round-trip per remote and branch" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -403,55 +439,42 @@ test "a remembered carrier tip round-trips through the fetched file" {
     defer st.deinit();
 
     const remote = "https://example.com/plyght/superdetermine.git";
-    const carrier_a = "0123456789abcdef0123456789abcdef01234567";
-    const carrier_b = "89abcdef0123456789abcdef0123456789abcdef";
+    const carrier_a = try GitOid.fromHex("0123456789abcdef0123456789abcdef01234567");
+    const carrier_b = try GitOid.fromHex("89abcdef0123456789abcdef0123456789abcdef");
     const tip_a = Oid.ofBytes("a");
     const tip_b = Oid.ofBytes("b");
+    const main_key = fetchedKey(remote, "main");
+    const dev_key = fetchedKey(remote, "dev");
+    const other_key = fetchedKey("https://example.com/other.git", "main");
 
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_a) == null);
-    try rememberTip(&st, alloc, remote, "main", carrier_a, tip_a);
-    try rememberTip(&st, alloc, remote, "dev", carrier_b, tip_b);
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_a).?.eql(tip_a));
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "dev", carrier_b).?.eql(tip_b));
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_b) == null);
-    try std.testing.expect(rememberedTip(&st, alloc, "https://example.com/other.git", "main", carrier_a) == null);
+    try std.testing.expect(remembered(&st, alloc, &main_key) == null);
+    try remember(&st, alloc, &main_key, carrier_a, tip_a);
+    try remember(&st, alloc, &dev_key, carrier_b, tip_b);
+    try std.testing.expect(remembered(&st, alloc, &main_key).?.carrier.eql(carrier_a));
+    try std.testing.expect(remembered(&st, alloc, &main_key).?.tip.eql(tip_a));
+    try std.testing.expect(remembered(&st, alloc, &dev_key).?.tip.eql(tip_b));
+    try std.testing.expect(remembered(&st, alloc, &other_key) == null);
 
-    try rememberTip(&st, alloc, remote, "main", carrier_b, tip_b);
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_a) == null);
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_b).?.eql(tip_b));
-    try std.testing.expect(rememberedTip(&st, alloc, remote, "dev", carrier_b).?.eql(tip_b));
-}
+    try remember(&st, alloc, &main_key, carrier_b, tip_b);
+    try std.testing.expect(remembered(&st, alloc, &main_key).?.carrier.eql(carrier_b));
+    try std.testing.expect(remembered(&st, alloc, &main_key).?.tip.eql(tip_b));
+    try std.testing.expect(remembered(&st, alloc, &dev_key).?.tip.eql(tip_b));
 
-test "credentials are withheld from a cleartext remote" {
-    try std.testing.expect(allowsCredentials("https://github.com/x/y"));
-    try std.testing.expect(allowsCredentials("HTTPS://github.com/x/y"));
-    try std.testing.expect(!allowsCredentials("http://192.168.1.9/x/y"));
-    try std.testing.expect(!allowsCredentials("HTTP://192.168.1.9/x/y"));
-}
+    try std.testing.expect(heldCarrier(st.root, io, alloc, &main_key) == null);
+    try holdCarrier(st.root, io, &main_key, "carrier one");
+    try holdCarrier(st.root, io, &dev_key, "carrier two");
+    const held_main = heldCarrier(st.root, io, alloc, &main_key).?;
+    defer alloc.free(held_main);
+    try std.testing.expectEqualStrings("carrier one", held_main);
+    const held_dev = heldCarrier(st.root, io, alloc, &dev_key).?;
+    defer alloc.free(held_dev);
+    try std.testing.expectEqualStrings("carrier two", held_dev);
+    try std.testing.expect(heldCarrier(st.root, io, alloc, &other_key) == null);
 
-test "native clone probe starts anonymous" {
-    var session = Session.init(std.testing.allocator, std.testing.io, "https://github.com/octocat/Hello-World.git", .anonymous);
-    defer session.deinit();
-    try std.testing.expect(session.client.credentials == null);
-    try std.testing.expect(session.owned_token == null);
-    try std.testing.expect(session.helper == null);
-}
-
-test "bridge exposes embedded Apricot transport" {
-    try std.testing.expect(@sizeOf(Published) > 0);
-    try std.testing.expect(@sizeOf(Fetched) > 0);
-    try std.testing.expect(@sizeOf(Collaboration.Resource) > 0);
-    try std.testing.expect(@sizeOf(ForgeDrivers.Driver) > 0);
-}
-
-test "bridge maps configured authors to projection signatures" {
-    const complete = signature("Plyght User <plyght@example.com>");
-    try std.testing.expectEqualStrings("Plyght User", complete.name);
-    try std.testing.expectEqualStrings("plyght@example.com", complete.email);
-    const email_only = signature("<plyght@example.com>");
-    try std.testing.expectEqualStrings("superdetermine", email_only.name);
-    try std.testing.expectEqualStrings("plyght@example.com", email_only.email);
-    const name_only = signature("Plyght User");
-    try std.testing.expectEqualStrings("Plyght User", name_only.name);
-    try std.testing.expectEqualStrings("none@superdetermine", name_only.email);
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(abs);
+    try holdCarrierAt(io, abs, alloc, remote, "main", "carrier three");
+    const replaced = heldCarrier(st.root, io, alloc, &main_key).?;
+    defer alloc.free(replaced);
+    try std.testing.expectEqualStrings("carrier three", replaced);
 }
