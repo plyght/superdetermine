@@ -35,6 +35,8 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
 | Three-way merge + resolve | Conflict markers, then `sdt resolve <file>` / `sdt resolve --abort`. |
 | Absorb | `sdt absorb` folds working edits into the changes they belong to. |
+| Probe any state | `sdt probe @2h -- zig build` runs any command against any captured state in a throwaway clone and streams its output; `sdt probe @green..@ -- <cmd>` bisects the moments between two states, several clones at a time. The worktree is never touched. |
+| Send one state | `sdt send @a3f91c` ships one exact tree, its check, and its verdict. `sdt get` materialises it as a copy-on-write worktree and says whether `sdt grade` there reproduces the verdict. |
 | Verdicts expire | A recorded verdict is kept for `verdicts.retain` (default 90d). A record another has superseded goes sooner, a green that aged out goes on time, and a red is never dropped for being old. |
 | Garbage collection | `sdt gc` reclaims space from unreachable objects (`--dry-run` to preview). What a rewrite abandoned stays recoverable for `gc.retain` (default 30d) and is collected after; anything a branch points at is kept regardless of age. |
 | Purge a path | `sdt purge <path...>` erases a path from every change, so `sdt gc` can reclaim what a mistakenly committed build directory holds. |
@@ -141,6 +143,9 @@ sdt work ../agent-copy     # wt   instant worktree
 sdt work list              #      every worktree, what it saved, what it has not
 sdt work merge agent-copy  #      bring its saved changes back here
 sdt work remove agent-copy #      set it aside (refuses unsaved edits; restore brings it back)
+sdt probe @green -- zig build     # pb   run anything against any state, in a clone
+sdt probe @green..@ -- zig build test   # bisect the moments in between
+sdt send @a3f91c           #      hand someone one exact state, verdict included
 sdt undo   /   sdt redo     # u   /  r
 sdt blame file.txt         # per-line authorship + provenance
 sdt absorb                 # fold edits into the changes they belong to

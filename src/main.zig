@@ -22,6 +22,7 @@ const readset = @import("readset.zig");
 const warrant = @import("warrant.zig");
 const tracer = @import("tracer.zig");
 const grade = @import("grade.zig");
+const probe = @import("probe.zig");
 const sched = @import("sched.zig");
 const rewind = @import("rewind.zig");
 const freshness = @import("freshness.zig");
@@ -120,6 +121,7 @@ const sections = [_]Section{
         .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
         .{ .name = "moments", .alias = "mo", .args = "[-n N] [--path f]", .desc = "captured states, their age and their verdicts" },
         .{ .name = "grade", .alias = "gd", .args = "[git-ref]", .desc = "grade now, or any git ref; --on automates" },
+        .{ .name = "probe", .alias = "pb", .args = "<ref>[..<ref>] [-- <cmd>]", .desc = "run a command against a state in a clone; a range bisects" },
         .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
         .{ .name = "recap", .alias = "rc", .args = "[@ref..]", .desc = "green and red spans, and what thrashed" },
     } },
@@ -137,6 +139,7 @@ const sections = [_]Section{
     } },
     .{ .title = "handing a repo to someone", .entries = &.{
         .{ .name = "send", .alias = "snd", .desc = "peer-to-peer on this network, via a code" },
+        .{ .name = "send", .args = "<ref>", .desc = "one exact state, with its check and verdict" },
         .{ .name = "send --file", .args = "<f>", .desc = "one sealed file, no network at all" },
         .{ .name = "send --link", .args = "<dir>", .desc = "static files you upload anywhere" },
         .{ .name = "get", .alias = "g", .args = "<code|url|file>", .desc = "the other side of all three" },
@@ -286,6 +289,7 @@ const aliases = [_]Alias{
     .{ .short = "rw", .full = "rewind" },
     .{ .short = "mo", .full = "moments" },
     .{ .short = "gd", .full = "grade" },
+    .{ .short = "pb", .full = "probe" },
     .{ .short = "doc", .full = "doctor" },
     .{ .short = "rc", .full = "recap" },
     .{ .short = "sp", .full = "super" },
@@ -459,6 +463,12 @@ fn run(init: std.process.Init) !void {
         try cmdMoments(io, alloc, w, rest);
     } else if (eq(cmd, "grade")) {
         const code = try cmdGrade(io, alloc, w, rest);
+        if (code != 0) {
+            try w.flush();
+            std.process.exit(code);
+        }
+    } else if (eq(cmd, "probe")) {
+        const code = try cmdProbe(io, alloc, w, rest);
         if (code != 0) {
             try w.flush();
             std.process.exit(code);
@@ -4283,37 +4293,48 @@ fn cmdMoments(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     const rows = picked.items;
     const start = if (rows.len > limit) rows.len - limit else 0;
     for (rows[start..]) |m| {
-        var id_hex: [16]u8 = undefined;
-        _ = m.shortId(&id_hex);
-        const v = ix.best(
-            m.full_tree,
-            verdict.commandHash(set.command(.fast)),
-            verdict.commandHash(set.command(.full)),
-        );
-        try w.print("{s}@{s}{s}  ", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
-        try writeAge(w, now_ms, m.ms);
-        if (v) |got| {
-            const colour: ui.Color = if (got.result == .green) .green else .red;
-            try w.print("{s}{s}{s} {s}{s}{s}", .{
-                ui.on(colour), got.result.label(), ui.off(),
-                ui.on(.dim),   got.tier.label(),   ui.off(),
-            });
-            // A green is never shown bare: the warrant travels with the claim.
-            if (got.result == .green) {
-                try w.print("  {s}{s}  relevance {d}/{d}  {s}{s}", .{
-                    ui.on(.dim),
-                    got.independence.label(),
-                    got.relevance_hit,
-                    got.relevance_total,
-                    got.discrimination.label(),
-                    ui.off(),
-                });
-            }
-        } else {
-            try w.print("{s}ungraded{s}", .{ ui.on(.dim), ui.off() });
-        }
-        try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), m.cause.label(), ui.off() });
+        try writeMomentRow(w, &ix, set, now_ms, m);
+        try w.writeAll("\n");
     }
+}
+
+fn writeMomentRow(
+    w: *std.Io.Writer,
+    ix: *const verdict.Index,
+    set: checks.Settings,
+    now_ms: i64,
+    m: moment.Moment,
+) !void {
+    var id_hex: [16]u8 = undefined;
+    _ = m.shortId(&id_hex);
+    const v = ix.best(
+        m.full_tree,
+        verdict.commandHash(set.command(.fast)),
+        verdict.commandHash(set.command(.full)),
+    );
+    try w.print("{s}@{s}{s}  ", .{ ui.on(.cyan), id_hex[0..12], ui.off() });
+    try writeAge(w, now_ms, m.ms);
+    if (v) |got| {
+        const colour: ui.Color = if (got.result == .green) .green else .red;
+        try w.print("{s}{s}{s} {s}{s}{s}", .{
+            ui.on(colour), got.result.label(), ui.off(),
+            ui.on(.dim),   got.tier.label(),   ui.off(),
+        });
+        // A green is never shown bare: the warrant travels with the claim.
+        if (got.result == .green) {
+            try w.print("  {s}{s}  relevance {d}/{d}  {s}{s}", .{
+                ui.on(.dim),
+                got.independence.label(),
+                got.relevance_hit,
+                got.relevance_total,
+                got.discrimination.label(),
+                ui.off(),
+            });
+        }
+    } else {
+        try w.print("{s}ungraded{s}", .{ ui.on(.dim), ui.off() });
+    }
+    try w.print("  {s}{s}{s}", .{ ui.on(.dim), m.cause.label(), ui.off() });
 }
 
 fn rewindTo(
@@ -4764,6 +4785,401 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         try ui.hint(w, "`sdt green` rewinds to the last state that worked");
     }
     return if (automated) 0 else report.exitCode();
+}
+
+fn probeUsage(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\usage: sdt probe <ref> [-- <cmd...>]             run it against that state, in a clone
+        \\       sdt probe <ref>..<ref> [-- <cmd...>]      bisect the moments between the two
+        \\       flags: --json  --rerun  -j <n>
+        \\
+    );
+    try ui.hint(w, "without `-- <cmd>` the configured check runs; try `sdt probe @green -- zig build`");
+}
+
+fn needsQuoting(word: []const u8) bool {
+    if (word.len == 0) return true;
+    for (word) |c| {
+        const plain = std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "_-./:=@%+,", c) != null;
+        if (!plain) return true;
+    }
+    return false;
+}
+
+fn joinCommand(alloc: std.mem.Allocator, words: []const []const u8) ![]u8 {
+    if (words.len == 1) return alloc.dupe(u8, words[0]);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (words, 0..) |word, i| {
+        if (i != 0) try out.append(alloc, ' ');
+        if (!needsQuoting(word)) {
+            try out.appendSlice(alloc, word);
+            continue;
+        }
+        try out.append(alloc, '\'');
+        for (word) |c| {
+            if (c == '\'') try out.appendSlice(alloc, "'\\''") else try out.append(alloc, c);
+        }
+        try out.append(alloc, '\'');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn exitFor(code: i32) u8 {
+    const bits: u32 = @bitCast(code);
+    return @intCast(bits & 0xff);
+}
+
+fn momentIndex(all: []const moment.Moment, r: revspec.Resolved) ?usize {
+    const target = switch (r.target) {
+        .live => return if (all.len == 0) null else all.len - 1,
+        .at => |m| m,
+    };
+    for (all, 0..) |m, i| {
+        if (std.mem.eql(u8, &m.id, &target.id)) return i;
+    }
+    for (all, 0..) |m, i| {
+        if (m.full_tree.eql(target.full_tree)) return i;
+    }
+    return null;
+}
+
+fn cmdProbe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !u8 {
+    var spec: []const u8 = "";
+    var as_json = false;
+    var rerun = false;
+    var jobs: usize = 0;
+    var words: std.ArrayList([]const u8) = .empty;
+    defer words.deinit(alloc);
+
+    var after_sep = false;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const a = rest[i];
+        if (after_sep) {
+            try words.append(alloc, a);
+        } else if (eq(a, "--")) {
+            after_sep = true;
+        } else if (eq(a, "--json")) {
+            as_json = true;
+        } else if (eq(a, "--rerun")) {
+            rerun = true;
+        } else if ((eq(a, "-j") or eq(a, "--jobs")) and i + 1 < rest.len) {
+            i += 1;
+            jobs = std.fmt.parseInt(usize, rest[i], 10) catch 0;
+        } else if (spec.len == 0 and a.len != 0 and a[0] != '-') {
+            spec = a;
+        }
+    }
+    if (spec.len == 0) {
+        try probeUsage(w);
+        return 2;
+    }
+
+    var s = (try openRepo(io, alloc, w)) orelse return 0;
+    defer s.deinit();
+    var work = try openWork(io);
+    defer work.close(io);
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+
+    const tier: verdict.Tier = if (set.has(.full)) .full else .fast;
+    var joined: ?[]u8 = null;
+    defer if (joined) |j| alloc.free(j);
+    var command: []const u8 = set.command(tier);
+    if (words.items.len != 0) {
+        joined = try joinCommand(alloc, words.items);
+        command = joined.?;
+    }
+    if (command.len == 0) {
+        try w.print("{s}{s}{s} no command given and no check configured\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "pass one after `--`, or set one with `sdt config check \"zig build test\"`");
+        return grade.exit_no_check;
+    }
+
+    var cache: ?probe.Cache = null;
+    if (!rerun) {
+        if (set.has(.full) and eq(command, set.full)) {
+            cache = .{ .index = &ix, .tier = .full, .command = verdict.commandHash(set.full) };
+        } else if (set.has(.fast) and eq(command, set.fast)) {
+            cache = .{ .index = &ix, .tier = .fast, .command = verdict.commandHash(set.fast) };
+        }
+    }
+
+    const launch = checks.Launch{
+        .nice = set.nice,
+        .timeout_ms = set.timeoutMs(tier),
+        .kill_grace_ms = set.kill_grace_ms,
+    };
+
+    if (std.mem.indexOf(u8, spec, "..") != null) {
+        return probeRange(io, alloc, w, &s, work, set, &ix, spec, command, launch, cache, jobs, as_json);
+    }
+
+    const resolved = resolveSpecOrFail(io, alloc, w, &s, spec, &ix, set);
+    defer resolved.deinit(alloc);
+    const m = switch (resolved.target) {
+        .live => {
+            try w.writeAll("@ is the live tree; run the command here instead\n");
+            return 2;
+        },
+        .at => |m| m,
+    };
+    var id_hex: [16]u8 = undefined;
+    _ = m.shortId(&id_hex);
+    const id = id_hex[0..12];
+
+    if (cache) |c| {
+        if (c.index.get(.{ .tree = m.full_tree, .tier = c.tier, .command = c.command })) |v| {
+            if (as_json) {
+                try w.writeAll("{\"ref\":");
+                try writeJsonString(w, spec);
+                try w.writeAll(",\"moment\":");
+                try writeJsonString(w, id);
+                try w.writeAll(",\"command\":");
+                try writeJsonString(w, command);
+                try w.print(",\"exit_code\":{d},\"duration_ms\":{d},\"outcome\":\"{s}\",\"cached\":true}}\n", .{
+                    v.exit_code, v.duration_ms, v.outcome.label(),
+                });
+                return exitFor(v.exit_code);
+            }
+            const colour: ui.Color = if (v.result == .green) .green else .red;
+            try w.print("{s}@{s}{s}  {s}{s}{s} {s}{s}{s}  exit {d} after {d}ms, from the verdict cache\n", .{
+                ui.on(.cyan),  id,               ui.off(),
+                ui.on(colour), v.result.label(), ui.off(),
+                ui.on(.dim),   v.tier.label(),   ui.off(),
+                v.exit_code,   v.duration_ms,
+            });
+            try ui.hint(w, "`--rerun` runs it again and shows the output");
+            return exitFor(v.exit_code);
+        }
+    }
+
+    const entries = try moment.entriesOf(&s, m);
+    defer workspace.freeTreeEntries(alloc, entries);
+
+    if (!as_json) {
+        try w.print("{s}probing @{s} in a clone: {s}{s}\n", .{ ui.on(.dim), id, command, ui.off() });
+    }
+    try w.flush();
+
+    const clone = probe.prepare(&s, work, entries, id, null) catch |e| {
+        try reportWorktreeFailure(w, e);
+        return 1;
+    };
+    defer clone.discard(io, alloc);
+
+    var streamed = launch;
+    streamed.stdio = if (as_json) .stderr_only else .inherit;
+    const outcome = try probe.execute(alloc, io, clone, command, streamed);
+
+    if (as_json) {
+        try w.writeAll("{\"ref\":");
+        try writeJsonString(w, spec);
+        try w.writeAll(",\"moment\":");
+        try writeJsonString(w, id);
+        try w.writeAll(",\"command\":");
+        try writeJsonString(w, command);
+        try w.print(",\"exit_code\":{d},\"duration_ms\":{d},\"outcome\":\"{s}\",\"cached\":false}}\n", .{
+            outcome.exit_code, outcome.duration_ms, outcome.outcome.label(),
+        });
+        return exitFor(outcome.exit_code);
+    }
+    const ok = outcome.exit_code == 0;
+    try w.print("{s}{s}{s} {s}@{s}{s} exit {d} after {d}ms\n", .{
+        ui.on(if (ok) .green else .red), if (ok) ui.check else ui.cross, ui.off(),
+        ui.on(.cyan),                    id,                             ui.off(),
+        outcome.exit_code,               outcome.duration_ms,
+    });
+    return exitFor(outcome.exit_code);
+}
+
+fn probeRange(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    work: std.Io.Dir,
+    set: checks.Settings,
+    ix: *const verdict.Index,
+    spec: []const u8,
+    command: []const u8,
+    launch: checks.Launch,
+    cache: ?probe.Cache,
+    jobs: usize,
+    as_json: bool,
+) !u8 {
+    const all = try moment.readAll(s, alloc);
+    defer moment.freeMoments(alloc, all);
+    if (all.len < 2) {
+        try w.writeAll("fewer than two moments captured, so there is nothing to bisect\n");
+        return 1;
+    }
+
+    const range = resolveRangeOrFail(io, alloc, w, s, spec, ix, set);
+    defer range.deinit(alloc);
+    const from_ix: usize = if (range.from) |f| momentIndex(all, f) orelse {
+        try w.print("{s}{s}{s} the start of {s}{s}{s} is not a captured moment\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+        });
+        return 1;
+    } else 0;
+    const to_ix = momentIndex(all, range.to) orelse {
+        try w.print("{s}{s}{s} the end of {s}{s}{s} is not a captured moment\n", .{
+            ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+        });
+        return 1;
+    };
+    const lo = @min(from_ix, to_ix);
+    const hi = @max(from_ix, to_ix);
+    if (lo == hi) {
+        try w.writeAll("the range holds a single moment; name two different states\n");
+        return 1;
+    }
+
+    const width = if (jobs != 0) jobs else probe.parallelism(
+        sched.powerOk(alloc, sched.settings(s, alloc)),
+        set.budget_percent,
+    );
+    var runner = probe.Runner{
+        .store = s,
+        .work_dir = work,
+        .moments = all,
+        .command = command,
+        .launch = launch,
+        .cache = cache,
+        .jobs = width,
+    };
+    defer runner.deinit();
+
+    var lo_hex: [16]u8 = undefined;
+    var hi_hex: [16]u8 = undefined;
+    _ = all[lo].shortId(&lo_hex);
+    _ = all[hi].shortId(&hi_hex);
+
+    if (!as_json) {
+        try w.print("{s}bisecting {d} moments between @{s} and @{s}, {d} at a time: {s}{s}\n", .{
+            ui.on(.dim), hi - lo + 1, lo_hex[0..12], hi_hex[0..12], width, command, ui.off(),
+        });
+        try w.flush();
+    }
+
+    const flip = runner.bisect(lo, hi) catch |e| {
+        try reportWorktreeFailure(w, e);
+        return 1;
+    };
+    const runs = runner.sorted();
+
+    var passing: ?usize = null;
+    var failing: ?usize = null;
+    if (flip) |f| {
+        if (runner.known(f.before).?.passes()) {
+            passing = f.before;
+            failing = f.after;
+        } else {
+            passing = f.after;
+            failing = f.before;
+        }
+    }
+
+    if (as_json) {
+        try w.writeAll("{\"command\":");
+        try writeJsonString(w, command);
+        try w.writeAll(",\"from\":");
+        try writeJsonString(w, lo_hex[0..12]);
+        try w.writeAll(",\"to\":");
+        try writeJsonString(w, hi_hex[0..12]);
+        try w.print(",\"jobs\":{d},\"first_failing\":", .{width});
+        try writeJsonMomentId(w, all, failing);
+        try w.writeAll(",\"last_passing\":");
+        try writeJsonMomentId(w, all, passing);
+        try w.writeAll(",\"runs\":[");
+        for (runs, 0..) |r, i| {
+            if (i != 0) try w.writeAll(",");
+            var hex: [16]u8 = undefined;
+            _ = all[r.index].shortId(&hex);
+            try w.writeAll("{\"moment\":");
+            try writeJsonString(w, hex[0..12]);
+            try w.print(",\"exit_code\":{d},\"duration_ms\":{d},\"outcome\":\"{s}\",\"cached\":{s}}}", .{
+                r.exit_code, r.duration_ms, r.outcome.label(), if (r.cached) "true" else "false",
+            });
+        }
+        try w.writeAll("]}\n");
+        return if (flip != null) 0 else 1;
+    }
+
+    if (flip == null) {
+        try w.print("{s}no flip: exit {d} at @{s} and exit {d} at @{s}{s}\n", .{
+            ui.on(.yellow),
+            runner.known(lo).?.exit_code,
+            lo_hex[0..12],
+            runner.known(hi).?.exit_code,
+            hi_hex[0..12],
+            ui.off(),
+        });
+        try ui.hint(w, "a bisect needs one end that passes and one that fails");
+        return 1;
+    }
+
+    const f = flip.?;
+    const now_ms = nowMillis(io);
+    try w.print("{s}exit flips from {d} to {d} at @{s}{s}\n", .{
+        ui.on(.yellow),
+        runner.known(f.before).?.exit_code,
+        runner.known(f.after).?.exit_code,
+        blk: {
+            var hex: [16]u8 = undefined;
+            _ = all[f.after].shortId(&hex);
+            break :blk hex[0..12];
+        },
+        ui.off(),
+    });
+    const first = if (f.before > 0 and f.after + 1 >= all.len) f.before - 1 else f.before;
+    const last = @min(f.after + 1, all.len - 1);
+    for (first..last + 1) |i| {
+        try w.writeAll(if (i == f.after) "\xe2\x86\x92 " else "  ");
+        try writeMomentRow(w, ix, set, now_ms, all[i]);
+        if (runner.known(i)) |r| {
+            if (r.cached) {
+                try w.print("  {s}exit {d}, from the verdict cache{s}", .{ ui.on(.dim), r.exit_code, ui.off() });
+            } else {
+                try w.print("  {s}exit {d} in {d}ms{s}", .{ ui.on(.dim), r.exit_code, r.duration_ms, ui.off() });
+            }
+        } else {
+            try w.print("  {s}not run{s}", .{ ui.on(.dim), ui.off() });
+        }
+        try w.writeAll("\n");
+    }
+
+    var ran: usize = 0;
+    var cached: usize = 0;
+    for (runs) |r| {
+        if (r.cached) cached += 1 else ran += 1;
+    }
+    var pass_hex: [16]u8 = undefined;
+    var fail_hex: [16]u8 = undefined;
+    _ = all[passing.?].shortId(&pass_hex);
+    _ = all[failing.?].shortId(&fail_hex);
+    try w.print("last passing {s}@{s}{s}, first failing {s}@{s}{s}  {s}({d} run{s}, {d} from the cache){s}\n", .{
+        ui.on(.cyan), pass_hex[0..12], ui.off(),
+        ui.on(.cyan), fail_hex[0..12], ui.off(),
+        ui.on(.dim),  ran,             if (ran == 1) "" else "s",
+        cached,       ui.off(),
+    });
+    try w.print("{s}hint:{s} `sdt probe @{s} -- {s}` shows the failing output; `sdt rewind @{s}` goes back to the passing state\n", .{
+        ui.on(.dim), ui.off(), fail_hex[0..12], command, pass_hex[0..12],
+    });
+    return 0;
+}
+
+fn writeJsonMomentId(w: *std.Io.Writer, all: []const moment.Moment, at: ?usize) !void {
+    const i = at orelse return w.writeAll("null");
+    var hex: [16]u8 = undefined;
+    _ = all[i].shortId(&hex);
+    try writeJsonString(w, hex[0..12]);
 }
 
 fn cmdGradeRef(
@@ -5959,7 +6375,7 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     });
     try w.flush();
     if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
-        return cloneShare(io, alloc, w, rest[0], into);
+        return cloneShare(io, alloc, w, rest[0], into, into);
     }
     if (isApricotRemote(rest[0])) {
         const cwd = try std.process.currentPathAlloc(io, alloc);
@@ -6078,6 +6494,7 @@ fn relayFlag(rest: []const []const u8, host: *[]const u8, port: *u16) void {
 fn sendUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\usage: sdt send                    hand it to someone on this network
+        \\       sdt send <ref>              one exact state, with its check and verdict
         \\       sdt send --file <path>      one sealed file, no network at all
         \\       sdt send --link <dir>       static files you upload anywhere
         \\       sdt send --relay <host:port>  across the internet, via a relay
@@ -6137,14 +6554,20 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     const wanted = try shareBranches(alloc, rest, 0);
     defer alloc.free(wanted);
 
-    if (file_path) |path| return sendFile(io, alloc, w, &s, path, wanted);
-    if (link_dir) |dir| return sendLink(io, alloc, w, &s, dir, base, wanted);
+    var state: ?share.State = null;
+    defer if (state) |st| st.deinit(alloc);
+    if (wanted.len == 1 and !s.refExists(wanted[0])) {
+        state = (try stateToSend(io, alloc, w, &s, wanted[0])) orelse return;
+    }
+
+    if (file_path) |path| return sendFile(io, alloc, w, &s, path, wanted, state);
+    if (link_dir) |dir| return sendLink(io, alloc, w, &s, dir, base, wanted, state);
 
     const code = try wormhole.generateCode(io, alloc);
     defer alloc.free(code);
     const parsed = wormhole.Code.parse(code) catch return sendUsage(w);
 
-    if (relay_host) |host| return sendViaRelay(io, alloc, w, &s, code, host, relay_port, wanted);
+    if (relay_host) |host| return sendViaRelay(io, alloc, w, &s, code, host, relay_port, wanted, state);
 
     var server: ipnet.Server = undefined;
     var bound: u16 = 0;
@@ -6186,13 +6609,76 @@ fn cmdSend(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         return;
     };
 
-    const payload = try share.buildBundle(&s, alloc, session.key, wanted);
+    const payload = try buildPayload(&s, alloc, session.key, wanted, state);
     defer alloc.free(payload);
     try session.sendStream(io, alloc, conn.channel(), payload);
 
     try w.print("{s}{s}{s} sent {d} bytes directly. nothing left this network.\n", .{
         ui.on(.green), ui.check, ui.off(), payload.len,
     });
+}
+
+fn buildPayload(
+    s: *Store,
+    alloc: std.mem.Allocator,
+    key: share.ShareKey,
+    wanted: []const []const u8,
+    state: ?share.State,
+) ![]u8 {
+    if (state) |st| return share.buildStateBundle(s, alloc, key, st);
+    return share.buildBundle(s, alloc, key, wanted);
+}
+
+fn stateToSend(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    spec: []const u8,
+) !?share.State {
+    const set = checks.settings(s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(s, alloc);
+    defer ix.deinit();
+
+    const resolved = resolveSpecOrFail(io, alloc, w, s, spec, &ix, set);
+    defer resolved.deinit(alloc);
+    const m = switch (resolved.target) {
+        .live => {
+            try w.writeAll("@ is the live tree; `sdt save` first, or name a moment\n");
+            return null;
+        },
+        .at => |m| m,
+    };
+
+    const entries = try moment.entriesOf(s, m);
+    defer workspace.freeTreeEntries(alloc, entries);
+    const tree = try s.writeTree(.{ .entries = entries });
+
+    const v = ix.best(tree, verdict.commandHash(set.command(.fast)), verdict.commandHash(set.command(.full)));
+    const tier: verdict.Tier = if (v) |got| got.tier else if (set.has(.full)) .full else .fast;
+    const check = set.command(tier);
+
+    var id_hex: [16]u8 = undefined;
+    _ = m.shortId(&id_hex);
+    try w.print("{s}state{s} {s}@{s}{s}", .{ ui.on(.dim), ui.off(), ui.on(.cyan), id_hex[0..12], ui.off() });
+    if (v) |got| {
+        const colour: ui.Color = if (got.result == .green) .green else .red;
+        try w.print("  {s}{s}{s} {s}{s}{s}", .{
+            ui.on(colour), got.result.label(), ui.off(),
+            ui.on(.dim),   got.tier.label(),   ui.off(),
+        });
+    } else {
+        try w.print("  {s}ungraded{s}", .{ ui.on(.dim), ui.off() });
+    }
+    if (check.len != 0) try w.print("  {s}{s}{s}", .{ ui.on(.dim), check, ui.off() });
+    try w.writeAll("\n");
+
+    return .{
+        .tree = tree,
+        .check = if (check.len != 0) try alloc.dupe(u8, check) else "",
+        .verdict = v,
+    };
 }
 
 fn sendFile(
@@ -6202,9 +6688,14 @@ fn sendFile(
     s: *Store,
     path: []const u8,
     wanted: []const []const u8,
+    state: ?share.State,
 ) !void {
     const key = share.newShareKey(io);
-    share.writeBundle(s, alloc, io, key, path, wanted) catch |e| {
+    const wrote = if (state) |st|
+        share.writeStateBundle(s, alloc, io, key, path, st)
+    else
+        share.writeBundle(s, alloc, io, key, path, wanted);
+    wrote catch |e| {
         try w.print("could not write {s}: {t}\n", .{ path, e });
         return;
     };
@@ -6230,13 +6721,18 @@ fn sendLink(
     dir: []const u8,
     base: []const u8,
     wanted: []const []const u8,
+    state: ?share.State,
 ) !void {
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     var dest = try std.Io.Dir.cwd().openDir(io, dir, .{});
     defer dest.close(io);
 
     const key = share.newShareKey(io);
-    share.exportDir(s, alloc, io, key, dest, wanted) catch |e| {
+    const wrote = if (state) |st|
+        share.exportStateDir(s, alloc, io, key, dest, st)
+    else
+        share.exportDir(s, alloc, io, key, dest, wanted);
+    wrote catch |e| {
         try w.print("could not write {s}: {t}\n", .{ dir, e });
         return;
     };
@@ -6261,6 +6757,7 @@ fn sendViaRelay(
     host: []const u8,
     port: u16,
     wanted: []const []const u8,
+    state: ?share.State,
 ) !void {
     try w.print("  {s}{s}{s}\n\n", .{ ui.on(.bold), code, ui.off() });
     try w.print("  sdt get {s} --relay {s}:{d}\n\n", .{ code, host, port });
@@ -6282,7 +6779,7 @@ fn sendViaRelay(
         return;
     };
 
-    const payload = try share.buildBundle(s, alloc, session.key, wanted);
+    const payload = try buildPayload(s, alloc, session.key, wanted, state);
     defer alloc.free(payload);
     try session.sendStream(io, alloc, conn.channel(), payload);
     try w.print("{s}{s}{s} sent {d} bytes. the relay saw ciphertext and nothing else.\n", .{
@@ -6310,6 +6807,7 @@ fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     const source = rest[0];
 
     var into: []const u8 = ".";
+    var named: ?[]const u8 = null;
     var relay_host: ?[]const u8 = null;
     var relay_port: u16 = default_relay_port;
     var i: usize = 1;
@@ -6325,11 +6823,12 @@ fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             i += 1;
         } else if (!std.mem.startsWith(u8, rest[i], "-")) {
             into = rest[i];
+            named = rest[i];
         }
     }
 
     if (std.mem.indexOf(u8, source, "#k=") != null) {
-        return cloneShare(io, alloc, w, source, into);
+        return cloneShare(io, alloc, w, source, into, named);
     }
     if (!looksLikeCode(source)) {
         try w.print("{s}{s}{s} not a code, a share url, or a bundle: {s}{s}{s}\n", .{
@@ -6338,7 +6837,7 @@ fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         try ui.hint(w, "codes look like 43-hydrant-hostel; links and files carry a #k=... key");
         return;
     }
-    return receiveCode(io, alloc, w, source, into, relay_host, relay_port);
+    return receiveCode(io, alloc, w, source, into, named, relay_host, relay_port);
 }
 
 fn receiveCode(
@@ -6347,6 +6846,7 @@ fn receiveCode(
     w: *std.Io.Writer,
     code: []const u8,
     into: []const u8,
+    named: ?[]const u8,
     relay_host: ?[]const u8,
     relay_port: u16,
 ) !void {
@@ -6354,15 +6854,6 @@ fn receiveCode(
         try w.writeAll("that does not look like an sdt code\n");
         return;
     };
-
-    std.Io.Dir.cwd().createDirPath(io, into) catch {};
-    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
-    defer dest.close(io);
-    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
-        Store.Error.RepoExists => try Store.open(io, alloc, dest),
-        else => return e,
-    };
-    defer s.deinit();
 
     const conn = blk: {
         if (relay_host) |host| {
@@ -6403,13 +6894,165 @@ fn receiveCode(
     };
     defer alloc.free(payload);
 
-    try share.importBundle(&s, alloc, session.key, payload);
+    var opened = share.openBundle(alloc, session.key, payload) catch |e| {
+        try w.print("transfer failed: {t}\n", .{e});
+        return;
+    };
+    defer opened.deinit(alloc);
+    if (opened.kind() == .state) return receiveState(io, alloc, w, &opened, named);
+
+    std.Io.Dir.cwd().createDirPath(io, into) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
+    defer dest.close(io);
+    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
+        Store.Error.RepoExists => try Store.open(io, alloc, dest),
+        else => return e,
+    };
+    defer s.deinit();
+
+    const got = try share.importOpened(&s, alloc, &opened);
+    got.deinit(alloc);
     try materializeHead(io, alloc, &s, dest);
 
     try w.print("{s}{s}{s} received into {s}{s}{s}\n", .{
         ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
     });
     try ui.hint(w, "any sealed values are still sealed. the code moved the code, not the secrets.");
+}
+
+fn receiveState(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    opened: *share.Opened,
+    named: ?[]const u8,
+) !void {
+    const state = (opened.state(alloc) catch |e| {
+        try w.print("could not read the state: {t}\n", .{e});
+        return;
+    }) orelse return;
+    defer state.deinit(alloc);
+
+    var tree_buf: [Oid.len * 2]u8 = undefined;
+    const tree_hex = shortHex(state.tree, &tree_buf);
+
+    const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(cwd_abs);
+
+    if (Store.discover(io, alloc, std.Io.Dir.cwd())) |found| {
+        var s = found;
+        defer s.deinit();
+        var work = try openWork(io);
+        defer work.close(io);
+        const work_abs = try work.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(work_abs);
+
+        const got = share.importOpened(&s, alloc, opened) catch |e| {
+            try w.print("transfer failed: {t}\n", .{e});
+            return;
+        };
+        got.deinit(alloc);
+        if (state.verdict) |v| verdict.record(&s, v) catch {};
+
+        const dst_abs = if (named) |n|
+            (if (std.fs.path.isAbsolute(n)) try alloc.dupe(u8, n) else try std.fs.path.join(alloc, &.{ cwd_abs, n }))
+        else
+            try std.fmt.allocPrint(alloc, "{s}-{s}", .{ work_abs, tree_hex });
+        defer alloc.free(dst_abs);
+
+        if (std.Io.Dir.cwd().access(io, dst_abs, .{})) |_| {
+            try w.print("{s} already exists\n", .{dst_abs});
+            return;
+        } else |_| {}
+
+        fork.workAtTree(&s, work, dst_abs, state.tree) catch |e| {
+            try reportWorktreeFailure(w, e);
+            return;
+        };
+        try reportState(alloc, w, &s, state, tree_hex, dst_abs);
+        return;
+    } else |_| {}
+
+    var default_dir: ?[]u8 = null;
+    defer if (default_dir) |d| alloc.free(d);
+    const dir = named orelse blk: {
+        default_dir = try std.fmt.allocPrint(alloc, "state-{s}", .{tree_hex});
+        break :blk default_dir.?;
+    };
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer dest.close(io);
+    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
+        Store.Error.RepoExists => try Store.open(io, alloc, dest),
+        else => return e,
+    };
+    defer s.deinit();
+
+    const got = share.importOpened(&s, alloc, opened) catch |e| {
+        try w.print("transfer failed: {t}\n", .{e});
+        return;
+    };
+    got.deinit(alloc);
+    if (state.verdict) |v| verdict.record(&s, v) catch {};
+    if (state.check.len != 0) {
+        const tier: verdict.Tier = if (state.verdict) |v| v.tier else .full;
+        config.set(&s, if (tier == .full) "checks.full" else "checks.fast", state.check) catch {};
+    }
+    try workspace.materialize(&s, state.tree, dest);
+    try reportState(alloc, w, &s, state, tree_hex, dir);
+}
+
+fn reportState(
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    state: share.State,
+    tree_hex: []const u8,
+    dir: []const u8,
+) !void {
+    if (state.verdict) |v| {
+        const colour: ui.Color = if (v.result == .green) .green else .red;
+        try w.print("{s}{s}{s} state {s}@{s}{s} at {s}{s}{s}\n", .{
+            ui.on(colour), if (v.result == .green) ui.check else ui.cross, ui.off(),
+            ui.on(.cyan),  tree_hex,                                       ui.off(),
+            ui.on(.cyan),  dir,                                            ui.off(),
+        });
+        try warrant.render(w, tree_hex, v);
+        if (v.result == .red) {
+            try w.print("  exit {d} after {d}ms\n", .{ v.exit_code, v.duration_ms });
+        }
+        if (v.isHollow()) {
+            try ui.hint(w, "green, but the warrant says this green proves little");
+        }
+    } else {
+        try w.print("{s}@{s}{s} at {s}{s}{s}, ungraded\n", .{
+            ui.on(.cyan), tree_hex, ui.off(), ui.on(.cyan), dir, ui.off(),
+        });
+    }
+    if (state.check.len != 0) {
+        try w.print("  {s}check:{s} {s}\n", .{ ui.on(.dim), ui.off(), state.check });
+    }
+
+    const set = checks.settings(s, alloc);
+    defer set.deinit(alloc);
+    if (state.verdict) |v| {
+        const local = set.command(v.tier);
+        if (eq(local, state.check)) {
+            try w.writeAll("`sdt grade` there reproduces it: same check, and the verdict is recorded for this tree\n");
+        } else if (local.len == 0) {
+            try w.print("`sdt grade` there does not reproduce it: no {s} check is configured here\n", .{v.tier.label()});
+            try ui.hint(w, "set one with `sdt config check \"...\"` to match the sender");
+        } else {
+            try w.print("`sdt grade` there does not reproduce it: this repo's {s} check is `{s}`, the sender's was `{s}`\n", .{
+                v.tier.label(), local, state.check,
+            });
+        }
+    } else if (state.check.len != 0) {
+        try w.print("no verdict came with it; `sdt grade` there runs `{s}`\n", .{state.check});
+    } else {
+        try w.writeAll("no verdict and no check came with it\n");
+        try ui.hint(w, "set one with `sdt config check \"...\"`, then `sdt grade` there");
+    }
 }
 
 fn materializeHead(io: std.Io, alloc: std.mem.Allocator, s: *Store, dest: std.Io.Dir) !void {
@@ -6457,25 +7100,20 @@ fn cloneShare(
     w: *std.Io.Writer,
     source: []const u8,
     into: []const u8,
+    named: ?[]const u8,
 ) !void {
-    std.Io.Dir.cwd().createDirPath(io, into) catch {};
-    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
-    defer dest.close(io);
-    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
-        Store.Error.RepoExists => try Store.open(io, alloc, dest),
-        else => return e,
-    };
-    defer s.deinit();
-
     const is_http = std.mem.startsWith(u8, source, "http://") or
         std.mem.startsWith(u8, source, "https://");
 
-    if (is_http) {
-        share.fetchHttp(&s, alloc, io, source) catch |e| {
-            try w.print("clone failed: {t}\n", .{e});
-            return;
-        };
-    } else {
+    var bytes: ?[]u8 = null;
+    defer if (bytes) |b| alloc.free(b);
+    var opened = blk: {
+        if (is_http) {
+            break :blk share.openHttp(alloc, io, source) catch |e| {
+                try w.print("clone failed: {t}\n", .{e});
+                return;
+            };
+        }
         const cut = std.mem.indexOf(u8, source, "#k=").?;
         const encoded = source[cut + "#k=".len ..];
         var key: share.ShareKey = undefined;
@@ -6489,11 +7127,32 @@ fn cloneShare(
             try w.writeAll("that key does not look like an sdt share key\n");
             return;
         };
-        share.readBundle(&s, alloc, io, key, source[0..cut]) catch |e| {
+        bytes = std.Io.Dir.cwd().readFileAlloc(io, source[0..cut], alloc, .unlimited) catch |e| {
             try w.print("clone failed: {t}\n", .{e});
             return;
         };
-    }
+        break :blk share.openBundle(alloc, key, bytes.?) catch |e| {
+            try w.print("clone failed: {t}\n", .{e});
+            return;
+        };
+    };
+    defer opened.deinit(alloc);
+    if (opened.kind() == .state) return receiveState(io, alloc, w, &opened, named);
+
+    std.Io.Dir.cwd().createDirPath(io, into) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
+    defer dest.close(io);
+    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
+        Store.Error.RepoExists => try Store.open(io, alloc, dest),
+        else => return e,
+    };
+    defer s.deinit();
+
+    const got = share.importOpened(&s, alloc, &opened) catch |e| {
+        try w.print("clone failed: {t}\n", .{e});
+        return;
+    };
+    got.deinit(alloc);
 
     const branch = try s.headBranch();
     defer alloc.free(branch);
@@ -6938,6 +7597,7 @@ test {
     _ = warrant;
     _ = tracer;
     _ = grade;
+    _ = probe;
     _ = sched;
     _ = rewind;
     _ = freshness;
@@ -6954,6 +7614,22 @@ test {
 }
 
 extern "c" fn chdir(path: [*:0]const u8) c_int;
+
+test "joinCommand keeps a single word verbatim and quotes what the shell would split" {
+    const alloc = std.testing.allocator;
+
+    const one = try joinCommand(alloc, &.{"zig build test && ls"});
+    defer alloc.free(one);
+    try std.testing.expectEqualStrings("zig build test && ls", one);
+
+    const plain = try joinCommand(alloc, &.{ "zig", "build", "test" });
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("zig build test", plain);
+
+    const quoted = try joinCommand(alloc, &.{ "grep", "a b", "it's", "" });
+    defer alloc.free(quoted);
+    try std.testing.expectEqualStrings("grep 'a b' 'it'\\''s' ''", quoted);
+}
 
 test "openWorkFrom finds the repo root from a nested subdirectory" {
     const io = std.testing.io;
