@@ -86,6 +86,11 @@ pub const peer_id_len = 8;
 pub const RoomTag = [room_tag_len]u8;
 pub const PeerId = [peer_id_len]u8;
 
+pub const Addr = struct {
+    ip: [4]u8,
+    port: u16,
+};
+
 /// The public label for a room, derived from its secret.
 ///
 /// This is what travels in the beacon, and it is a one-way function of the
@@ -400,6 +405,7 @@ pub const Frontier = struct {
     mutex: std.Io.Mutex = .init,
     present: OidSet = .empty,
     settled: OidSet = .empty,
+    thin: bool = false,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator) Frontier {
         return .{ .io = io, .alloc = alloc };
@@ -518,7 +524,8 @@ pub const Frontier = struct {
                     }
                 },
                 .blob => {
-                    const raw = st.readRaw(node.id) catch continue;
+                    if (self.thin) continue;
+                    const raw = st.readRawLocal(node.id) catch continue;
                     defer st.alloc.free(raw);
                     const b = object.Blob.decode(st.alloc, raw) catch continue;
                     defer st.alloc.free(b.chunks);
@@ -991,9 +998,11 @@ pub const Roster = struct {
     me: PeerId,
     /// Everyone it can see, `me` included.
     peers: []PeerId,
+    addrs: []?Addr,
 
     pub fn deinit(self: Roster, alloc: std.mem.Allocator) void {
         alloc.free(self.peers);
+        alloc.free(self.addrs);
     }
 };
 
@@ -1007,18 +1016,43 @@ pub fn writeRoster(
     peers: []const PeerId,
     now_ms: i64,
 ) !void {
+    const none = try alloc.alloc(?Addr, peers.len);
+    defer alloc.free(none);
+    @memset(none, null);
+    try writeRosterWith(store, alloc, me, peers, none, now_ms);
+}
+
+pub fn writeRosterWith(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    me: PeerId,
+    peers: []const PeerId,
+    addrs: []const ?Addr,
+    now_ms: i64,
+) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
     var hex: [peer_id_len * 2]u8 = undefined;
     try out.print(alloc, "self {s} {d}\n", .{ peerHex(me, &hex), now_ms });
-    for (peers) |p| {
+    for (peers, addrs) |p, a| {
         if (std.mem.eql(u8, &p, &me)) continue;
-        try out.print(alloc, "peer {s} {d}\n", .{ peerHex(p, &hex), now_ms });
+        try out.print(alloc, "peer {s} {d}", .{ peerHex(p, &hex), now_ms });
+        if (a) |addr| {
+            try out.print(alloc, " {d}.{d}.{d}.{d}:{d}", .{ addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port });
+        }
+        try out.append(alloc, '\n');
     }
 
     store.root.createDirPath(store.io, "mesh") catch {};
     try store.root.writeFile(store.io, .{ .sub_path = roster_path, .data = out.items });
+}
+
+fn parseAddr(text: []const u8) ?Addr {
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return null;
+    const ip4 = net.Ip4Address.parse(text[0..colon], port) catch return null;
+    return .{ .ip = ip4.bytes, .port = port };
 }
 
 pub fn clearRoster(store: *Store) void {
@@ -1045,6 +1079,8 @@ pub fn readRoster(store: *Store, alloc: std.mem.Allocator, now_ms: i64) ?Roster 
     var me: ?PeerId = null;
     var peers: std.ArrayList(PeerId) = .empty;
     errdefer peers.deinit(alloc);
+    var addrs: std.ArrayList(?Addr) = .empty;
+    errdefer addrs.deinit(alloc);
 
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |raw| {
@@ -1059,25 +1095,36 @@ pub fn readRoster(store: *Store, alloc: std.mem.Allocator, now_ms: i64) ?Roster 
         if (id_hex.len != peer_id_len * 2) continue;
         var id: PeerId = undefined;
         _ = std.fmt.hexToBytes(&id, id_hex) catch continue;
+        const addr: ?Addr = if (it.next()) |a| parseAddr(a) else null;
 
         if (std.mem.eql(u8, tag, "self")) {
             me = id;
             peers.append(alloc, id) catch continue;
+            addrs.append(alloc, null) catch continue;
         } else if (std.mem.eql(u8, tag, "peer")) {
             peers.append(alloc, id) catch continue;
+            addrs.append(alloc, addr) catch continue;
         }
     }
 
     // Without a fresh `self` line there is no local peer to rank, so there is
     // nothing to decide and the caller must behave as it always did.
-    if (me == null) {
+    if (me == null or peers.items.len != addrs.items.len) {
         peers.deinit(alloc);
+        addrs.deinit(alloc);
         return null;
     }
-    return .{ .me = me.?, .peers = peers.toOwnedSlice(alloc) catch {
+    const peer_list = peers.toOwnedSlice(alloc) catch {
         peers.deinit(alloc);
+        addrs.deinit(alloc);
         return null;
-    } };
+    };
+    const addr_list = addrs.toOwnedSlice(alloc) catch {
+        alloc.free(peer_list);
+        addrs.deinit(alloc);
+        return null;
+    };
+    return .{ .me = me.?, .peers = peer_list, .addrs = addr_list };
 }
 
 // --- one link to one peer ---
@@ -1116,6 +1163,7 @@ pub const Link = struct {
     /// to repeat itself. Touched only by this link's read loop.
     peer_tips: []Oid = &.{},
     peer_ops: []Oid = &.{},
+    addr: ?Addr = null,
     rtt_us: std.atomic.Value(u64) = .init(0),
     sent: std.atomic.Value(u64) = .init(0),
     received: std.atomic.Value(u64) = .init(0),
@@ -1160,7 +1208,7 @@ pub const Link = struct {
             raws.deinit(alloc);
         }
         for (ids) |o| {
-            const raw = self.mesh.st.readRaw(o) catch continue;
+            const raw = self.mesh.st.readRawLocal(o) catch continue;
             try raws.append(alloc, raw);
         }
         _ = self.sent.fetchAdd(raws.items.len, .monotonic);
@@ -1335,6 +1383,7 @@ pub const Mesh = struct {
     /// Peers already linked, so a beacon that keeps arriving does not keep
     /// opening connections to the same machine.
     known: std.AutoHashMapUnmanaged(PeerId, i64) = .empty,
+    heard: std.AutoHashMapUnmanaged(PeerId, Addr) = .empty,
     /// Objects already handed to the mesh, so a store that is legitimately
     /// short of something does not re-announce the same metadata forever.
     pushed: OidSet = .empty,
@@ -1365,6 +1414,7 @@ pub const Mesh = struct {
             .tcp_port = server.socket.address.getPort(),
         };
 
+        m.frontier.thin = st.thin;
         try m.frontier.seed(st);
         try m.verdicts.seed(st);
         return m;
@@ -1398,6 +1448,7 @@ pub const Mesh = struct {
         clearRoster(self.st);
 
         self.known.deinit(self.alloc);
+        self.heard.deinit(self.alloc);
         self.pushed.deinit(self.alloc);
         self.frontier.deinit();
         self.verdicts.deinit();
@@ -1437,15 +1488,21 @@ pub const Mesh = struct {
         const alloc = self.alloc;
         var peers: std.ArrayList(PeerId) = .empty;
         defer peers.deinit(alloc);
+        var addrs: std.ArrayList(?Addr) = .empty;
+        defer addrs.deinit(alloc);
 
         self.lockLinks();
         for (self.links.items) |l| {
             if (!l.alive.load(.acquire)) continue;
             peers.append(alloc, l.peer) catch continue;
+            addrs.append(alloc, l.addr orelse self.heard.get(l.peer)) catch {
+                _ = peers.pop();
+                continue;
+            };
         }
         self.unlockLinks();
 
-        writeRoster(self.st, alloc, self.me, peers.items, nowMillis(self.io)) catch {};
+        writeRosterWith(self.st, alloc, self.me, peers.items, addrs.items, nowMillis(self.io)) catch {};
     }
 
     pub fn beacon(self: *Mesh) Beacon {
@@ -1600,7 +1657,7 @@ pub const Mesh = struct {
             self.pushed_mutex.unlock(self.io);
             if (already) continue;
 
-            const raw = self.st.readRaw(o) catch continue;
+            const raw = self.st.readRawLocal(o) catch continue;
             errdefer self.alloc.free(raw);
             if (budget) |b| b.* -|= raw.len;
             try into.append(self.alloc, raw);
@@ -1640,7 +1697,7 @@ pub const Mesh = struct {
     /// hold each other's closure, so an update needs to carry only what has
     /// happened since. Skipping it and relying on gossip alone would mean a peer
     /// joining an old repo learns its history one edit at a time, or never.
-    fn establish(self: *Mesh, conn: *wormhole.Conn, dialing: bool) !void {
+    fn establish(self: *Mesh, conn: *wormhole.Conn, dialing: bool, addr: ?Addr) !void {
         const io = self.io;
         const alloc = self.alloc;
 
@@ -1658,6 +1715,7 @@ pub const Mesh = struct {
             .conn = conn,
             .wire = sync.Wire.init(io, alloc, conn.channel(), session),
             .peer = std.mem.zeroes(PeerId),
+            .addr = addr,
         };
 
         var me_hex: [peer_id_len * 2]u8 = undefined;
@@ -1666,6 +1724,7 @@ pub const Mesh = struct {
             .scope = self.opts.scope,
             .peer = &me_hex,
             .now_ms = nowMillis(io),
+            .thin = self.st.thin,
         };
 
         self.lockStore();
@@ -1726,17 +1785,23 @@ pub const Mesh = struct {
         for (w.bulk) |o| try self.pushed.put(alloc, o.bytes, {});
     }
 
-    fn dial(self: *Mesh, address: net.IpAddress) void {
-        var target = address;
+    fn dial(self: *Mesh, addr: Addr) void {
+        var target: net.IpAddress = .{ .ip4 = .{ .bytes = addr.ip, .port = addr.port } };
         const stream = target.connect(self.io, .{ .mode = .stream, .protocol = .tcp }) catch return;
         const conn = wormhole.Conn.adopt(self.io, self.alloc, stream) catch {
             stream.close(self.io);
             return;
         };
-        self.establish(conn, true) catch {
+        self.establish(conn, true, addr) catch {
             conn.destroy();
             return;
         };
+    }
+
+    fn noteHeard(self: *Mesh, peer: PeerId, addr: Addr) void {
+        self.lockLinks();
+        defer self.unlockLinks();
+        self.heard.put(self.alloc, peer, addr) catch {};
     }
 
     /// Whether this end is the one that dials.
@@ -1816,7 +1881,7 @@ pub const Mesh = struct {
             // Handled inline rather than on a spawned thread: a join is rare,
             // and a connection whose lifetime outlives the loop that made it is
             // the shape that turns a shutdown into a use-after-free.
-            self.establish(conn, false) catch {
+            self.establish(conn, false, null) catch {
                 conn.destroy();
                 continue;
             };
@@ -1840,11 +1905,13 @@ pub const Mesh = struct {
             const heard = listener.next(250) orelse continue;
             if (!std.mem.eql(u8, &heard.beacon.room, &self.room)) continue;
             if (std.mem.eql(u8, &heard.beacon.peer, &self.me)) continue;
+            const addr = Addr{ .ip = heard.ip, .port = heard.beacon.tcp_port };
+            self.noteHeard(heard.beacon.peer, addr);
             if (!self.shouldDial(heard.beacon.peer)) continue;
             if (self.alreadyLinked(heard.beacon.peer)) continue;
             if (self.recentlySeen(heard.beacon.peer, nowMillis(self.io), 2_000)) continue;
 
-            self.dial(.{ .ip4 = .{ .bytes = heard.ip, .port = heard.beacon.tcp_port } });
+            self.dial(addr);
         }
     }
 
@@ -1857,7 +1924,11 @@ pub const Mesh = struct {
             for (self.opts.seeds) |seed| {
                 if (self.stop.load(.acquire)) return;
                 const conn = wormhole.Conn.open(self.io, self.alloc, seed.host, seed.port) catch continue;
-                self.establish(conn, true) catch {
+                const addr: ?Addr = if (net.Ip4Address.parse(seed.host, seed.port)) |ip4|
+                    .{ .ip = ip4.bytes, .port = seed.port }
+                else |_|
+                    null;
+                self.establish(conn, true, addr) catch {
                     conn.destroy();
                     continue;
                 };

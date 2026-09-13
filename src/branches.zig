@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const workspace = @import("workspace.zig");
+const lazy = @import("lazy.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -52,10 +53,14 @@ pub fn create(store: *Store, name: []const u8) !void {
 /// state; the CLI layer will auto-snapshot before switching.
 pub fn switchTo(store: *Store, work_dir: std.Io.Dir, name: []const u8) !void {
     const from_tree = headTree(store);
-    try store.setHeadBranch(name);
-    if (!store.refExists(name)) return; // unborn branch: nothing to materialize
+    if (!store.refExists(name)) {
+        try store.setHeadBranch(name);
+        return; // unborn branch: nothing to materialize
+    }
     const change = try store.readChange(try store.readRef(name));
     defer object.freeChange(store.alloc, change);
+    try lazy.ensureTree(store, change.tree);
+    try store.setHeadBranch(name);
     try workspace.checkout(store, work_dir, from_tree, change.tree);
 }
 

@@ -9,6 +9,7 @@ const branches = @import("branches.zig");
 const workspace = @import("workspace.zig");
 const readset = @import("readset.zig");
 const tracer = @import("tracer.zig");
+const lazy = @import("lazy.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -482,6 +483,7 @@ pub fn reconcile(
     var want = std.StringHashMap(Oid).init(alloc);
     defer want.deinit();
     for (entries) |e| try want.put(e.path, e.blob);
+    try lazy.ensureEntries(store, entries);
 
     // Delete tracked paths the target does not have. The clone's own tracked
     // set is whatever `captureEntries` sees in it.

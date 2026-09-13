@@ -170,6 +170,7 @@ pub const HelloFrame = struct {
     scope: []const u8,
     /// True when this end opens the session as the author.
     writer: bool,
+    thin: bool = false,
 };
 
 /// One branch tip as it crosses the wire.
@@ -274,6 +275,7 @@ pub fn encode(alloc: std.mem.Allocator, msg: Message) ![]u8 {
             try body.putU16(@intCast(f.scope.len));
             try body.bytes(f.scope);
             try body.byte(@intFromBool(f.writer));
+            try body.byte(@intFromBool(f.thin));
         },
         .inventory => |f| {
             try body.putU32(@intCast(f.refs.len));
@@ -392,11 +394,13 @@ pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !Message {
             errdefer alloc.free(scope);
             const flag = (try body.slice(1))[0];
             if (flag > 1) return Error.BadFrame;
+            const thin = if (body.remaining() > 0) (try body.slice(1))[0] == 1 else false;
             return .{ .hello = .{
                 .version = version,
                 .peer = peer,
                 .scope = scope,
                 .writer = flag == 1,
+                .thin = thin,
             } };
         },
         .inventory => {

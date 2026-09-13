@@ -341,6 +341,52 @@ pub fn fetchInto(
     return tip;
 }
 
+pub const Filled = struct {
+    objects: usize = 0,
+    bytes: u64 = 0,
+};
+
+pub fn fetchObjects(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    remote: []const u8,
+    into: ?*Store,
+    ids: []const Oid,
+    held: ?[]bool,
+) !Filled {
+    const fetched = try fetchDefault(allocator, io, remote);
+    defer fetched.deinit(allocator);
+
+    const stamp = std.Io.Clock.real.now(io).nanoseconds;
+    const temporary_name = try std.fmt.allocPrint(allocator, ".sdt-carrier-{d}", .{stamp});
+    defer allocator.free(temporary_name);
+    const current_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(current_path);
+    const temporary_path = try std.fs.path.resolve(allocator, &.{ current_path, temporary_name });
+    defer allocator.free(temporary_path);
+    defer std.Io.Dir.cwd().deleteTree(io, temporary_path) catch {};
+    try restore(allocator, io, temporary_path, fetched);
+    var source_directory = try std.Io.Dir.openDirAbsolute(io, temporary_path, .{});
+    defer source_directory.close(io);
+    var restored_store = try Store.open(io, allocator, source_directory);
+    defer restored_store.deinit();
+
+    var out: Filled = .{};
+    for (ids, 0..) |o, i| {
+        const has = restored_store.has(o);
+        if (held) |h| h[i] = has;
+        if (!has) continue;
+        const dst = into orelse continue;
+        if (dst.has(o)) continue;
+        const raw = try restored_store.readRawLocal(o);
+        defer allocator.free(raw);
+        _ = try dst.writeRaw(raw);
+        out.objects += 1;
+        out.bytes += raw.len;
+    }
+    return out;
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 

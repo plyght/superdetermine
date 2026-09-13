@@ -6,6 +6,7 @@ const moment = @import("moment.zig");
 const opdag = @import("opdag.zig");
 const branches = @import("branches.zig");
 const config = @import("config.zig");
+const lazy = @import("lazy.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -48,10 +49,12 @@ pub const Stats = struct {
     swept: usize,
     bytes_freed: u64,
     kept: usize,
+    thinned: usize = 0,
+    thinned_bytes: u64 = 0,
 };
 
 fn markChunks(store: *Store, marked: *Marked, o: Oid) !void {
-    const raw = store.readRaw(o) catch return;
+    const raw = store.readRawLocal(o) catch return;
     defer store.alloc.free(raw);
     const blob = object.Blob.decode(store.alloc, raw) catch return;
     defer store.alloc.free(blob.chunks);
@@ -82,7 +85,7 @@ fn markObject(store: *Store, marked: *Marked, root: Oid) !void {
             defer object.freeTree(store.alloc, tree);
             for (tree.entries) |e| {
                 if ((try marked.getOrPut(e.blob.bytes)).found_existing) continue;
-                const raw = try store.readRaw(e.blob);
+                const raw = store.readRawLocal(e.blob) catch continue;
                 defer store.alloc.free(raw);
                 const blob = object.Blob.decode(store.alloc, raw) catch continue;
                 defer store.alloc.free(blob.chunks);
@@ -92,11 +95,14 @@ fn markObject(store: *Store, marked: *Marked, root: Oid) !void {
     }
 }
 
-pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
+pub fn mark(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Marked {
     const io = store.io;
+    const was_thin = store.thin;
+    store.thin = false;
+    defer store.thin = was_thin;
 
     var marked = Marked.init(alloc);
-    defer marked.deinit();
+    errdefer marked.deinit();
 
     const names = try branches.list(store, alloc);
     defer {
@@ -169,8 +175,26 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
             for (r.tips) |t| try markObject(store, &marked, t);
         }
     }
+    return marked;
+}
+
+pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
+    const io = store.io;
+    const was_thin = store.thin;
+    var marked = try mark(store, alloc, dry_run);
+    defer marked.deinit();
+    store.thin = false;
+    defer store.thin = was_thin;
 
     var stats: Stats = .{ .swept = 0, .bytes_freed = 0, .kept = 0 };
+
+    var remote: ?std.AutoHashMap([Oid.len]u8, void) = null;
+    defer if (remote) |*r| r.deinit();
+    if (was_thin) {
+        store.thin = true;
+        remote = lazy.droppable(store, alloc, &marked) catch null;
+        store.thin = false;
+    }
 
     var objects = try store.root.openDir(io, "objects", .{ .iterate = true });
     defer objects.close(io);
@@ -193,7 +217,8 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
             @memcpy(hex[2..], entry.name);
             const o = Oid.fromHex(&hex) catch continue;
 
-            if (marked.contains(o.bytes)) {
+            const thinnable = if (remote) |r| r.contains(o.bytes) else false;
+            if (marked.contains(o.bytes) and !thinnable) {
                 stats.kept += 1;
                 continue;
             }
@@ -202,11 +227,17 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
             if (!dry_run) {
                 shard_dir.deleteFile(io, entry.name) catch continue;
             }
-            stats.swept += 1;
-            stats.bytes_freed += size;
+            if (thinnable) {
+                stats.thinned += 1;
+                stats.thinned_bytes += size;
+            } else {
+                stats.swept += 1;
+                stats.bytes_freed += size;
+            }
         }
     }
 
+    if (was_thin and !dry_run) lazy.pruneHydrated(store, alloc) catch {};
     return stats;
 }
 
@@ -227,6 +258,15 @@ pub fn run(store: *Store, alloc: std.mem.Allocator, out: *std.Io.Writer, dry_run
         try out.print("gc: would remove {d} objects, free {s} (kept {d})\n", .{ stats.swept, human, stats.kept });
     } else {
         try out.print("gc: removed {d} objects, freed {s} (kept {d})\n", .{ stats.swept, human, stats.kept });
+    }
+    if (store.thin) {
+        var tbuf: [32]u8 = undefined;
+        const thinned = formatBytes(stats.thinned_bytes, &tbuf);
+        if (dry_run) {
+            try out.print("gc: thin, would drop {d} chunks a source holds, {s}\n", .{ stats.thinned, thinned });
+        } else {
+            try out.print("gc: thin, dropped {d} chunks a source holds, {s}\n", .{ stats.thinned, thinned });
+        }
     }
 }
 

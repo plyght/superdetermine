@@ -7,6 +7,7 @@ const ignore = @import("ignore.zig");
 const idx = @import("index.zig");
 const keyring = @import("keyring.zig");
 const seal = @import("seal.zig");
+const lazy = @import("lazy.zig");
 const Oid = oid.Oid;
 
 fn appendFile(
@@ -282,6 +283,7 @@ pub fn checkout(store: *Store, dest_dir: std.Io.Dir, from_tree: ?Oid, to_tree: O
 
     const target = try store.readTree(to_tree);
     defer object.freeTree(alloc, target);
+    try lazy.ensureEntries(store, target.entries);
 
     var previous: ?object.Tree = null;
     defer if (previous) |p| object.freeTree(alloc, p);
@@ -366,6 +368,7 @@ pub fn restoreFile(store: *Store, work_dir: std.Io.Dir, rel_path: []const u8) !v
 
     for (tree.entries) |e| {
         if (std.mem.eql(u8, e.path, rel_path)) {
+            try lazy.ensureEntries(store, &[_]object.TreeEntry{e});
             if (e.mode == .sealed) {
                 const k = (try keyring.currentKey(store, work_dir)) orelse return seal.Error.NotAMember;
                 return writeUnsealed(store, work_dir, e, k);

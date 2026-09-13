@@ -4,6 +4,7 @@ const oid = @import("oid.zig");
 const object = @import("object.zig");
 const cdc = @import("cdc.zig");
 const config = @import("config.zig");
+const lazy = @import("lazy.zig");
 const Oid = oid.Oid;
 
 /// The on-disk content-addressed store, rooted at `.sdt/`.
@@ -84,11 +85,13 @@ pub const Store = struct {
     gear: ?cdc.GearTable = null,
     durability: Durability = .strict,
     compress: ?bool = null,
+    thin: bool = false,
 
     pub const Error = error{
         NotARepo,
         RepoExists,
         ObjectNotFound,
+        ContentUnavailable,
         CorruptObject,
         RefNotFound,
         InvalidRef,
@@ -117,7 +120,19 @@ pub const Store = struct {
         var s: Store = .{ .io = io, .alloc = alloc, .root = root };
         s.gear = loadGear(io, root);
         s.durability = loadDurability(&s, alloc);
+        s.thin = loadThin(&s, alloc);
         return s;
+    }
+
+    fn loadThin(self: *Store, alloc: std.mem.Allocator) bool {
+        var out = false;
+        if (config.get(self, alloc, lazy.thin_key)) |maybe| {
+            if (maybe) |v| {
+                defer alloc.free(v);
+                out = lazy.boolOf(v);
+            }
+        } else |_| {}
+        return out;
     }
 
     fn loadDurability(self: *Store, alloc: std.mem.Allocator) Durability {
@@ -303,13 +318,40 @@ pub const Store = struct {
         return o;
     }
 
-    /// Read raw content by Oid. Caller frees. Errors `ObjectNotFound`.
-    pub fn readRaw(self: *Store, o: Oid) ![]u8 {
+    pub fn readRawLocal(self: *Store, o: Oid) ![]u8 {
         var buf: [80]u8 = undefined;
         const p = objectPath(o, &buf);
         const raw = self.root.readFileAlloc(self.io, p, self.alloc, .unlimited) catch
             return Error.ObjectNotFound;
         return self.unpackFromDisk(raw);
+    }
+
+    /// Read raw content by Oid. Caller frees. Errors `ObjectNotFound`.
+    pub fn readRaw(self: *Store, o: Oid) ![]u8 {
+        return self.readRawLocal(o) catch |e| switch (e) {
+            Error.ObjectNotFound => {
+                if (!self.thin) return e;
+                try lazy.fetchIds(self, &.{o}, null, null);
+                return self.readRawLocal(o);
+            },
+            else => return e,
+        };
+    }
+
+    pub fn sizeOnDisk(self: *Store, o: Oid) ?u64 {
+        var buf: [80]u8 = undefined;
+        const p = objectPath(o, &buf);
+        const st = self.root.statFile(self.io, p, .{}) catch return null;
+        return st.size;
+    }
+
+    pub fn deleteRaw(self: *Store, o: Oid) !void {
+        var buf: [80]u8 = undefined;
+        const p = objectPath(o, &buf);
+        self.root.deleteFile(self.io, p) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
     }
 
     // --- typed helpers ---
@@ -336,6 +378,7 @@ pub const Store = struct {
         defer self.alloc.free(enc);
         const blob = try object.Blob.decode(self.alloc, enc);
         defer self.alloc.free(blob.chunks);
+        if (self.thin) try lazy.ensureChunks(self, blob.chunks, null);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.alloc);
         for (blob.chunks) |co| {

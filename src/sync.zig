@@ -59,6 +59,7 @@ pub const Options = struct {
     max_rounds: u32 = 64,
     /// How long the joining end waits for a LAN announcement.
     discover_ms: u64 = 10_000,
+    thin: bool = false,
 };
 
 pub const Report = struct {
@@ -283,6 +284,17 @@ pub fn closure(
     ops: []const Oid,
     prefix: []const u8,
 ) !Closure {
+    return closureWith(st, alloc, changes, ops, prefix, true);
+}
+
+pub fn closureWith(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    changes: []const Oid,
+    ops: []const Oid,
+    prefix: []const u8,
+    chunks: bool,
+) !Closure {
     var seen = OidSet.init(alloc);
     defer seen.deinit();
 
@@ -327,7 +339,8 @@ pub fn closure(
                 }
             },
             .blob => {
-                const raw = st.readRaw(node.id) catch continue;
+                if (!chunks) continue;
+                const raw = st.readRawLocal(node.id) catch continue;
                 defer st.alloc.free(raw);
                 const b = object.Blob.decode(st.alloc, raw) catch continue;
                 defer st.alloc.free(b.chunks);
@@ -367,6 +380,16 @@ pub fn objectsToSend(
     peer_objects: []const Oid,
     prefix: []const u8,
 ) ![]Oid {
+    return objectsToSendWith(st, alloc, peer_objects, prefix, true);
+}
+
+pub fn objectsToSendWith(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    peer_objects: []const Oid,
+    prefix: []const u8,
+    chunks: bool,
+) ![]Oid {
     const refs = try localRefs(st, alloc);
     defer freeRefs(alloc, refs);
     const tips = try tipsOf(alloc, refs);
@@ -374,7 +397,7 @@ pub fn objectsToSend(
     const ops = try opdag.heads(st, alloc);
     defer alloc.free(ops);
 
-    const c = try closure(st, alloc, tips, ops, prefix);
+    const c = try closureWith(st, alloc, tips, ops, prefix, chunks);
     defer c.deinit(alloc);
 
     var theirs = OidSet.init(alloc);
@@ -397,7 +420,18 @@ pub fn missingFor(
     peer_heads: []const Oid,
     prefix: []const u8,
 ) ![]Oid {
-    const c = try closure(st, alloc, peer_tips, peer_heads, prefix);
+    return missingForWith(st, alloc, peer_tips, peer_heads, prefix, true);
+}
+
+pub fn missingForWith(
+    st: *Store,
+    alloc: std.mem.Allocator,
+    peer_tips: []const Oid,
+    peer_heads: []const Oid,
+    prefix: []const u8,
+    chunks: bool,
+) ![]Oid {
+    const c = try closureWith(st, alloc, peer_tips, peer_heads, prefix, chunks);
     defer alloc.free(c.have);
     return c.missing;
 }
@@ -529,6 +563,8 @@ const Party = struct {
     refused: OidSet,
     sent: usize = 0,
     received: usize = 0,
+    thin: bool = false,
+    peer_thin: bool = false,
 
     fn init(st: *Store, alloc: std.mem.Allocator, wire: *Wire, scope: []const u8) Party {
         return .{
@@ -545,7 +581,7 @@ const Party = struct {
     }
 
     fn wants(self: *Party, tips: []const Oid, heads: []const Oid) ![]Oid {
-        const raw = try missingFor(self.st, self.alloc, tips, heads, self.scope);
+        const raw = try missingForWith(self.st, self.alloc, tips, heads, self.scope, !self.thin);
         defer self.alloc.free(raw);
 
         var out: std.ArrayList(Oid) = .empty;
@@ -577,10 +613,14 @@ const Party = struct {
         } });
     }
 
+    fn bulk(self: *Party, peer_objects: []const Oid) ![]Oid {
+        return objectsToSendWith(self.st, self.alloc, peer_objects, self.scope, !self.peer_thin);
+    }
+
     fn sendPack(self: *Party, ids: []const Oid) !void {
         try self.wire.send(.{ .pack = .{ .count = @intCast(ids.len) } });
         for (ids) |o| {
-            const raw = self.st.readRaw(o) catch continue;
+            const raw = self.st.readRawLocal(o) catch continue;
             defer self.st.alloc.free(raw);
             try self.wire.send(.{ .object = .{ .raw = raw } });
             self.sent += 1;
@@ -654,6 +694,7 @@ pub fn initiate(st: *Store, alloc: std.mem.Allocator, wire: *Wire, opts: Options
         .peer = opts.peer,
         .scope = opts.scope,
         .writer = true,
+        .thin = opts.thin,
     } });
 
     const hello = try wire.expect(alloc, .hello);
@@ -669,6 +710,8 @@ pub fn initiate(st: *Store, alloc: std.mem.Allocator, wire: *Wire, opts: Options
 
     var party = Party.init(st, alloc, wire, report.scope);
     defer party.deinit();
+    party.thin = opts.thin;
+    party.peer_thin = hello.hello.thin;
 
     try party.sendInventory();
     const inv = try takeInventory(alloc, wire);
@@ -687,7 +730,7 @@ pub fn initiate(st: *Store, alloc: std.mem.Allocator, wire: *Wire, opts: Options
     _ = try party.recvPack();
 
     {
-        const bulk = try objectsToSend(st, alloc, peer.objects, party.scope);
+        const bulk = try party.bulk(peer.objects);
         defer alloc.free(bulk);
         try party.sendPack(bulk);
     }
@@ -744,10 +787,13 @@ pub fn respond(st: *Store, alloc: std.mem.Allocator, wire: *Wire, opts: Options)
         .peer = opts.peer,
         .scope = report.scope,
         .writer = false,
+        .thin = opts.thin,
     } });
 
     var party = Party.init(st, alloc, wire, report.scope);
     defer party.deinit();
+    party.thin = opts.thin;
+    party.peer_thin = hello.hello.thin;
 
     const inv = try takeInventory(alloc, wire);
     const peer = PeerState{
@@ -765,7 +811,7 @@ pub fn respond(st: *Store, alloc: std.mem.Allocator, wire: *Wire, opts: Options)
     try party.sendInventory();
 
     {
-        const bulk = try objectsToSend(st, alloc, peer.objects, party.scope);
+        const bulk = try party.bulk(peer.objects);
         defer alloc.free(bulk);
         try party.sendPack(bulk);
     }

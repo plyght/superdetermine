@@ -422,6 +422,22 @@ pub const table = [_]Setting{
         .group = "talking to other repos",
         .desc = "the room's secret; set by `sdt mesh open|join`",
     },
+    .{
+        .name = "thin",
+        .key = "store.thin",
+        .kind = .toggle,
+        .group = "talking to other repos",
+        .desc = "hold the history but only the chunks the current tree needs; the rest is fetched when read",
+        .default = "off",
+    },
+    .{
+        .name = "sources",
+        .key = "thin.sources",
+        .kind = .list,
+        .group = "talking to other repos",
+        .desc = "where a thin store fetches what it lacks: host:port of `sdt serve`, a repo path, or a share link",
+        .default = "the room's peers, then the remote",
+    },
 
     .{
         .name = "provenance",

@@ -52,6 +52,7 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | **Live multiplayer** | `sdt mesh` puts every peer in one room. Everyone is a writer, edits land on the others in milliseconds, and there is no server: peers find each other by broadcast and converge by merge. |
 | Shared verdicts | A green earned on one machine answers on every machine, because a verdict is keyed by content and not by who ran it. |
 | Sparse fetch and serve | Pull only the paths you need. A peer is just an object store, no forced server. |
+| Thin clones | `sdt clone --thin` takes the whole history and only the current tree's content. A file from an older state arrives from a peer, a served repo, or the remote the first time it is read. `sdt fetch --all` fills it in. |
 | Sealed secrets | Save your `.env` safely. Values are encrypted per-variable into a sealed tree entry; the plaintext is never an object and git never sees the path. Team access is a wrapped key, not a service. |
 | Encrypted sharing | `sdt send` hands a repo to someone peer to peer, or as a link or file no host can read. |
 
@@ -320,6 +321,23 @@ The two layers compose the way you would want: share a repo and the recipient ge
 Git interop deliberately has no share layer: GitHub sees your code so review works, and only your values stay sealed.
 
 Every command has a short alias: `sdt st`, `sdt d`, `sdt sv`, `sdt sl`, `sdt rv`. Run `sdt help` for the full table. Output is colored when stdout is a terminal and respects `NO_COLOR`.
+
+### Thin clones
+
+A clone holds every chunk of every file in history. A thin clone holds the history and the content of the tree you stand on, and nothing older:
+
+```
+sdt clone --thin 10.0.0.5:7777 repo     # from `sdt serve` there
+sdt clone --thin ../repo                # from a repo on this disk
+sdt clone --thin repo.grb#k=...         # from a bundle or a share link
+sdt clone --thin https://github.com/you/repo.git
+sdt get --thin 43-hydrant-hostel        # the same, peer to peer
+sdt mesh join --thin <secret>           # the same, in a room
+```
+
+Changes, trees, manifests, moments, verdicts and the op-log all arrive, so `sdt log`, `sdt moments` and `sdt green` work as they do in a full clone. Only the chunks are lazy. Switch to an older branch, rewind, restore a file, probe a state, or grade a clone, and the chunks that state needs are fetched on the way, in one batch, with one dim line saying how many arrived and from where. The sources are tried in order: peers in the room, then `sources` (a `host:port`, a repo path, a share link), then the remote's carrier. Offline with nothing to fetch from, the command names the file and every source it tried, and exits 12.
+
+`sdt config thin on` makes any clone thin: the next `sdt gc` drops chunks outside the current tree, but only ones a source is known to hold. `sdt fetch --all` goes the other way and turns thin off. `sdt doctor` shows how many chunks are held against how many the history references. A chunk that is not here is not garbage, it is remote: `gc` keeps every manifest that names it.
 
 ## Multiplayer, with nobody in the middle
 

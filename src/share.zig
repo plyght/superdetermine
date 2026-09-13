@@ -354,13 +354,15 @@ fn obtain(st: *Store, alloc: std.mem.Allocator, src: anytype, o: Oid) ![]u8 {
     return raw;
 }
 
-fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const Ref) !void {
+fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const Ref, thin: bool) !void {
     var seen = Seen.init(alloc);
     defer seen.deinit();
 
     var stack: std.ArrayList(Oid) = .empty;
     defer stack.deinit(alloc);
     for (refs) |r| try stack.append(alloc, r.target);
+
+    const head_change: ?Oid = if (thin) refs[headRefIndex(st, refs)].target else null;
 
     while (stack.pop()) |o| {
         if (o.isZero()) continue;
@@ -372,16 +374,20 @@ fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const
         defer object.freeChange(alloc, change);
         for (change.parents) |p| try stack.append(alloc, p);
 
-        if ((try seen.getOrPut(change.tree.bytes)).found_existing) continue;
+        const with_chunks = if (head_change) |h| h.eql(o) else true;
+        if (!with_chunks and seen.contains(change.tree.bytes)) continue;
+        try seen.put(change.tree.bytes, {});
         const tree_raw = try obtain(st, alloc, src, change.tree);
         defer alloc.free(tree_raw);
         const tree = try object.Tree.decode(alloc, tree_raw);
         defer object.freeTree(alloc, tree);
 
         for (tree.entries) |e| {
-            if ((try seen.getOrPut(e.blob.bytes)).found_existing) continue;
+            if (!with_chunks and seen.contains(e.blob.bytes)) continue;
+            try seen.put(e.blob.bytes, {});
             const blob_raw = try obtain(st, alloc, src, e.blob);
             defer alloc.free(blob_raw);
+            if (!with_chunks) continue;
             const blob = try object.Blob.decode(alloc, blob_raw);
             defer alloc.free(blob.chunks);
             for (blob.chunks) |c| {
@@ -394,6 +400,16 @@ fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const
 
     for (refs) |r| try st.updateRef(r.name, r.target);
     try adoptHead(st, refs);
+}
+
+fn headRefIndex(st: *Store, refs: []const Ref) usize {
+    const head = st.headBranch() catch return 0;
+    defer st.alloc.free(head);
+    for (refs, 0..) |r, i| if (std.mem.eql(u8, r.name, head)) return i;
+    const preferred = config.defaultBranch(st.io, st.alloc) catch return 0;
+    defer st.alloc.free(preferred);
+    for (refs, 0..) |r, i| if (std.mem.eql(u8, r.name, preferred)) return i;
+    return 0;
 }
 
 fn adoptHead(st: *Store, refs: []const Ref) !void {
@@ -712,6 +728,7 @@ pub const Opened = struct {
             parsed: ParsedUrl,
         },
     },
+    owned_bytes: ?[]u8 = null,
 
     pub fn deinit(self: *Opened, alloc: std.mem.Allocator) void {
         alloc.free(self.root_text);
@@ -719,6 +736,7 @@ pub const Opened = struct {
             .bundle => |*map| map.deinit(),
             .http => |h| h.parsed.deinit(alloc),
         }
+        if (self.owned_bytes) |b| alloc.free(b);
     }
 
     pub fn kind(self: *const Opened) Kind {
@@ -727,6 +745,13 @@ pub const Opened = struct {
 
     pub fn state(self: *const Opened, alloc: std.mem.Allocator) !?State {
         return parseStateRoot(alloc, self.root_text);
+    }
+
+    pub fn holds(self: *const Opened, o: Oid) bool {
+        return switch (self.source) {
+            .bundle => |map| map.contains(blindedRaw(self.nk, o)),
+            .http => false,
+        };
     }
 
     fn fetch(self: *const Opened, alloc: std.mem.Allocator, o: Oid) ![]u8 {
@@ -801,6 +826,10 @@ pub fn openBundle(
 }
 
 pub fn importOpened(st: *Store, alloc: std.mem.Allocator, opened: *const Opened) !Received {
+    return importOpenedWith(st, alloc, opened, false);
+}
+
+pub fn importOpenedWith(st: *Store, alloc: std.mem.Allocator, opened: *const Opened, thin: bool) !Received {
     if (try parseStateRoot(alloc, opened.root_text)) |state| {
         errdefer state.deinit(alloc);
         try importTree(st, alloc, opened, state.tree);
@@ -808,8 +837,46 @@ pub fn importOpened(st: *Store, alloc: std.mem.Allocator, opened: *const Opened)
     }
     const refs = try parseRoot(alloc, opened.root_text);
     defer freeRefs(alloc, refs);
-    try importGraph(st, alloc, opened, refs);
+    try importGraph(st, alloc, opened, refs, thin);
     return .refs;
+}
+
+pub const Fetched = struct {
+    objects: usize = 0,
+    bytes: u64 = 0,
+};
+
+pub fn fetchObjects(st: *Store, alloc: std.mem.Allocator, opened: *const Opened, ids: []const Oid) !Fetched {
+    var out: Fetched = .{};
+    for (ids) |o| {
+        if (st.has(o)) continue;
+        const raw = opened.fetch(alloc, o) catch |e| switch (e) {
+            Error.BadBundle, Error.HttpStatus => continue,
+            else => return e,
+        };
+        defer alloc.free(raw);
+        _ = try st.writeRaw(raw);
+        out.objects += 1;
+        out.bytes += raw.len;
+    }
+    return out;
+}
+
+pub fn openSource(alloc: std.mem.Allocator, io: std.Io, source: []const u8) !Opened {
+    if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://")) {
+        return openHttp(alloc, io, source);
+    }
+    const cut = std.mem.indexOf(u8, source, "#k=") orelse return Error.BadUrl;
+    const encoded = source[cut + "#k=".len ..];
+    var key: ShareKey = undefined;
+    const n = b64.Decoder.calcSizeForSlice(encoded) catch return Error.BadUrl;
+    if (n != key_len) return Error.BadUrl;
+    b64.Decoder.decode(&key, encoded) catch return Error.BadUrl;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, source[0..cut], alloc, .unlimited);
+    errdefer alloc.free(bytes);
+    var opened = try openBundle(alloc, key, bytes);
+    opened.owned_bytes = bytes;
+    return opened;
 }
 
 pub fn importBundle(

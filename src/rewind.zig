@@ -5,6 +5,7 @@ const moment = @import("moment.zig");
 const checks = @import("checks.zig");
 const oplog = @import("oplog.zig");
 const workspace = @import("workspace.zig");
+const lazy = @import("lazy.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -160,6 +161,13 @@ fn applyPartial(
 ) !void {
     const io = store.io;
     const alloc = store.alloc;
+
+    var chosen: std.ArrayList(object.TreeEntry) = .empty;
+    defer chosen.deinit(alloc);
+    for (target) |e| {
+        if (selected(paths, e.path)) try chosen.append(alloc, e);
+    }
+    try lazy.ensureEntries(store, chosen.items);
 
     var want = std.StringHashMap(Oid).init(alloc);
     defer want.deinit();

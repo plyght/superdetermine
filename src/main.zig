@@ -61,6 +61,7 @@ const worktrees = @import("worktrees.zig");
 const transfer = @import("transfer.zig");
 const stack = @import("stack.zig");
 const resolution = @import("resolution.zig");
+const lazy = @import("lazy.zig");
 const ipnet = std.Io.net;
 
 const Oid = oid.Oid;
@@ -163,21 +164,21 @@ const sections = [_]Section{
         .{ .name = "send", .args = "<ref>", .desc = "one exact state, with its check and verdict" },
         .{ .name = "send --file", .args = "<f>", .desc = "one sealed file, no network at all" },
         .{ .name = "send --link", .args = "<dir>", .desc = "static files you upload anywhere" },
-        .{ .name = "get", .alias = "g", .args = "<code|url|file>", .desc = "the other side of all three" },
+        .{ .name = "get", .alias = "g", .args = "<code|url|file> [--thin]", .desc = "the other side of all three" },
         .{ .name = "relay", .alias = "rv", .desc = "run a meeting point for internet transfers" },
     } },
     .{ .title = "distributed (no forced server)", .entries = &.{
         .{ .name = "mesh", .alias = "mp", .desc = "live multiplayer: every peer a writer, no server" },
         .{ .name = "mesh open", .desc = "start a room here and print its secret" },
-        .{ .name = "mesh join", .args = "<secret>", .desc = "join the room that secret names" },
+        .{ .name = "mesh join", .args = "<secret> [--thin]", .desc = "join the room that secret names" },
         .{ .name = "serve", .alias = "srv", .args = "[port]", .desc = "share this repo's objects over TCP" },
         .{ .name = "serve --link", .args = "<dir>", .desc = "host a `send --link` export over HTTP" },
-        .{ .name = "fetch", .alias = "f", .args = "<src>", .desc = "sparse-pull a branch" },
+        .{ .name = "fetch", .alias = "f", .args = "<src> | --all", .desc = "sparse-pull a branch; --all fills a thin store" },
         .{ .name = "watch", .desc = "experimental: auto-save on every change" },
         .{ .name = "hook", .args = "[install]", .desc = "tell a coding agent whether its work passed" },
     } },
     .{ .title = "git, side by side", .entries = &.{
-        .{ .name = "clone", .alias = "cl", .args = "<src> [dir]", .desc = "a git repo, a share URL, or a bundle" },
+        .{ .name = "clone", .alias = "cl", .args = "<src> [dir] [--thin]", .desc = "a git repo, a share URL, a bundle, a served host:port, or a repo path" },
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
         .{ .name = "export", .args = "<repo> [--force]", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
@@ -399,8 +400,31 @@ pub fn main(init: std.process.Init) !void {
     run(init) catch |e| switch (e) {
         error.WriteFailed => return,
         error.InvalidUsage => std.process.exit(2),
+        error.ContentUnavailable => {
+            reportUnavailable(init.io);
+            std.process.exit(lazy.exit_code);
+        },
         else => return e,
     };
+}
+
+fn reportUnavailable(io: std.Io) void {
+    var buf: [2048]u8 = undefined;
+    var ew = std.Io.File.stderr().writer(io, &buf);
+    const e = &ew.interface;
+    var hex: [Oid.len * 2]u8 = undefined;
+    const miss = &lazy.last_miss;
+    const what = miss.path();
+    if (what.len != 0) {
+        e.print("{s}{s}{s} cannot read {s}: chunk {s} is not held here; tried {s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), what, shortHex(miss.id, &hex), miss.tried(),
+        }) catch {};
+    } else {
+        e.print("{s}{s}{s} object {s} is not held here; tried {s}\n", .{
+            ui.on(.red), ui.cross, ui.off(), shortHex(miss.id, &hex), miss.tried(),
+        }) catch {};
+    }
+    e.flush() catch {};
 }
 
 fn run(init: std.process.Init) !void {
@@ -418,6 +442,7 @@ fn run(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const w = &stdout.interface;
     ui.init(io, std.Io.File.stdout());
+    lazy.report = w;
     defer w.flush() catch {};
 
     if (args.len < 2) {
@@ -2528,6 +2553,9 @@ fn setSetting(
         },
     }
 
+    if (eq(item.key, lazy.thin_key) and settings.boolOf(value) == true) {
+        try ui.hint(w, "chunks outside the current tree now leave on the next `sdt gc`, once a source is known to hold them");
+    }
     const shown = try settings.display(alloc, item, value);
     defer alloc.free(shown);
     try w.print("{s}{s}{s} {s} is {s}{s}{s}{s}\n", .{
@@ -3719,6 +3747,7 @@ fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     var work = try openWork(io);
     defer work.close(io);
     branches.switchTo(&s, work, rest[0]) catch |e| {
+        if (e == error.ContentUnavailable) return e;
         try w.print("could not switch to {s}: {s}\n", .{ rest[0], @errorName(e) });
         return;
     };
@@ -4401,8 +4430,10 @@ fn cmdServe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
 fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
         try w.writeAll("usage: sdt fetch <src-repo-dir> [path-prefix]\n");
+        try w.writeAll("       sdt fetch --all              fetch every chunk a thin store lacks, and stop being thin\n");
         return;
     }
+    if (eq(rest[0], "--all")) return fetchAll(io, alloc, w);
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     resolveOps(alloc, &s);
@@ -4421,11 +4452,28 @@ fn cmdFetch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     }
 }
 
+fn fetchAll(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    if (!s.thin) {
+        try w.writeAll("this store is not thin; it already holds everything it references\n");
+        return;
+    }
+    const got = try lazy.fetchAll(&s, alloc);
+    try config.set(&s, lazy.thin_key, "false");
+    lazy.forgetHydrated(&s);
+    var buf: [32]u8 = undefined;
+    try w.print("{s}{s}{s} full: fetched {d} chunk{s} ({s}); nothing is fetched on demand any more\n", .{
+        ui.on(.green), ui.check,                          ui.off(),
+        got.objects,   if (got.objects == 1) "" else "s", ui.humanBytes(got.bytes, &buf),
+    });
+}
+
 fn meshUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\usage: sdt mesh [run] [--peer <host:port>] [--port <n>] [--quiet]
         \\       sdt mesh open              start a room here and print its secret
-        \\       sdt mesh join <secret>     join the room that secret names
+        \\       sdt mesh join <secret>     join the room that secret names (--thin: fetch chunks from peers as needed)
         \\       sdt mesh status            what is configured, and what it means
         \\       sdt mesh leave             forget the secret; stop being a member
         \\
@@ -4496,20 +4544,30 @@ fn meshJoin(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
 
-    const secret = rest[0];
+    var secret: []const u8 = "";
+    var thin = false;
+    for (rest) |a| {
+        if (eq(a, "--thin")) thin = true else if (secret.len == 0) secret = a;
+    }
+    if (secret.len == 0) {
+        try w.writeAll("usage: sdt mesh join <secret> [--thin]\n");
+        return;
+    }
     if (secret.len > wormhole.max_password_len) {
         try w.print("that secret is longer than {d} characters\n", .{wormhole.max_password_len});
         return;
     }
     try config.set(&s, "mesh.secret", secret);
+    if (thin) try config.set(&s, lazy.thin_key, "true");
 
     var tag_hex: [mesh.room_tag_len * 2]u8 = undefined;
     const tag = mesh.roomTag(secret);
     _ = std.fmt.bufPrint(&tag_hex, "{x}", .{&tag}) catch {};
-    try w.print("{s}{s}{s} joined room {s}{s}{s}\n", .{
-        ui.on(.green), ui.check, ui.off(), ui.on(.dim), tag_hex[0..8], ui.off(),
+    try w.print("{s}{s}{s} joined room {s}{s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.dim), tag_hex[0..8], if (thin) ", thin" else "", ui.off(),
     });
     try ui.hint(w, "`sdt mesh` to go live");
+    if (thin) try ui.hint(w, "history arrives whole; a file's chunks arrive from a peer the first time you read it");
 }
 
 fn meshLeave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
@@ -6262,6 +6320,40 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     }
     try w.writeAll("\n");
 
+    if (lazy.census(&s, alloc)) |c| {
+        var held_buf: [32]u8 = undefined;
+        var full_buf: [32]u8 = undefined;
+        if (c.thin) {
+            try w.print("  store        {s}thin{s}: {d} of {d} chunks held, {s} on disk, about {s} in full\n", .{
+                ui.on(.cyan),                           ui.off(),
+                c.held,                                 c.referenced,
+                ui.humanBytes(c.held_bytes, &held_buf), ui.humanBytes(c.full_bytes, &full_buf),
+            });
+            var srcs = lazy.sources(&s, alloc) catch null;
+            defer if (srcs) |*x| x.deinit();
+            if (srcs) |x| {
+                if (x.items.len == 0) {
+                    try w.print("               {s}{s} no source to fetch from: `sdt config sources <host:port|path|link>`{s}\n", .{
+                        ui.on(.yellow), ui.warn, ui.off(),
+                    });
+                } else {
+                    try w.writeAll("               sources: ");
+                    for (x.items, 0..) |src, i| {
+                        var lbuf: [96]u8 = undefined;
+                        if (i != 0) try w.writeAll(", ");
+                        try w.writeAll(src.label(&lbuf));
+                    }
+                    try w.writeAll("\n");
+                }
+            }
+            if (c.held < c.referenced) {
+                try ui.hint(w, "               `sdt fetch --all` fills it and turns thin off");
+            }
+        } else {
+            try w.print("  store        full: {d} chunks, {s} on disk\n", .{ c.held, ui.humanBytes(c.held_bytes, &held_buf) });
+        }
+    } else |_| {}
+
     const op_heads = opdag.heads(&s, alloc) catch try alloc.alloc(Oid, 0);
     defer alloc.free(op_heads);
     try w.print("  op-log       {d} head{s}\n", .{ op_heads.len, if (op_heads.len == 1) "" else "s" });
@@ -7061,41 +7153,58 @@ fn warnSealedAbsent(w: *std.Io.Writer) !void {
 }
 
 fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
-    if (rest.len < 1) {
-        try w.writeAll("usage: sdt clone <forge-src|share-url|bundle#k=...> [dir]\n");
+    var thin = false;
+    var pos: [2][]const u8 = undefined;
+    var np: usize = 0;
+    for (rest) |a| {
+        if (eq(a, "--thin")) {
+            thin = true;
+        } else if (np < 2) {
+            pos[np] = a;
+            np += 1;
+        }
+    }
+    if (np < 1) {
+        try w.writeAll("usage: sdt clone <forge-src|share-url|bundle#k=...|host:port|repo-dir> [dir] [--thin]\n");
+        try ui.hint(w, "--thin takes the history and the current tree's content; older content arrives when it is read");
         return;
     }
-    const into = if (rest.len >= 2) rest[1] else defaultCloneDir(rest[0]) orelse {
-        try w.print("cannot tell what to name the directory for {s}. pass one: sdt clone <src> <dir>\n", .{rest[0]});
+    const src = pos[0];
+    const into = if (np >= 2) pos[1] else defaultCloneDir(src) orelse {
+        try w.print("cannot tell what to name the directory for {s}. pass one: sdt clone <src> <dir>\n", .{src});
         return;
     };
     try w.print("{s}cloning{s} {s}{s}{s}\n", .{
-        ui.on(.dim), ui.off(), ui.on(.cyan), rest[0], ui.off(),
+        ui.on(.dim), ui.off(), ui.on(.cyan), src, ui.off(),
     });
     try w.flush();
-    if (std.mem.indexOf(u8, rest[0], "#k=") != null) {
-        return cloneShare(io, alloc, w, rest[0], into, into);
+    if (std.mem.indexOf(u8, src, "#k=") != null) {
+        return cloneShare(io, alloc, w, src, into, into, thin);
     }
-    if (isApricotRemote(rest[0])) {
+    if (localRepoDir(io, src)) return cloneLocal(io, alloc, w, src, into, thin);
+    if (!isUrl(src)) {
+        if (parseSeed(src)) |seed| return cloneServe(io, alloc, w, seed, into, thin);
+    }
+    if (isApricotRemote(src)) {
         const cwd = try std.process.currentPathAlloc(io, alloc);
         defer alloc.free(cwd);
         const destination = try std.fs.path.resolve(alloc, &.{ cwd, into });
         defer alloc.free(destination);
-        const fetched = apricot_bridge.fetchDefault(alloc, io, rest[0]) catch |e| switch (e) {
+        const fetched = apricot_bridge.fetchDefault(alloc, io, src) catch |e| switch (e) {
             // No carrier there, so this repo has no native history to take —
             // only the projection git can see. Falling through to a git clone
             // is right, but doing it in silence hands somebody a flattened
             // history that looks complete and is not.
             error.MissingCarrierRef, error.MissingBranch => blk: {
                 try w.print("{s}{s}{s} no native carrier at {s}: cloning the git history only\n", .{
-                    ui.on(.yellow), ui.warn, ui.off(), rest[0],
+                    ui.on(.yellow), ui.warn, ui.off(), src,
                 });
                 try ui.hint(w, "moments, verdicts and the op-log live in the carrier, and are not in git");
                 try warnSealedAbsent(w);
                 break :blk null;
             },
             else => {
-                try reportApricotFailure(w, "native clone from", rest[0], e);
+                try reportApricotFailure(w, "native clone from", src, e);
                 return;
             },
         };
@@ -7105,8 +7214,9 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
                 try w.print("{s}{s}{s} native clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), @errorName(e) });
                 return;
             };
-            try w.print("{s}{s}{s} cloned exact native repository into {s}{s}{s}\n", .{
-                ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+            if (thin) try thinAfterRestore(io, alloc, w, into, src);
+            try w.print("{s}{s}{s} cloned exact native repository into {s}{s}{s}{s}\n", .{
+                ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(), if (thin) " (thin)" else "",
             });
             const arrived = try keyring.sealedPathsAt(io, alloc, destination);
             defer keyring.freePaths(alloc, arrived);
@@ -7120,9 +7230,14 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     } else {
         try warnSealedAbsent(w);
     }
+    if (thin) {
+        try w.print("{s}{s}{s} --thin needs a native source; git has no chunks to fetch later, so this clone is full\n", .{
+            ui.on(.yellow), ui.warn, ui.off(),
+        });
+    }
     // Create the destination as a superdetermine repo, then clone git into it.
     var progress = git.Progress.init(io, w);
-    git.cloneGitOnly(alloc, rest[0], into, &progress) catch {
+    git.cloneGitOnly(alloc, src, into, &progress) catch {
         const detail = git.lastError();
         if (detail.len != 0) {
             try w.print("{s}{s}{s} clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), detail });
@@ -7157,6 +7272,20 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             ui.off(),
         });
     }
+}
+
+fn thinAfterRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, into: []const u8, remote: []const u8) !void {
+    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
+    defer dest.close(io);
+    var s = try Store.open(io, alloc, dest);
+    defer s.deinit();
+    try config.set(&s, lazy.remote_key, remote);
+    try config.set(&s, lazy.thin_key, "true");
+    const dropped = try lazy.thinOut(&s, alloc);
+    var buf: [32]u8 = undefined;
+    try w.print("{s}kept the history, dropped {d} chunk{s} ({s}) the remote holds{s}\n", .{
+        ui.on(.dim), dropped.objects, if (dropped.objects == 1) "" else "s", ui.humanBytes(dropped.bytes, &buf), ui.off(),
+    });
 }
 
 fn shareBranches(alloc: std.mem.Allocator, rest: []const []const u8, from: usize) ![][]const u8 {
@@ -7509,9 +7638,12 @@ fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     var named: ?[]const u8 = null;
     var relay_host: ?[]const u8 = null;
     var relay_port: u16 = default_relay_port;
+    var thin = false;
     var i: usize = 1;
     while (i < rest.len) : (i += 1) {
-        if (eq(rest[i], "--relay") and i + 1 < rest.len) {
+        if (eq(rest[i], "--thin")) {
+            thin = true;
+        } else if (eq(rest[i], "--relay") and i + 1 < rest.len) {
             const spec = rest[i + 1];
             if (std.mem.lastIndexOfScalar(u8, spec, ':')) |c| {
                 relay_host = spec[0..c];
@@ -7527,7 +7659,7 @@ fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     }
 
     if (std.mem.indexOf(u8, source, "#k=") != null) {
-        return cloneShare(io, alloc, w, source, into, named);
+        return cloneShare(io, alloc, w, source, into, named, thin);
     }
     if (!looksLikeCode(source)) {
         try w.print("{s}{s}{s} not a code, a share url, or a bundle: {s}{s}{s}\n", .{
@@ -7536,7 +7668,7 @@ fn cmdGet(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         try ui.hint(w, "codes look like 43-hydrant-hostel; links and files carry a #k=... key");
         return;
     }
-    return receiveCode(io, alloc, w, source, into, named, relay_host, relay_port);
+    return receiveCode(io, alloc, w, source, into, named, relay_host, relay_port, thin);
 }
 
 fn receiveCode(
@@ -7548,6 +7680,7 @@ fn receiveCode(
     named: ?[]const u8,
     relay_host: ?[]const u8,
     relay_port: u16,
+    thin: bool,
 ) !void {
     const parsed = wormhole.Code.parse(code) catch {
         try w.writeAll("that does not look like an sdt code\n");
@@ -7609,14 +7742,19 @@ fn receiveCode(
     };
     defer s.deinit();
 
-    const got = try share.importOpened(&s, alloc, &opened);
+    const got = try share.importOpenedWith(&s, alloc, &opened, thin);
     got.deinit(alloc);
+    if (thin) {
+        try config.set(&s, lazy.thin_key, "true");
+        s.thin = true;
+    }
     try materializeHead(io, alloc, &s, dest);
 
-    try w.print("{s}{s}{s} received into {s}{s}{s}\n", .{
-        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+    try w.print("{s}{s}{s} received into {s}{s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(), if (thin) " (thin)" else "",
     });
     try ui.hint(w, "any sealed values are still sealed. the code moved the code, not the secrets.");
+    if (thin) try ui.hint(w, "a code is one-shot, so name a source for older chunks: `sdt config sources <host:port|path|link>`");
 }
 
 fn receiveState(
@@ -7800,6 +7938,7 @@ fn cloneShare(
     source: []const u8,
     into: []const u8,
     named: ?[]const u8,
+    thin: bool,
 ) !void {
     const is_http = std.mem.startsWith(u8, source, "http://") or
         std.mem.startsWith(u8, source, "https://");
@@ -7847,11 +7986,16 @@ fn cloneShare(
     };
     defer s.deinit();
 
-    const got = share.importOpened(&s, alloc, &opened) catch |e| {
+    const got = share.importOpenedWith(&s, alloc, &opened, thin) catch |e| {
         try w.print("clone failed: {t}\n", .{e});
         return;
     };
     got.deinit(alloc);
+    if (thin) {
+        try config.set(&s, lazy.thin_key, "true");
+        try rememberShareSource(io, alloc, &s, source, is_http);
+        s.thin = true;
+    }
 
     const branch = try s.headBranch();
     defer alloc.free(branch);
@@ -7860,10 +8004,99 @@ fn cloneShare(
         defer object.freeChange(alloc, change);
         try workspace.materialize(&s, change.tree, dest);
     }
-    try w.print("{s}{s}{s} cloned into {s}{s}{s}\n", .{
-        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
+    try w.print("{s}{s}{s} cloned into {s}{s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(), if (thin) " (thin)" else "",
     });
     try w.writeAll("any sealed values are still sealed. `sdt unseal` needs a key you were not given.\n");
+}
+
+fn rememberShareSource(io: std.Io, alloc: std.mem.Allocator, s: *Store, source: []const u8, is_http: bool) !void {
+    if (is_http) return config.set(s, lazy.sources_key, source);
+    const cut = std.mem.indexOf(u8, source, "#k=") orelse return;
+    const abs = std.Io.Dir.cwd().realPathFileAlloc(io, source[0..cut], alloc) catch return;
+    defer alloc.free(abs);
+    const entry = try std.fmt.allocPrint(alloc, "{s}{s}", .{ abs, source[cut..] });
+    defer alloc.free(entry);
+    try config.set(s, lazy.sources_key, entry);
+}
+
+fn localRepoDir(io: std.Io, src: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ src, store.dir_name }) catch return false;
+    std.Io.Dir.cwd().access(io, p, .{}) catch return false;
+    return true;
+}
+
+fn cloneLocal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, src: []const u8, into: []const u8, thin: bool) !void {
+    var from = lazy.openLocal(io, alloc, src) orelse {
+        try w.print("{s}{s}{s} {s} is not a superdetermine repo\n", .{ ui.on(.red), ui.cross, ui.off(), src });
+        return;
+    };
+    defer from.deinit();
+
+    std.Io.Dir.cwd().createDirPath(io, into) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
+    defer dest.close(io);
+    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
+        Store.Error.RepoExists => try Store.open(io, alloc, dest),
+        else => return e,
+    };
+    defer s.deinit();
+
+    const got = try lazy.copyRepo(&from, &s, thin);
+    const src_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, src, alloc);
+    defer alloc.free(src_abs);
+    try config.set(&s, lazy.thin_key, if (thin) "true" else "false");
+    try config.set(&s, lazy.sources_key, src_abs);
+    s.thin = thin;
+    try materializeHead(io, alloc, &s, dest);
+
+    var buf: [32]u8 = undefined;
+    try w.print("{s}{s}{s} cloned into {s}{s}{s}{s}: {d} objects, {s}\n", .{
+        ui.on(.green),                  ui.check, ui.off(),                    ui.on(.cyan),
+        into,                           ui.off(), if (thin) " (thin)" else "", got.objects,
+        ui.humanBytes(got.bytes, &buf),
+    });
+}
+
+fn cloneServe(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, seed: mesh.Seed, into: []const u8, thin: bool) !void {
+    const head = net.headTcp(io, alloc, seed.host, seed.port) catch {
+        try w.print("{s}{s}{s} nothing is serving at {s}:{d}\n", .{ ui.on(.red), ui.cross, ui.off(), seed.host, seed.port });
+        try ui.hint(w, "`sdt serve` there first");
+        return;
+    };
+    defer if (head) |h| alloc.free(h);
+    const branch: []const u8 = head orelse "main";
+
+    std.Io.Dir.cwd().createDirPath(io, into) catch {};
+    var dest = try std.Io.Dir.cwd().openDir(io, into, .{});
+    defer dest.close(io);
+    var s = Store.init(io, alloc, dest) catch |e| switch (e) {
+        Store.Error.RepoExists => try Store.open(io, alloc, dest),
+        else => return e,
+    };
+    defer s.deinit();
+
+    _ = net.fetchThinTcp(&s, seed.host, seed.port, branch) catch |e| {
+        try w.print("{s}{s}{s} clone failed: {s}\n", .{ ui.on(.red), ui.cross, ui.off(), @errorName(e) });
+        return;
+    };
+    try s.setHeadBranch(branch);
+    const entry = try std.fmt.allocPrint(alloc, "{s}:{d}", .{ seed.host, seed.port });
+    defer alloc.free(entry);
+    try config.set(&s, lazy.sources_key, entry);
+    try config.set(&s, lazy.thin_key, "true");
+    s.thin = true;
+    if (!thin) {
+        _ = try lazy.fetchAll(&s, alloc);
+        try config.set(&s, lazy.thin_key, "false");
+        lazy.forgetHydrated(&s);
+        s.thin = false;
+    }
+    try materializeHead(io, alloc, &s, dest);
+    try w.print("{s}{s}{s} cloned into {s}{s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(), if (thin) " (thin)" else "",
+    });
 }
 
 fn sealUsage(w: *std.Io.Writer) !void {
