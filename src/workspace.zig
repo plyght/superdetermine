@@ -5,6 +5,7 @@ const Store = @import("store.zig").Store;
 const ignore = @import("ignore.zig");
 const idx = @import("index.zig");
 const keyring = @import("keyring.zig");
+const seal = @import("seal.zig");
 const Oid = oid.Oid;
 
 fn appendFile(
@@ -60,10 +61,6 @@ fn scan(
         entries.deinit(alloc);
     }
 
-    const seen_outputs = try alloc.alloc(bool, plan.outputs.len);
-    defer alloc.free(seen_outputs);
-    @memset(seen_outputs, false);
-
     var walker = try work_dir.walkSelectively(alloc);
     defer walker.deinit();
 
@@ -75,9 +72,6 @@ fn scan(
             .file => {
                 if (plan.isSource(entry.path)) continue;
                 if (ignores.isIgnored(entry.path, false)) continue;
-                for (plan.outputs, 0..) |o, i| {
-                    if (std.mem.eql(u8, o, entry.path)) seen_outputs[i] = true;
-                }
                 try appendFile(store, work_dir, entry.path, cache, fresh, &entries);
             },
             .sym_link => {
@@ -98,10 +92,15 @@ fn scan(
         }
     }
 
-    for (plan.outputs, seen_outputs) |path, already| {
-        if (already) continue;
-        work_dir.access(io, path, .{}) catch continue;
-        try appendFile(store, work_dir, path, cache, fresh, &entries);
+    for (plan.sealed) |form| {
+        const blob = try store.writeFileContent(form.text);
+        const path = try alloc.dupe(u8, form.path);
+        errdefer alloc.free(path);
+        try entries.append(alloc, .{
+            .mode = .sealed,
+            .path = path,
+            .blob = blob,
+        });
     }
 
     const slice = try entries.toOwnedSlice(alloc);
@@ -126,7 +125,7 @@ pub fn captureEntries(store: *Store, work_dir: std.Io.Dir) ![]object.TreeEntry {
     var fresh = idx.Index.empty(alloc);
     defer fresh.deinit();
 
-    var plan = try keyring.prepare(store.io, alloc, work_dir);
+    var plan = try keyring.prepare(store, work_dir);
     defer plan.deinit();
 
     const entries = try scan(store, work_dir, &cache, &fresh, &plan);
@@ -146,7 +145,7 @@ pub fn snapshot(store: *Store, work_dir: std.Io.Dir, author: []const u8, message
     var fresh = idx.Index.empty(alloc);
     defer fresh.deinit();
 
-    var plan = try keyring.prepare(store.io, alloc, work_dir);
+    var plan = try keyring.prepare(store, work_dir);
     defer plan.deinit();
 
     const entries = try scan(store, work_dir, &cache, &fresh, &plan);
@@ -200,7 +199,7 @@ pub fn status(store: *Store, work_dir: std.Io.Dir, alloc: std.mem.Allocator) ![]
     var fresh = idx.Index.empty(store.alloc);
     defer fresh.deinit();
 
-    var plan = try keyring.prepare(store.io, store.alloc, work_dir);
+    var plan = try keyring.prepare(store, work_dir);
     defer plan.deinit();
 
     const work_entries = try scan(store, work_dir, &cache, &fresh, &plan);
@@ -284,10 +283,22 @@ pub fn checkout(store: *Store, dest_dir: std.Io.Dir, from_tree: ?Oid, to_tree: O
 
     if (previous) |p| for (p.entries) |e| {
         if (want.contains(e.path)) continue;
+        if (e.mode == .sealed) continue;
         dest_dir.deleteFile(io, e.path) catch {};
     };
 
+    var key: ?seal.RepoKey = null;
+    var key_loaded = false;
     for (target.entries) |e| {
+        if (e.mode == .sealed) {
+            if (!key_loaded) {
+                key_loaded = true;
+                key = keyring.currentKey(store, dest_dir) catch null;
+            }
+            const k = key orelse continue;
+            try writeUnsealed(store, dest_dir, e, k);
+            continue;
+        }
         if (std.fs.path.dirnamePosix(e.path)) |dir| {
             try dest_dir.createDirPath(io, dir);
         }
@@ -300,6 +311,23 @@ pub fn checkout(store: *Store, dest_dir: std.Io.Dir, from_tree: ?Oid, to_tree: O
         if (want.contains(e.path)) continue;
         pruneEmptyDirs(io, dest_dir, e.path);
     };
+}
+
+fn writeUnsealed(store: *Store, dest_dir: std.Io.Dir, e: object.TreeEntry, k: seal.RepoKey) !void {
+    const io = store.io;
+    const alloc = store.alloc;
+    const sealed = try store.readFileContent(e.blob);
+    defer alloc.free(sealed);
+    const plain = try seal.unsealText(alloc, k, e.path, sealed);
+    defer alloc.free(plain);
+    if (std.fs.path.dirnamePosix(e.path)) |dir| {
+        try dest_dir.createDirPath(io, dir);
+    }
+    try dest_dir.writeFile(io, .{
+        .sub_path = e.path,
+        .data = plain,
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
 }
 
 fn pruneEmptyDirs(io: std.Io, dest_dir: std.Io.Dir, rel_path: []const u8) void {
@@ -326,6 +354,10 @@ pub fn restoreFile(store: *Store, work_dir: std.Io.Dir, rel_path: []const u8) !v
 
     for (tree.entries) |e| {
         if (std.mem.eql(u8, e.path, rel_path)) {
+            if (e.mode == .sealed) {
+                const k = (try keyring.currentKey(store, work_dir)) orelse return seal.Error.NotAMember;
+                return writeUnsealed(store, work_dir, e, k);
+            }
             const data = try store.readFileContent(e.blob);
             defer alloc.free(data);
             if (std.fs.path.dirnamePosix(rel_path)) |dir| {
@@ -447,7 +479,6 @@ test "ignored files are excluded from status and snapshot" {
 test "a sealed source never enters the tree and its sealed form always does" {
     const io = std.testing.io;
     const alloc = testing.allocator;
-    const seal = @import("seal.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -459,19 +490,18 @@ test "a sealed source never enters the tree and its sealed form always does" {
     _ = setenv("XDG_CONFIG_HOME", absz.ptr, 1);
     defer _ = unsetenv("XDG_CONFIG_HOME");
 
-    var store = try Store.init(io, alloc, tmp.dir);
-    defer store.deinit();
-
     try tmp.dir.createDirPath(io, "work");
     var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
     defer work.close(io);
+    var store = try Store.init(io, alloc, work);
+    defer store.deinit();
 
     const id = try keyring.createIdentity(io, alloc, true);
     var manifest = seal.Manifest.empty(alloc);
     defer manifest.deinit();
     _ = try manifest.addPath(".env");
     try manifest.putMember(io, seal.newRepoKey(io), "nico", id.publicId());
-    try keyring.saveManifest(io, alloc, work, &manifest);
+    try keyring.saveManifest(alloc, &store, &manifest);
 
     try work.writeFile(io, .{ .sub_path = ".sdtignore", .data = ".env\n" });
     try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=sk-live-1\n" });
@@ -487,10 +517,10 @@ test "a sealed source never enters the tree and its sealed form always does" {
 
     var saw_sealed = false;
     for (tree.entries) |e| {
-        try testing.expect(!std.mem.eql(u8, e.path, ".env"));
-        try testing.expect(!std.mem.eql(u8, e.path, ".env.sealed"));
-        if (std.mem.eql(u8, e.path, seal.manifest_name)) {
+        try testing.expect(!std.mem.eql(u8, e.path, seal.legacy_manifest_name));
+        if (std.mem.eql(u8, e.path, ".env")) {
             saw_sealed = true;
+            try testing.expectEqual(object.Mode.sealed, e.mode);
             const data = try store.readFileContent(e.blob);
             defer alloc.free(data);
             try testing.expect(std.mem.indexOf(u8, data, "sk-live-1") == null);
@@ -505,6 +535,24 @@ test "a sealed source never enters the tree and its sealed form always does" {
         alloc.free(st);
     }
     try testing.expectEqual(@as(usize, 0), st.len);
+
+    var cache = try idx.Index.load(&store, alloc);
+    defer cache.deinit();
+    try testing.expect(!cache.map.contains(".env"));
+
+    try work.deleteFile(io, ".env");
+    try tmp.dir.createDirPath(io, "out");
+    var out = try tmp.dir.openDir(io, "out", .{});
+    defer out.close(io);
+    try materialize(&store, change.tree, out);
+    const unsealed = try out.readFileAlloc(io, ".env", alloc, .unlimited);
+    defer alloc.free(unsealed);
+    try testing.expectEqualStrings("API_KEY=sk-live-1\n", unsealed);
+
+    try restoreFile(&store, work, ".env");
+    const back = try work.readFileAlloc(io, ".env", alloc, .unlimited);
+    defer alloc.free(back);
+    try testing.expectEqualStrings("API_KEY=sk-live-1\n", back);
 }
 
 test "restoreFile discards local edits to one file" {

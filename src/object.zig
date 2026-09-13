@@ -23,6 +23,7 @@ pub const Mode = enum(u32) {
     regular = 0o100644,
     executable = 0o100755,
     symlink = 0o120000,
+    sealed = 0o100600,
     _,
 };
 

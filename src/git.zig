@@ -1025,6 +1025,7 @@ fn buildGitTree(
     defer attrs.deinit();
 
     for (tree.entries) |e| {
+        if (e.mode == .sealed) continue;
         var blob_oid: c.git_oid = undefined;
         var reused = false;
         if (cache) |bc| {
@@ -2331,6 +2332,68 @@ test "exportHead reproduces files, author and message in a git repo" {
     const nsize: usize = @intCast(c.git_blob_rawsize(nested_blob_obj));
     const nraw = @as([*]const u8, @ptrCast(c.git_blob_rawcontent(nested_blob_obj)))[0..nsize];
     try testing.expectEqualStrings("nested content\n", nraw);
+}
+
+test "exportHead leaves a sealed entry out of the git tree entirely" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "grrepo");
+    var gr_dir = try tmp.dir.openDir(io, "grrepo", .{});
+    defer gr_dir.close(io);
+    var store = try Store.init(io, alloc, gr_dir);
+    defer store.deinit();
+
+    const code_blob = try store.writeFileContent("fn main() void {}\n");
+    const env_blob = try store.writeFileContent("API_KEY=gr1:AAAA\n");
+    const entries = [_]object.TreeEntry{
+        .{ .mode = .sealed, .path = ".env", .blob = env_blob },
+        .{ .mode = .regular, .path = "main.zig", .blob = code_blob },
+    };
+    const tree_oid = try store.writeTree(.{ .entries = &entries });
+    const change = object.Change{
+        .tree = tree_oid,
+        .parents = &[_]Oid{},
+        .change_id = [_]u8{4} ** 16,
+        .timestamp = 1_700_000_000,
+        .tz_offset_min = 0,
+        .author = "Nico <nico@example.com>",
+        .message = "sealed export\n",
+    };
+    const change_oid = try store.writeChange(change);
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    try store.updateRef(branch, change_oid);
+
+    try tmp.dir.createDirPath(io, "gitout");
+    const abs = try tmp.dir.realPathFileAlloc(io, "gitout", alloc);
+    defer alloc.free(abs);
+    try exportHead(&store, abs);
+
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, abs.ptr));
+    defer c.git_repository_free(repo);
+    var head_ref: ?*c.git_reference = null;
+    try check(c.git_repository_head(&head_ref, repo));
+    defer c.git_reference_free(head_ref);
+    var commit_obj: ?*c.git_object = null;
+    try check(c.git_reference_peel(&commit_obj, head_ref, c.GIT_OBJECT_COMMIT));
+    defer c.git_object_free(commit_obj);
+    const commit: ?*c.git_commit = @ptrCast(commit_obj);
+    var gtree: ?*c.git_tree = null;
+    try check(c.git_commit_tree(&gtree, commit));
+    defer c.git_tree_free(gtree);
+
+    try testing.expectEqual(@as(usize, 1), @as(usize, @intCast(c.git_tree_entrycount(gtree))));
+    var code_entry: ?*c.git_tree_entry = null;
+    try check(c.git_tree_entry_bypath(&code_entry, gtree, "main.zig"));
+    defer c.git_tree_entry_free(code_entry);
+    var env_entry: ?*c.git_tree_entry = null;
+    try testing.expect(c.git_tree_entry_bypath(&env_entry, gtree, ".env") != 0);
 }
 
 fn buildStoreWithChange(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir) !Store {
