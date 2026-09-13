@@ -7,7 +7,8 @@ const merge_mod = @import("merge.zig");
 const oplog = @import("oplog.zig");
 const sync = @import("sync.zig");
 const workspace = @import("workspace.zig");
-const Store = @import("store.zig").Store;
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
 const Oid = oid.Oid;
 
 pub const Error = error{
@@ -21,6 +22,7 @@ pub const Error = error{
     RestoreTargetExists,
     CannotRemoveOrigin,
     CorruptRegistry,
+    AmbiguousWorktree,
 };
 
 pub const State = enum { active, removed };
@@ -45,6 +47,7 @@ pub const Inspection = struct {
     entry: Entry,
     branch: ?[]u8,
     tip: ?Oid,
+    ahead: usize,
     changes: []workspace.StatusEntry,
 
     pub fn deinit(self: Inspection, alloc: std.mem.Allocator) void {
@@ -160,7 +163,70 @@ pub fn create(store: *Store, origin_abs: []const u8, destination_abs: []const u8
     if (std.mem.eql(u8, origin_abs, destination_abs)) return Error.CannotRemoveOrigin;
     try branches.work(store.io, origin_abs, destination_abs);
     errdefer std.Io.Dir.cwd().deleteTree(store.io, destination_abs) catch {};
+    try forgetInherited(store.io, store.alloc, destination_abs);
     return register(store, destination_abs);
+}
+
+pub fn forgetInherited(io: std.Io, alloc: std.mem.Allocator, destination_abs: []const u8) !void {
+    const inherited = try std.fs.path.join(alloc, &.{ destination_abs, store_mod.dir_name, registry_dir });
+    defer alloc.free(inherited);
+    std.Io.Dir.cwd().deleteTree(io, inherited) catch {};
+}
+
+pub fn name(entry: Entry) []const u8 {
+    return std.fs.path.basename(entry.original_path);
+}
+
+pub fn find(store: *Store, alloc: std.mem.Allocator, spec: []const u8) !Entry {
+    if (spec.len == 0) return Error.WorktreeNotFound;
+    const entries = try list(store, alloc, true);
+    defer {
+        for (entries) |entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    const resolved: ?[:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(store.io, spec, alloc) catch null;
+    defer if (resolved) |path| alloc.free(path);
+    const joined: ?[]u8 = if (std.fs.path.isAbsolute(spec)) null else blk: {
+        const cwd = std.Io.Dir.cwd().realPathFileAlloc(store.io, ".", alloc) catch break :blk null;
+        defer alloc.free(cwd);
+        break :blk try std.fs.path.resolve(alloc, &.{ cwd, spec });
+    };
+    defer if (joined) |path| alloc.free(path);
+
+    var match: ?usize = null;
+    for (entries, 0..) |entry, i| {
+        const exact = std.mem.eql(u8, entry.id, spec) or
+            std.mem.eql(u8, entry.original_path, spec) or
+            std.mem.eql(u8, entry.path, spec) or
+            (resolved != null and (std.mem.eql(u8, entry.original_path, resolved.?) or std.mem.eql(u8, entry.path, resolved.?))) or
+            (joined != null and std.mem.eql(u8, entry.original_path, joined.?));
+        if (exact) return dupe(alloc, entry);
+        const loose = std.mem.eql(u8, name(entry), spec) or
+            (spec.len >= 4 and std.mem.startsWith(u8, entry.id, spec));
+        if (!loose) continue;
+        if (match != null) return Error.AmbiguousWorktree;
+        match = i;
+    }
+    const index = match orelse return Error.WorktreeNotFound;
+    return dupe(alloc, entries[index]);
+}
+
+fn dupe(alloc: std.mem.Allocator, entry: Entry) !Entry {
+    const id = try alloc.dupe(u8, entry.id);
+    errdefer alloc.free(id);
+    const branch = try alloc.dupe(u8, entry.branch);
+    errdefer alloc.free(branch);
+    const original_path = try alloc.dupe(u8, entry.original_path);
+    errdefer alloc.free(original_path);
+    const path = try alloc.dupe(u8, entry.path);
+    return .{
+        .id = id,
+        .state = entry.state,
+        .branch = branch,
+        .baseline = entry.baseline,
+        .original_path = original_path,
+        .path = path,
+    };
 }
 
 pub fn get(store: *Store, alloc: std.mem.Allocator, id: []const u8) !Entry {
@@ -213,7 +279,7 @@ pub fn inspect(store: *Store, alloc: std.mem.Allocator, id: []const u8) !Inspect
     const entry = try get(store, alloc, id);
     errdefer entry.deinit(alloc);
     if (entry.state == .removed) {
-        return .{ .entry = entry, .branch = null, .tip = null, .changes = try alloc.alloc(workspace.StatusEntry, 0) };
+        return .{ .entry = entry, .branch = null, .tip = null, .ahead = 0, .changes = try alloc.alloc(workspace.StatusEntry, 0) };
     }
     var child = try openWorktree(store, entry.path);
     defer child.dir.close(store.io);
@@ -221,8 +287,16 @@ pub fn inspect(store: *Store, alloc: std.mem.Allocator, id: []const u8) !Inspect
     const branch = try child.store.headBranch();
     errdefer alloc.free(branch);
     const tip = child.store.readRef(branch) catch null;
+    const ahead = if (tip) |t| try aheadOf(&child.store, alloc, t, entry.baseline) else 0;
     const changes = try workspace.status(&child.store, child.dir, alloc);
-    return .{ .entry = entry, .branch = branch, .tip = tip, .changes = changes };
+    return .{ .entry = entry, .branch = branch, .tip = tip, .ahead = ahead, .changes = changes };
+}
+
+fn aheadOf(store: *Store, alloc: std.mem.Allocator, tip: Oid, baseline: Oid) !usize {
+    const chain = try history.chainOf(store, alloc, tip);
+    defer alloc.free(chain);
+    const base = history.indexOf(chain, baseline) orelse return chain.len;
+    return chain.len - base - 1;
 }
 
 fn importObjects(destination: *Store, source: *Store, alloc: std.mem.Allocator) !usize {
@@ -425,6 +499,44 @@ test "register list inspect remove and restore preserve the complete worktree" {
     try testing.expectEqualStrings("base", body);
 }
 
+test "find answers to the id, its prefix, the path, and the directory name" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "origin");
+    var origin = try tmp.dir.openDir(io, "origin", .{ .iterate = true });
+    defer origin.close(io);
+    var store = try Store.init(io, alloc, origin);
+    defer store.deinit();
+    _ = try save(origin, &store, "base", 1);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const origin_abs = try std.fs.path.join(alloc, &.{ root, "origin" });
+    defer alloc.free(origin_abs);
+    const child_abs = try std.fs.path.join(alloc, &.{ root, "child" });
+    defer alloc.free(child_abs);
+    const made = try create(&store, origin_abs, child_abs);
+    defer made.deinit(alloc);
+
+    const specs = [_][]const u8{ made.id, made.id[0..6], child_abs, "child" };
+    for (specs) |spec| {
+        const found = try find(&store, alloc, spec);
+        defer found.deinit(alloc);
+        try testing.expectEqualStrings(made.id, found.id);
+        try testing.expectEqualStrings("child", name(found));
+    }
+    try testing.expectError(Error.WorktreeNotFound, find(&store, alloc, "nowhere"));
+
+    const inherited = try std.fs.path.join(alloc, &.{ child_abs, store_mod.dir_name, registry_dir });
+    defer alloc.free(inherited);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, inherited, .{}));
+
+    const looked = try inspect(&store, alloc, made.id);
+    defer looked.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), looked.ahead);
+}
+
 test "merge worktree imports objects and is reversible independently of removal" {
     const io = std.testing.io;
     const alloc = testing.allocator;
@@ -452,6 +564,10 @@ test "merge worktree imports objects and is reversible independently of removal"
     var child_store = try Store.open(io, alloc, child_dir);
     const child_tip = try save(child_dir, &child_store, "changed", 2);
     child_store.deinit();
+
+    const looked = try inspect(&store, alloc, id);
+    defer looked.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), looked.ahead);
 
     const merged = try mergeWorktree(&store, alloc, id, "main", "T <t@e>", 3);
     defer merged.deinit(alloc);

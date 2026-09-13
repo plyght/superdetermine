@@ -56,6 +56,8 @@ const wormhole = @import("wormhole.zig");
 const ui = @import("ui.zig");
 const discovery = @import("discovery.zig");
 const apricot_bridge = @import("apricot_bridge.zig");
+const worktrees = @import("worktrees.zig");
+const transfer = @import("transfer.zig");
 const ipnet = std.Io.net;
 
 const Oid = oid.Oid;
@@ -81,6 +83,11 @@ const sections = [_]Section{
         .{ .name = "switch", .alias = "sw", .args = "<name>", .desc = "move to another branch (auto-saves)" },
         .{ .name = "branch", .alias = "b", .args = "[-d name]", .desc = "list branches, or delete one" },
         .{ .name = "work", .alias = "wt", .args = "<dir>", .desc = "instant copy-on-write worktree" },
+        .{ .name = "work list", .args = "[--all]", .desc = "every worktree, its branch, and what is unsaved" },
+        .{ .name = "work status", .args = "[<dir|name>]", .desc = "one worktree in detail, or all of them" },
+        .{ .name = "work merge", .args = "<dir|name>", .desc = "bring a worktree's saved changes back here" },
+        .{ .name = "work remove", .args = "<dir|name> [--force]", .desc = "set a worktree aside (refuses unsaved edits)" },
+        .{ .name = "work restore", .args = "<dir|name>", .desc = "put a removed worktree back" },
         .{ .name = "restore", .alias = "rs", .args = "<file>... [--at ref]", .desc = "put one file back, from the last save or any state" },
         .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
         .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
@@ -95,6 +102,8 @@ const sections = [_]Section{
         .{ .name = "split", .alias = "spl", .args = "[ref] -- <paths> | --hunk p:n", .desc = "split one change in two, by path or hunk" },
         .{ .name = "drop", .alias = "dr", .args = "[ref]", .desc = "remove a change, keep its edits in the tree" },
         .{ .name = "reorder", .alias = "ro", .args = "<order...>", .desc = "reorder the last changes, 1 = oldest" },
+        .{ .name = "take", .alias = "tk", .args = "<ref>", .desc = "copy a change from another branch onto this one" },
+        .{ .name = "move", .alias = "mv", .args = "<ref> <branch>", .desc = "move a change onto another branch" },
     } },
     .{ .title = "who wrote this", .entries = &.{
         .{ .name = "blame", .alias = "bl", .args = "<file>", .desc = "per-line authorship, incl. agent/prompt" },
@@ -226,7 +235,7 @@ fn printUsage(w: *std.Io.Writer) !void {
             try w.print("{s}\n", .{e.desc});
         }
     }
-    try w.print("\n  {s}status and log take --json. NO_COLOR is respected.{s}\n", .{ ui.on(.dim), ui.off() });
+    try w.print("\n  {s}status, log, and work list take --json. NO_COLOR is respected.{s}\n", .{ ui.on(.dim), ui.off() });
 }
 
 fn padTo(w: *std.Io.Writer, used: usize, target: usize) !void {
@@ -266,6 +275,8 @@ const aliases = [_]Alias{
     .{ .short = "spl", .full = "split" },
     .{ .short = "dr", .full = "drop" },
     .{ .short = "ro", .full = "reorder" },
+    .{ .short = "tk", .full = "take" },
+    .{ .short = "mv", .full = "move" },
     .{ .short = "bl", .full = "blame" },
     .{ .short = "prov", .full = "provenance" },
     .{ .short = "u", .full = "undo" },
@@ -522,6 +533,10 @@ fn run(init: std.process.Init) !void {
         try cmdSplit(io, alloc, w, rest);
     } else if (eq(cmd, "reorder")) {
         try cmdReorder(io, alloc, w, rest);
+    } else if (eq(cmd, "take")) {
+        try cmdTake(io, alloc, w, rest);
+    } else if (eq(cmd, "move")) {
+        try cmdMove(io, alloc, w, rest);
     } else if (eq(cmd, "hook")) {
         hook.run(io, alloc, w, rest);
     } else if (eq(cmd, "gc")) {
@@ -1436,6 +1451,148 @@ fn cmdReorder(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     };
     defer r.deinit(alloc);
     try reportRewrite(io, alloc, w, &s, before_tree, r, "reordered", .checkout);
+}
+
+fn cmdTake(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 1) {
+        try w.writeAll("usage: sdt take <ref>\n");
+        try ui.hint(w, "copies that change onto this branch, keeping its identity; `sdt move` takes it off the other branch too");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "take");
+
+    const source = (try resolveChangeOrFail(io, alloc, w, &s, rest[0])) orelse return;
+    const branch = try s.headBranch();
+    defer alloc.free(branch);
+    if (try transfer.holds(&s, alloc, branch, source)) {
+        try w.print("that change is already on {s}\n", .{branch});
+        return;
+    }
+    const before_tree = branches.headTree(&s);
+
+    const r = transfer.take(&s, alloc, source, branch, .tip, nowSeconds(io)) catch |e| {
+        if (try reportTransferError(w, e, "take", branch)) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+
+    var buf: [Oid.len * 2]u8 = undefined;
+    try w.print("{s}{s}{s} took {s}{s}{s} onto {s}{s}{s}", .{
+        ui.on(.green), ui.check,               ui.off(),
+        ui.on(.cyan),  shortHex(source, &buf), ui.off(),
+        ui.on(.cyan),  branch,                 ui.off(),
+    });
+    try reportTransfer(io, alloc, w, &s, before_tree, r.destination_new, r.rewritten, r.conflicts, "`sdt undo` puts the old history back");
+}
+
+fn cmdMove(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len < 2) {
+        try w.writeAll("usage: sdt move <ref> <branch>\n");
+        try ui.hint(w, "moves that change onto <branch> and off the branch it is on, keeping its identity");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "move");
+
+    const change = (try resolveChangeOrFail(io, alloc, w, &s, rest[0])) orelse return;
+    const destination = rest[1];
+    if (!s.refExists(destination)) {
+        try w.print("no such branch: {s}\n", .{destination});
+        try ui.hint(w, "`sdt branch` lists them; `sdt new <name>` makes one");
+        return;
+    }
+    const current = try s.headBranch();
+    defer alloc.free(current);
+    const source = (transfer.branchHolding(&s, alloc, current, change) catch |e| switch (e) {
+        transfer.Error.AmbiguousSource => {
+            try w.writeAll("that change sits on more than one branch\n");
+            try ui.hint(w, "`sdt switch` to the one it should leave, then move it from there");
+            return;
+        },
+        else => return e,
+    }) orelse {
+        try w.writeAll("that change is not on any branch\n");
+        try ui.hint(w, "`sdt take <ref>` copies a change from anywhere in history");
+        return;
+    };
+    defer alloc.free(source);
+    if (eq(source, destination)) {
+        try w.print("that change is already on {s}\n", .{destination});
+        return;
+    }
+    const before_tree = branches.headTree(&s);
+
+    const r = transfer.move(&s, alloc, source, change, destination, .tip, nowSeconds(io)) catch |e| {
+        if (try reportTransferError(w, e, "move", destination)) return;
+        return e;
+    };
+    defer r.deinit(alloc);
+
+    var buf: [Oid.len * 2]u8 = undefined;
+    try w.print("{s}{s}{s} moved {s}{s}{s} from {s}{s}{s} to {s}{s}{s}", .{
+        ui.on(.green), ui.check,               ui.off(),
+        ui.on(.cyan),  shortHex(change, &buf), ui.off(),
+        ui.on(.cyan),  source,                 ui.off(),
+        ui.on(.cyan),  destination,            ui.off(),
+    });
+    if (r.source_new == null) try w.print("; {s} is unborn again", .{source});
+    const here: ?Oid = if (eq(current, destination))
+        r.destination_new
+    else if (eq(current, source))
+        r.source_new
+    else
+        s.readRef(current) catch null;
+    try reportTransfer(io, alloc, w, &s, before_tree, here, r.rewritten, r.conflicts, "`sdt undo` puts both branches back");
+}
+
+fn reportTransfer(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    before_tree: ?Oid,
+    here: ?Oid,
+    rewritten: usize,
+    conflicts: []const []u8,
+    undo_hint: []const u8,
+) !void {
+    if (rewritten > 1) try w.print(": {d} change(s) rewritten", .{rewritten});
+    try w.writeAll("\n");
+
+    var work = try openWork(io);
+    defer work.close(io);
+    const to_tree: Oid = if (here) |tip| blk: {
+        const change = s.readChange(tip) catch break :blk try s.writeTree(.{ .entries = &.{} });
+        defer object.freeChange(alloc, change);
+        break :blk change.tree;
+    } else try s.writeTree(.{ .entries = &.{} });
+    workspace.checkout(s, work, before_tree, to_tree) catch {};
+
+    if (conflicts.len != 0) {
+        try w.print("{d} path(s) came out conflicted, with both sides marked:\n", .{conflicts.len});
+        for (conflicts) |p| try w.print("  ! {s}\n", .{p});
+        try ui.hint(w, "fix the markers and `sdt save`, or `sdt undo` to put history back");
+        return;
+    }
+    try mirrorRewriteToGit(io, alloc, w, s);
+    try ui.hint(w, undo_hint);
+}
+
+fn reportTransferError(w: *std.Io.Writer, e: anyerror, what: []const u8, branch: []const u8) !bool {
+    switch (e) {
+        transfer.Error.NothingToDo => try w.print("nothing to {s}\n", .{what}),
+        transfer.Error.SameBranch => try w.print("that change is already on {s}\n", .{branch}),
+        transfer.Error.SourceNotFound => try w.writeAll("that ref is not a change on a branch\n"),
+        transfer.Error.DestinationNotFound => try w.print("nothing saved on {s} yet\n", .{branch}),
+        transfer.Error.InvalidPosition => try w.writeAll("that position is not on this branch\n"),
+        else => return reportHistoryError(w, e, what),
+    }
+    return true;
 }
 
 fn cmdGc(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -2922,9 +3079,19 @@ fn reportWorktreeFailure(w: *std.Io.Writer, e: anyerror) !void {
 
 fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
-        try w.writeAll("usage: sdt work <new-dir>\n");
+        try w.writeAll("usage: sdt work <new-dir> [--at <ref>]\n");
+        try w.writeAll("       sdt work list [--all] [--json]\n");
+        try w.writeAll("       sdt work status [<dir|name>] [--json]\n");
+        try w.writeAll("       sdt work merge <dir|name>\n");
+        try w.writeAll("       sdt work remove <dir|name> [--force]\n");
+        try w.writeAll("       sdt work restore <dir|name>\n");
         return;
     }
+    if (eq(rest[0], "list")) return cmdWorkList(io, alloc, w, rest[1..]);
+    if (eq(rest[0], "status")) return cmdWorkStatus(io, alloc, w, rest[1..]);
+    if (eq(rest[0], "merge")) return cmdWorkMerge(io, alloc, w, rest[1..]);
+    if (eq(rest[0], "remove")) return cmdWorkRemove(io, alloc, w, rest[1..]);
+    if (eq(rest[0], "restore")) return cmdWorkRestore(io, alloc, w, rest[1..]);
     const src_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
     defer alloc.free(src_abs);
     const dst = rest[0];
@@ -2965,6 +3132,7 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
             try reportWorktreeFailure(w, e);
             return;
         };
+        registerWorktree(io, alloc, &s, dst_abs);
         var id_hex: [16]u8 = undefined;
         _ = resolved.target.at.shortId(&id_hex);
         try w.print("worktree at {s}, holding {s}@{s}{s}", .{ dst, ui.on(.cyan), id_hex[0..12], ui.off() });
@@ -2979,7 +3147,387 @@ fn cmdWork(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         try reportWorktreeFailure(w, e);
         return;
     };
+    if (Store.discover(io, alloc, std.Io.Dir.cwd())) |found| {
+        var s = found;
+        defer s.deinit();
+        registerWorktree(io, alloc, &s, dst_abs);
+    } else |_| {}
     try w.print("instant copy-on-write worktree at {s}\n", .{dst});
+}
+
+fn registerWorktree(io: std.Io, alloc: std.mem.Allocator, s: *Store, dst_abs: []const u8) void {
+    const real = std.Io.Dir.cwd().realPathFileAlloc(io, dst_abs, alloc) catch return;
+    defer alloc.free(real);
+    const inner = std.fs.path.join(alloc, &.{ real, store.dir_name }) catch return;
+    defer alloc.free(inner);
+    std.Io.Dir.cwd().access(io, inner, .{}) catch return;
+    worktrees.forgetInherited(io, alloc, real) catch {};
+    const entry = worktrees.register(s, real) catch return;
+    entry.deinit(alloc);
+}
+
+const WorktreeLook = union(enum) {
+    active: worktrees.Inspection,
+    removed,
+    missing,
+
+    fn deinit(self: WorktreeLook, alloc: std.mem.Allocator) void {
+        if (self == .active) self.active.deinit(alloc);
+    }
+};
+
+fn lookAtWorktree(s: *Store, alloc: std.mem.Allocator, entry: worktrees.Entry) !WorktreeLook {
+    if (entry.state == .removed) return .removed;
+    const looked = worktrees.inspect(s, alloc, entry.id) catch |e| switch (e) {
+        worktrees.Error.WorktreeMissing => return .missing,
+        else => return e,
+    };
+    return .{ .active = looked };
+}
+
+fn worktreeLine(w: *std.Io.Writer, entry: worktrees.Entry, look: WorktreeLook) !void {
+    try w.print("{s}{s}{s} {s}{s}{s}  {s}{s}{s}", .{
+        ui.on(.dim),  ui.bullet,             ui.off(),
+        ui.on(.bold), worktrees.name(entry), ui.off(),
+        ui.on(.dim),  entry.original_path,   ui.off(),
+    });
+    switch (look) {
+        .removed => try w.print("  {s}(removed){s}\n", .{ ui.on(.yellow), ui.off() }),
+        .missing => try w.print("  {s}(missing){s}\n", .{ ui.on(.red), ui.off() }),
+        .active => |looked| {
+            var buf: [Oid.len * 2]u8 = undefined;
+            try w.print("  {s}{s}{s}", .{ ui.on(.cyan), looked.branch.?, ui.off() });
+            if (looked.tip) |tip| try w.print(" {s}", .{shortHex(tip, &buf)}) else try w.writeAll(" (unborn)");
+            if (looked.ahead == 0 and !looked.dirty()) {
+                try w.print("  {s}clean{s}\n", .{ ui.on(.green), ui.off() });
+                return;
+            }
+            try w.writeAll(" ");
+            if (looked.ahead != 0) try w.print(" {d} ahead", .{looked.ahead});
+            if (looked.dirty()) try w.print(" {s}{d} unsaved{s}", .{ ui.on(.yellow), looked.changes.len, ui.off() });
+            try w.writeAll("\n");
+        },
+    }
+}
+
+fn worktreeJson(w: *std.Io.Writer, entry: worktrees.Entry, look: WorktreeLook, with_changes: bool) !void {
+    try w.writeAll("{\"name\":");
+    try writeJsonString(w, worktrees.name(entry));
+    try w.writeAll(",\"path\":");
+    try writeJsonString(w, entry.original_path);
+    const state: []const u8 = switch (look) {
+        .active => "active",
+        .removed => "removed",
+        .missing => "missing",
+    };
+    try w.print(",\"id\":\"{s}\",\"state\":\"{s}\"", .{ entry.id, state });
+    switch (look) {
+        .active => |looked| {
+            try w.writeAll(",\"branch\":");
+            try writeJsonString(w, looked.branch.?);
+            if (looked.tip) |tip| {
+                var buf: [Oid.len * 2]u8 = undefined;
+                try w.print(",\"tip\":\"{s}\"", .{tip.toHex(&buf)});
+            } else {
+                try w.writeAll(",\"tip\":null");
+            }
+            try w.print(",\"ahead\":{d},\"unsaved\":{d}", .{ looked.ahead, looked.changes.len });
+            if (with_changes) {
+                try w.writeAll(",\"changes\":[");
+                for (looked.changes, 0..) |e, i| {
+                    if (i != 0) try w.writeByte(',');
+                    try w.print("{{\"kind\":\"{s}\",\"path\":", .{@tagName(e.kind)});
+                    try writeJsonString(w, e.path);
+                    try w.writeByte('}');
+                }
+                try w.writeByte(']');
+            }
+        },
+        .removed => {
+            try w.writeAll(",\"kept_at\":");
+            try writeJsonString(w, entry.path);
+        },
+        .missing => {},
+    }
+    try w.writeByte('}');
+}
+
+fn cmdWorkList(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const json = hasFlag(rest, "--json");
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const entries = try worktrees.list(&s, alloc, hasFlag(rest, "--all"));
+    defer {
+        for (entries) |entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    if (json) try w.writeByte('[');
+    for (entries, 0..) |entry, i| {
+        const look = try lookAtWorktree(&s, alloc, entry);
+        defer look.deinit(alloc);
+        if (json) {
+            if (i != 0) try w.writeByte(',');
+            try worktreeJson(w, entry, look, false);
+        } else {
+            try worktreeLine(w, entry, look);
+        }
+    }
+    if (json) {
+        try w.writeAll("]\n");
+        return;
+    }
+    if (entries.len == 0) {
+        try w.writeAll("no worktrees\n");
+        try ui.hint(w, "`sdt work <dir>` makes one in milliseconds");
+    }
+}
+
+fn cmdWorkStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const json = hasFlag(rest, "--json");
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const spec = firstArg(rest);
+    var one: [1]worktrees.Entry = undefined;
+    const entries: []worktrees.Entry = if (spec.len != 0) blk: {
+        one[0] = (try findWorktreeOrFail(&s, alloc, w, spec)) orelse return;
+        break :blk one[0..1];
+    } else try worktrees.list(&s, alloc, true);
+    defer {
+        for (entries) |entry| entry.deinit(alloc);
+        if (spec.len == 0) alloc.free(entries);
+    }
+    if (json) try w.writeByte('[');
+    for (entries, 0..) |entry, i| {
+        const look = try lookAtWorktree(&s, alloc, entry);
+        defer look.deinit(alloc);
+        if (json) {
+            if (i != 0) try w.writeByte(',');
+            try worktreeJson(w, entry, look, true);
+            continue;
+        }
+        try worktreeLine(w, entry, look);
+        switch (look) {
+            .removed => try w.print("    kept at {s}\n", .{entry.path}),
+            .missing => try w.writeAll("    the directory is gone\n"),
+            .active => |looked| {
+                var buf: [Oid.len * 2]u8 = undefined;
+                try w.print("    made from {s}{s}{s} at {s}\n", .{
+                    ui.on(.cyan), entry.branch, ui.off(), shortHex(entry.baseline, &buf),
+                });
+                for (looked.changes) |e| {
+                    const mark: []const u8 = switch (e.kind) {
+                        .added => "A",
+                        .modified => "M",
+                        .deleted => "D",
+                    };
+                    try w.print("    {s}{s}{s} {s}\n", .{ ui.on(.yellow), mark, ui.off(), e.path });
+                }
+            },
+        }
+    }
+    if (json) {
+        try w.writeAll("]\n");
+        return;
+    }
+    if (entries.len == 0) {
+        try w.writeAll("no worktrees\n");
+        try ui.hint(w, "`sdt work <dir>` makes one in milliseconds");
+    }
+}
+
+fn firstArg(rest: []const []const u8) []const u8 {
+    for (rest) |a| {
+        if (a.len != 0 and a[0] != '-') return a;
+    }
+    return "";
+}
+
+fn findWorktreeOrFail(s: *Store, alloc: std.mem.Allocator, w: *std.Io.Writer, spec: []const u8) !?worktrees.Entry {
+    return worktrees.find(s, alloc, spec) catch |e| switch (e) {
+        worktrees.Error.WorktreeNotFound => {
+            try w.print("{s}{s}{s} no worktree matches {s}{s}{s}\n", .{
+                ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+            });
+            try ui.hint(w, "`sdt work list` names every one; a path, a name, or an id prefix all work");
+            return null;
+        },
+        worktrees.Error.AmbiguousWorktree => {
+            try w.print("{s}{s}{s} more than one worktree matches {s}{s}{s}\n", .{
+                ui.on(.red), ui.cross, ui.off(), ui.on(.bold), spec, ui.off(),
+            });
+            try ui.hint(w, "`sdt work list` shows them; give the path");
+            return null;
+        },
+        else => return e,
+    };
+}
+
+fn cmdWorkMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const spec = firstArg(rest);
+    if (spec.len == 0) {
+        try w.writeAll("usage: sdt work merge <dir|name>\n");
+        try ui.hint(w, "brings the changes saved in that worktree onto this branch; the worktree stays");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "merge");
+
+    const entry = (try findWorktreeOrFail(&s, alloc, w, spec)) orelse return;
+    defer entry.deinit(alloc);
+    const name = worktrees.name(entry);
+    const into = try s.headBranch();
+    defer alloc.free(into);
+    const author = try config.author(&s, alloc);
+    defer alloc.free(author);
+    const before_tree = branches.headTree(&s);
+
+    const r = worktrees.mergeWorktree(&s, alloc, entry.id, into, author, nowSeconds(io)) catch |e| switch (e) {
+        worktrees.Error.WorktreeDirty => {
+            try w.print("{s}{s}{s} {s} has unsaved edits\n", .{ ui.on(.red), ui.cross, ui.off(), name });
+            try ui.hint(w, "run `sdt save` inside it first, so the merge takes everything");
+            return;
+        },
+        worktrees.Error.NothingToMerge => {
+            try w.print("nothing to merge: {s} has saved nothing since it was made\n", .{name});
+            return;
+        },
+        worktrees.Error.WorktreeRemoved => {
+            try w.print("{s} was removed\n", .{name});
+            try ui.hint(w, "`sdt work restore <dir|name>` puts it back first");
+            return;
+        },
+        worktrees.Error.WorktreeMissing => {
+            try w.print("{s} is not on disk\n", .{entry.original_path});
+            return;
+        },
+        history.Error.UnbornBranch => {
+            try w.writeAll("nothing saved on this branch yet\n");
+            return;
+        },
+        else => return e,
+    };
+    defer r.deinit(alloc);
+
+    const tip = try s.readChange(r.new);
+    defer object.freeChange(alloc, tip);
+    var work = try openWork(io);
+    defer work.close(io);
+    workspace.checkout(&s, work, before_tree, tip.tree) catch {};
+
+    var buf: [Oid.len * 2]u8 = undefined;
+    const how: []const u8 = if (r.fast_forward) " (fast-forward)" else "";
+    try w.print("{s}{s}{s} merged {s}{s}{s} into {s}{s}{s}{s}, now at {s}{s}{s}\n", .{
+        ui.on(.green), ui.check,     ui.off(),
+        ui.on(.bold),  name,         ui.off(),
+        ui.on(.cyan),  into,         ui.off(),
+        how,           ui.on(.cyan), shortHex(r.new, &buf),
+        ui.off(),
+    });
+    if (!r.clean()) {
+        merge.saveState(&s, into, r.prev, r.conflicts) catch {};
+        try w.print("{d} conflict(s):\n", .{r.conflicts.len});
+        for (r.conflicts) |p| try w.print("  ! {s}\n", .{p});
+        try w.writeAll("fix the markers, then `sdt resolve <file>` each, or `sdt resolve --abort`\n");
+        return;
+    }
+    try mirrorRewriteToGit(io, alloc, w, &s);
+    try ui.hint(w, "`sdt undo` puts this branch back; the worktree is untouched either way");
+}
+
+fn cmdWorkRemove(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const spec = firstArg(rest);
+    if (spec.len == 0) {
+        try w.writeAll("usage: sdt work remove <dir|name> [--force]\n");
+        try ui.hint(w, "sets the directory aside; `sdt work restore` brings it back");
+        return;
+    }
+    const force = hasFlag(rest, "--force") or hasFlag(rest, "-f");
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const entry = (try findWorktreeOrFail(&s, alloc, w, spec)) orelse return;
+    defer entry.deinit(alloc);
+    const name = worktrees.name(entry);
+    if (entry.state == .removed) {
+        try w.print("{s} is already removed\n", .{name});
+        try ui.hint(w, "`sdt work restore <dir|name>` puts it back");
+        return;
+    }
+    const look = try lookAtWorktree(&s, alloc, entry);
+    defer look.deinit(alloc);
+    if (look == .missing) {
+        try w.print("{s} is not on disk\n", .{entry.original_path});
+        try ui.hint(w, "it was deleted outside sdt, so there is nothing to set aside");
+        return;
+    }
+    if (look.active.dirty() and !force) {
+        try w.print("{s}{s}{s} {s} has {d} unsaved edit(s)\n", .{
+            ui.on(.red), ui.cross, ui.off(), name, look.active.changes.len,
+        });
+        for (look.active.changes) |e| try w.print("  {s}\n", .{e.path});
+        try ui.hint(w, "run `sdt save` inside it, or `sdt work remove <dir|name> --force`");
+        return;
+    }
+    var work = try openWork(io);
+    defer work.close(io);
+    const origin_abs = try work.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(origin_abs);
+    const removed = worktrees.remove(&s, alloc, origin_abs, entry.id) catch |e| switch (e) {
+        worktrees.Error.CannotRemoveOrigin => {
+            try w.writeAll("that is the repo you are standing in\n");
+            return;
+        },
+        worktrees.Error.RestoreTargetExists => {
+            try w.print("something already sits where {s} would be kept\n", .{name});
+            return;
+        },
+        worktrees.Error.WorktreeMissing => {
+            try w.print("{s} is not on disk\n", .{entry.original_path});
+            return;
+        },
+        else => return e,
+    };
+    defer removed.deinit(alloc);
+    try w.print("{s}{s}{s} removed worktree {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.bold), name, ui.off(),
+    });
+    if (look.active.dirty()) try w.print("  its {d} unsaved edit(s) went with it\n", .{look.active.changes.len});
+    try w.print("  {s}kept at {s}{s}\n", .{ ui.on(.dim), removed.path, ui.off() });
+    try ui.hint(w, "`sdt work restore <dir|name>` puts it back");
+}
+
+fn cmdWorkRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const spec = firstArg(rest);
+    if (spec.len == 0) {
+        try w.writeAll("usage: sdt work restore <dir|name>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const entry = (try findWorktreeOrFail(&s, alloc, w, spec)) orelse return;
+    defer entry.deinit(alloc);
+    const name = worktrees.name(entry);
+    const restored = worktrees.restore(&s, alloc, entry.id) catch |e| switch (e) {
+        worktrees.Error.AlreadyRegistered => {
+            try w.print("{s} is not removed\n", .{name});
+            return;
+        },
+        worktrees.Error.RestoreTargetExists => {
+            try w.print("something already sits at {s}\n", .{entry.original_path});
+            try ui.hint(w, "move it away, then restore again");
+            return;
+        },
+        worktrees.Error.WorktreeMissing => {
+            try w.print("the removed copy at {s} is gone\n", .{entry.path});
+            return;
+        },
+        else => return e,
+    };
+    defer restored.deinit(alloc);
+    try w.print("{s}{s}{s} restored worktree {s}{s}{s} at {s}\n", .{
+        ui.on(.green), ui.check, ui.off(), ui.on(.bold), name, ui.off(), restored.path,
+    });
 }
 
 fn cmdRestore(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -6341,6 +6889,8 @@ test {
     _ = mesh;
     _ = @import("index.zig");
     _ = settings;
+    _ = worktrees;
+    _ = transfer;
 }
 
 extern "c" fn chdir(path: [*:0]const u8) c_int;
@@ -6820,6 +7370,150 @@ test "drop removes a change and leaves its content in the working tree" {
     const back = try f.chain();
     defer alloc.free(back);
     try std.testing.expectEqual(@as(usize, 2), back.len);
+}
+
+test "take copies a change from another branch and one undo removes it again" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    _ = try f.save("root");
+    try branches.create(&f.store, "feature");
+    try branches.switchTo(&f.store, f.root, "feature");
+    try f.write("feature.txt", "feature\n");
+    const on_feature = try f.save("feature work");
+    try branches.switchTo(&f.store, f.root, "main");
+
+    try cmdTake(io, alloc, f.w(), &.{"feature"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "took") != null);
+    const chain = try f.chain();
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+
+    const taken = try f.store.readChange(chain[1]);
+    defer object.freeChange(alloc, taken);
+    const original = try f.store.readChange(on_feature);
+    defer object.freeChange(alloc, original);
+    try std.testing.expectEqualSlices(u8, &original.change_id, &taken.change_id);
+    try std.testing.expectEqualStrings("feature work", taken.message);
+
+    const on_disk = try f.read("feature.txt");
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("feature\n", on_disk);
+    try std.testing.expect((try f.store.readRef("feature")).eql(on_feature));
+
+    f.clear();
+    try cmdTake(io, alloc, f.w(), &.{"feature"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "already on main") != null);
+
+    f.clear();
+    try cmdUndo(io, alloc, f.w());
+    const back = try f.chain();
+    defer alloc.free(back);
+    try std.testing.expectEqual(@as(usize, 1), back.len);
+}
+
+test "move sends a change to another branch and one undo puts both branches back" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    const root = try f.save("root");
+    try branches.create(&f.store, "feature");
+    try f.write("stray.txt", "stray\n");
+    const stray = try f.save("stray");
+
+    try cmdMove(io, alloc, f.w(), &.{ "main", "feature" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "moved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "from main to feature") != null);
+    try std.testing.expect((try f.store.readRef("main")).eql(root));
+    const feature_chain = try history.chainOf(&f.store, alloc, try f.store.readRef("feature"));
+    defer alloc.free(feature_chain);
+    try std.testing.expectEqual(@as(usize, 2), feature_chain.len);
+    const moved = try f.store.readChange(feature_chain[1]);
+    defer object.freeChange(alloc, moved);
+    try std.testing.expectEqualStrings("stray", moved.message);
+    try std.testing.expectError(error.FileNotFound, f.root.access(io, "stray.txt", .{}));
+
+    f.clear();
+    try cmdUndo(io, alloc, f.w());
+    try std.testing.expect((try f.store.readRef("main")).eql(stray));
+    try std.testing.expect((try f.store.readRef("feature")).eql(root));
+}
+
+test "work list, status, merge, remove, and restore run the worktree's whole life" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("a.txt", "a\n");
+    _ = try f.save("root");
+
+    try cmdWork(io, alloc, f.w(), &.{"../copy"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "worktree at ../copy") != null);
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{"list"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "copy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "clean") != null);
+
+    var copy = try f.tmp.dir.openDir(io, "copy", .{ .iterate = true });
+    defer copy.close(io);
+    {
+        var child = try Store.open(io, alloc, copy);
+        defer child.deinit();
+        try copy.writeFile(io, .{ .sub_path = "b.txt", .data = "b\n" });
+        _ = try workspace.snapshot(&child, copy, "T <t@e.com>", "in the copy", nowSeconds(io));
+    }
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{ "status", "copy" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "1 ahead") != null);
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{ "list", "--json" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "\"ahead\":1") != null);
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{ "merge", "copy" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "merged copy into main") != null);
+    const chain = try f.chain();
+    defer alloc.free(chain);
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+    const merged = try f.read("b.txt");
+    defer alloc.free(merged);
+    try std.testing.expectEqualStrings("b\n", merged);
+
+    try copy.writeFile(io, .{ .sub_path = "b.txt", .data = "edited\n" });
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{ "remove", "copy" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "unsaved") != null);
+    try f.tmp.dir.access(io, "copy", .{});
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{ "remove", "copy", "--force" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "removed worktree copy") != null);
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "copy", .{}));
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{"list"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "no worktrees") != null);
+
+    f.clear();
+    try cmdWork(io, alloc, f.w(), &.{ "restore", "copy" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "restored worktree copy") != null);
+    try f.tmp.dir.access(io, "copy", .{});
+
+    f.clear();
+    try cmdUndo(io, alloc, f.w());
+    const back = try f.chain();
+    defer alloc.free(back);
+    try std.testing.expectEqual(@as(usize, 1), back.len);
 }
 
 test "branch -d refuses the current branch, refuses unmerged work, then deletes" {

@@ -56,6 +56,15 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a branch -d 'list branches'
     \\complete -c sdt -n __fish_use_subcommand -a branches -d 'list branches'
     \\complete -c sdt -n __fish_use_subcommand -a work -d 'instant copy-on-write worktree'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -a list -d 'every worktree, its branch, and what is unsaved'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -a status -d 'one worktree in detail, or all of them'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -a merge -d "bring a worktree's saved changes back here"
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -a remove -d 'set a worktree aside (refuses unsaved edits)'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -a restore -d 'put a removed worktree back'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -l at -d 'fork from a moment instead of the live tree' -r
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -l all -d 'include removed worktrees'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -l force -d 'remove even with unsaved edits'
+    \\complete -c sdt -n '__fish_seen_subcommand_from work wt' -l json -d 'machine-readable output'
     \\complete -c sdt -n __fish_use_subcommand -a restore -d 'put one file back, from the last save or any state'
     \\complete -c sdt -n __fish_use_subcommand -a merge -d 'merge another branch into this one'
     \\complete -c sdt -n __fish_use_subcommand -a absorb -d 'fold edits into the changes they belong to'
@@ -66,6 +75,8 @@ const fish_script =
     \\complete -c sdt -n __fish_use_subcommand -a split -d 'split one change in two, by path or hunk'
     \\complete -c sdt -n __fish_use_subcommand -a drop -d 'remove a change, keep its edits in the tree'
     \\complete -c sdt -n __fish_use_subcommand -a reorder -d 'reorder the last changes, 1 = oldest'
+    \\complete -c sdt -n __fish_use_subcommand -a take -d 'copy a change from another branch onto this one'
+    \\complete -c sdt -n __fish_use_subcommand -a move -d 'move a change onto another branch'
     \\complete -c sdt -n '__fish_seen_subcommand_from squash sq' -s m -d 'message for the collapsed change' -r
     \\complete -c sdt -n '__fish_seen_subcommand_from squash sq' -l at -d 'end the span at this ref' -r
     \\complete -c sdt -n '__fish_seen_subcommand_from split spl' -s m -d 'message for the extracted change' -r
@@ -171,6 +182,8 @@ const zsh_script =
     \\    'split:split one change in two, by path or hunk'
     \\    'drop:remove a change, keep its edits in the tree'
     \\    'reorder:reorder the last changes, 1 = oldest'
+    \\    'take:copy a change from another branch onto this one'
+    \\    'move:move a change onto another branch'
     \\    'provenance:show which agent/prompt produced each change'
     \\    'why:who last authored a file'
     \\    'undo:revert the last change-making operation'
@@ -236,6 +249,10 @@ const zsh_script =
     \\    compadd -- -m --at
     \\  elif (( CURRENT >= 3 )) && [[ ${words[2]} == (branch|b|br|branches) ]]; then
     \\    compadd -- -d -D
+    \\  elif (( CURRENT == 3 )) && [[ ${words[2]} == (work|wt) ]]; then
+    \\    compadd list status merge remove restore -- --at
+    \\  elif (( CURRENT >= 4 )) && [[ ${words[2]} == (work|wt) ]]; then
+    \\    compadd -- --all --force --json
     \\  fi
     \\}
     \\_gr "$@"
@@ -249,7 +266,7 @@ const bash_script =
     \\  local cur prev
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
-    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync u undo unseal update us version watch why work wt"
+    \\  local commands="ab absorb am amend at attest b back bk bl blame bn br branch branches bundle cat cfg ci cl clone co collapse comp completions config cp d desc diff doc doctor dr drop export f fetch g gc gd grade get gn green help hook import init k key l lfs log merge mg mo moments move mv n new note notes pl point prov provenance ps pt pull push r rb rc rebase recap receive recv redo relay reorder res resolve restore rev rewind ro rot rotate rs rv rw save seal send serve setup sh share show sl snap snapshot snd sp spl split sq squash srv st status super sv sw switch sync take tk u undo unseal update us version watch why work wt"
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     \\    return 0
@@ -287,6 +304,14 @@ const bash_script =
     \\    COMPREPLY=( $(compgen -W "-d -D" -- "$cur") )
     \\    return 0
     \\  fi
+    \\  if [[ "${COMP_WORDS[1]}" == "work" || "${COMP_WORDS[1]}" == "wt" ]]; then
+    \\    if [[ $COMP_CWORD -eq 2 ]]; then
+    \\      COMPREPLY=( $(compgen -W "list status merge remove restore --at" -- "$cur") )
+    \\    else
+    \\      COMPREPLY=( $(compgen -W "--all --force --json" -- "$cur") )
+    \\    fi
+    \\    return 0
+    \\  fi
     \\}
     \\complete -F _sdt sdt
     \\
@@ -302,4 +327,14 @@ test "parse maps known shells" {
 test "script contents" {
     try std.testing.expect(std.mem.indexOf(u8, script(.fish), "save") != null);
     try std.testing.expect(script(.bash).len > 0);
+}
+
+test "every shell completes take, move, and the work subcommands" {
+    inline for (.{ Shell.fish, Shell.zsh, Shell.bash }) |shell| {
+        const text = script(shell);
+        try std.testing.expect(std.mem.indexOf(u8, text, "take") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "move") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "list status merge remove restore") != null or
+            std.mem.indexOf(u8, text, "-a restore") != null);
+    }
 }

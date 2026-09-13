@@ -2,6 +2,7 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const history = @import("history.zig");
+const branches = @import("branches.zig");
 const replay = @import("replay.zig");
 const oplog = @import("oplog.zig");
 const Store = @import("store.zig").Store;
@@ -13,6 +14,7 @@ pub const Error = error{
     DestinationNotFound,
     InvalidPosition,
     NothingToDo,
+    AmbiguousSource,
 };
 
 pub const Position = union(enum) {
@@ -273,6 +275,7 @@ pub fn move(
         .prev = destination_prev,
         .new = destination_new,
         .timestamp = timestamp,
+        .joined = true,
     });
 
     var conflicts: std.ArrayList([]u8) = .empty;
@@ -390,8 +393,77 @@ test "move removes from source, restacks descendants, and preserves the change o
 
     try oplog.undo(&f.store, null);
     try testing.expect((try f.store.readRef("main")).eql(destination));
-    try oplog.undo(&f.store, null);
     try testing.expect((try f.store.readRef("feature")).eql(source_tip));
+    try oplog.redo(&f.store, null);
+    try testing.expect((try f.store.readRef("main")).eql(result.destination_new));
+    try testing.expect((try f.store.readRef("feature")).eql(result.source_new.?));
+}
+
+test "move of the only change on a branch leaves it unborn, and one undo brings it back" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const root = try f.commit(null, &.{"root"}, "root");
+    const lone = try f.commit(null, &.{"lone"}, "lone");
+    try f.store.updateRef("main", root);
+    try f.store.updateRef("scratch", lone);
+
+    const result = try move(&f.store, testing.allocator, "scratch", lone, "main", .tip, 5);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.source_new == null);
+    try testing.expect(!f.store.refExists("scratch"));
+    try testing.expect(try f.hasPath(result.destination_new, "lone"));
+
+    try oplog.undo(&f.store, null);
+    try testing.expect((try f.store.readRef("scratch")).eql(lone));
+    try testing.expect((try f.store.readRef("main")).eql(root));
+}
+
+pub fn branchHolding(store: *Store, alloc: std.mem.Allocator, preferred: []const u8, change: Oid) !?[]u8 {
+    if (try holds(store, alloc, preferred, change)) return try alloc.dupe(u8, preferred);
+    const names = try branches.list(store, alloc);
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    var found: ?[]u8 = null;
+    errdefer if (found) |f| alloc.free(f);
+    for (names) |name| {
+        if (std.mem.eql(u8, name, preferred)) continue;
+        if (!try holds(store, alloc, name, change)) continue;
+        if (found != null) return Error.AmbiguousSource;
+        found = try alloc.dupe(u8, name);
+    }
+    return found;
+}
+
+pub fn holds(store: *Store, alloc: std.mem.Allocator, branch: []const u8, change: Oid) !bool {
+    const tip = store.readRef(branch) catch return false;
+    const chain = try history.chainOf(store, alloc, tip);
+    defer alloc.free(chain);
+    return history.indexOf(chain, change) != null;
+}
+
+test "branchHolding prefers the current branch and refuses two other candidates" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const root = try f.commit(null, &.{"root"}, "root");
+    const shared = try f.commit(root, &.{ "root", "shared" }, "shared");
+    const elsewhere = try f.commit(root, &.{ "root", "elsewhere" }, "elsewhere");
+    try f.store.updateRef("main", shared);
+    try f.store.updateRef("a", shared);
+    try f.store.updateRef("b", shared);
+    try f.store.updateRef("c", elsewhere);
+
+    const on_main = (try branchHolding(&f.store, testing.allocator, "main", shared)).?;
+    defer testing.allocator.free(on_main);
+    try testing.expectEqualStrings("main", on_main);
+
+    const only_c = (try branchHolding(&f.store, testing.allocator, "main", elsewhere)).?;
+    defer testing.allocator.free(only_c);
+    try testing.expectEqualStrings("c", only_c);
+
+    try testing.expectError(Error.AmbiguousSource, branchHolding(&f.store, testing.allocator, "c", shared));
+    try testing.expect((try branchHolding(&f.store, testing.allocator, "main", Oid.ofBytes("nowhere"))) == null);
 }
 
 test "move refuses the same branch without changing it" {

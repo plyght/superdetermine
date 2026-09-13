@@ -31,7 +31,7 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Durable by default | An acknowledged write is on the device, not in a cache a power cut empties. The barrier is spent where a name is published, so ordinary object writes stay at the speed they were. `sdt config durability fast` trades it back. |
 | Working copy is always a change | There is no staging area and no stash. `sdt save` names a boundary. It is not how `sdt` keeps your work. |
 | Operation log | `sdt undo` and `sdt redo` across the whole repo. Nothing gets lost. |
-| Instant copy-on-write worktrees | `sdt work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). |
+| Instant copy-on-write worktrees | `sdt work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). `sdt work list`, `status`, `merge`, `remove`, and `restore` run its whole life from the repo it came from. |
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
 | Three-way merge + resolve | Conflict markers, then `sdt resolve <file>` / `sdt resolve --abort`. |
 | Absorb | `sdt absorb` folds working edits into the changes they belong to. |
@@ -43,7 +43,7 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Scriptable output | `sdt status --json` and `sdt log --json`; `sdt completions <fish\|zsh\|bash>`. |
 | Bidirectional git interop | Import and export full history, branches, and tags. Push and pull to GitHub. |
 | Git LFS interop | Pointers resolve to real content on import and clean back to pointers on export, sharing `.git/lfs/objects` with git-lfs. |
-| History you can edit | `rebase`, `squash`, `split` (by path or by hunk), `reorder`, `amend --at`, `drop`. Every one is reversible with `sdt undo`. |
+| History you can edit | `rebase`, `squash`, `split` (by path or by hunk), `reorder`, `amend --at`, `drop`, `take`, `move`. Every one is reversible with `sdt undo`. |
 | Converges without a service | The operation log is a DAG with a merge that cannot fail, so two machines reconcile through `sdt sync`, or through any dumb transport that moves files. |
 | **Live multiplayer** | `sdt mesh` puts every peer in one room. Everyone is a writer, edits land on the others in milliseconds, and there is no server: peers find each other by broadcast and converge by merge. |
 | Shared verdicts | A green earned on one machine answers on every machine, because a verdict is keyed by content and not by who ran it. |
@@ -138,6 +138,9 @@ sdt show <ref>             # sh   what one change or moment contains
 sdt cat <ref>:file.txt     #      one file as of any state, without moving the tree
 sdt new feature            # n    branch and switch
 sdt work ../agent-copy     # wt   instant worktree
+sdt work list              #      every worktree, what it saved, what it has not
+sdt work merge agent-copy  #      bring its saved changes back here
+sdt work remove agent-copy #      set it aside (refuses unsaved edits; restore brings it back)
 sdt undo   /   sdt redo     # u   /  r
 sdt blame file.txt         # per-line authorship + provenance
 sdt absorb                 # fold edits into the changes they belong to
@@ -166,6 +169,8 @@ sdt reorder 3 1 2          # ro   permute the last N changes
 sdt amend --at <ref>       # am   fold working edits into a named change
 sdt drop <ref>             # dr   remove a change, keep its content in the tree
 sdt point <ref>            # pt   move the branch tip anywhere
+sdt take <ref>             # tk   copy a change from another branch onto this one
+sdt move <ref> <branch>    # mv   move a change onto another branch, one undo for both
 ```
 
 Working with git:

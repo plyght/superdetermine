@@ -47,6 +47,7 @@ pub const OpRecord = struct {
     prev: Oid,
     new: Oid,
     timestamp: i64,
+    joined: bool = false,
 };
 
 // Record wire format, one line per op:
@@ -62,8 +63,9 @@ pub fn record(store: *Store, op: OpRecord) !void {
     _ = op.prev.toHex(&prev_hex);
     _ = op.new.toHex(&new_hex);
 
-    const line = try std.fmt.allocPrint(alloc, "{s} {s} {s} {d} {s}\n", .{
+    const line = try std.fmt.allocPrint(alloc, "{s}{s} {s} {s} {d} {s}\n", .{
         op.kind.label(),
+        if (op.joined) "+" else "",
         prev_hex,
         new_hex,
         op.timestamp,
@@ -78,7 +80,9 @@ pub fn record(store: *Store, op: OpRecord) !void {
 
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) !OpRecord {
     var it = std.mem.splitScalar(u8, line, ' ');
-    const kind_s = it.next() orelse return error.InvalidOpRecord;
+    const kind_raw = it.next() orelse return error.InvalidOpRecord;
+    const joined = std.mem.endsWith(u8, kind_raw, "+");
+    const kind_s = if (joined) kind_raw[0 .. kind_raw.len - 1] else kind_raw;
     const prev_s = it.next() orelse return error.InvalidOpRecord;
     const new_s = it.next() orelse return error.InvalidOpRecord;
     const ts_s = it.next() orelse return error.InvalidOpRecord;
@@ -91,6 +95,7 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) !OpRecord {
         .prev = try Oid.fromHex(prev_s),
         .new = try Oid.fromHex(new_s),
         .timestamp = try std.fmt.parseInt(i64, ts_s, 10),
+        .joined = joined,
     };
 }
 
@@ -188,17 +193,22 @@ pub fn undo(store: *Store, work_dir: ?std.Io.Dir) !void {
     const reals = realCount(records);
     if (pointer == 0 or reals == 0) return error.NothingToUndo;
 
-    const target = nthReal(records, pointer - 1).?;
+    const unit = nthReal(records, pointer - 1).?;
 
-    try applyOp(store, target, target.prev, work_dir);
-
-    try record(store, .{
-        .kind = .undo,
-        .branch = target.branch,
-        .prev = target.new,
-        .new = target.prev,
-        .timestamp = nowSeconds(store),
-    });
+    const now = nowSeconds(store);
+    var i = unit.len;
+    while (i > 0) : (i -= 1) {
+        const target = unit[i - 1];
+        try applyOp(store, target, target.prev, work_dir);
+        try record(store, .{
+            .kind = .undo,
+            .branch = target.branch,
+            .prev = target.new,
+            .new = target.prev,
+            .timestamp = now,
+            .joined = i != unit.len,
+        });
+    }
 }
 
 /// Re-apply the most recently undone real op. Only valid when the last effective
@@ -220,17 +230,20 @@ pub fn redo(store: *Store, work_dir: ?std.Io.Dir) !void {
     const reals = realCount(records);
     if (pointer >= reals) return error.NothingToRedo;
 
-    const target = nthReal(records, pointer).?;
+    const unit = nthReal(records, pointer).?;
 
-    try applyOp(store, target, target.new, work_dir);
-
-    try record(store, .{
-        .kind = .redo,
-        .branch = target.branch,
-        .prev = target.prev,
-        .new = target.new,
-        .timestamp = nowSeconds(store),
-    });
+    const now = nowSeconds(store);
+    for (unit, 0..) |target, i| {
+        try applyOp(store, target, target.new, work_dir);
+        try record(store, .{
+            .kind = .redo,
+            .branch = target.branch,
+            .prev = target.prev,
+            .new = target.new,
+            .timestamp = now,
+            .joined = i != 0,
+        });
+    }
 }
 
 fn isMeta(k: OpKind) bool {
@@ -241,18 +254,23 @@ fn isMeta(k: OpKind) bool {
 fn realCount(records: []const OpRecord) usize {
     var n: usize = 0;
     for (records) |r| {
-        if (!isMeta(r.kind)) n += 1;
+        if (!isMeta(r.kind) and !r.joined) n += 1;
     }
     return n;
 }
 
 /// The i-th real op (0-based), skipping meta records.
-fn nthReal(records: []const OpRecord, i: usize) ?OpRecord {
+fn nthReal(records: []const OpRecord, i: usize) ?[]const OpRecord {
     var n: usize = 0;
-    for (records) |r| {
-        if (isMeta(r.kind)) continue;
-        if (n == i) return r;
-        n += 1;
+    for (records, 0..) |r, start| {
+        if (isMeta(r.kind) or r.joined) continue;
+        if (n != i) {
+            n += 1;
+            continue;
+        }
+        var end = start + 1;
+        while (end < records.len and !isMeta(records[end].kind) and records[end].joined) end += 1;
+        return records[start..end];
     }
     return null;
 }
@@ -260,18 +278,18 @@ fn nthReal(records: []const OpRecord, i: usize) ?OpRecord {
 /// Count of real ops currently applied: total reals minus the net backward shift
 /// from the trailing run of undo/redo meta records.
 fn currentPointer(records: []const OpRecord) usize {
-    var net_back: usize = 0;
+    var net_back: isize = 0;
     var i = records.len;
     while (i > 0) : (i -= 1) {
         const k = records[i - 1].kind;
-        if (k == .undo) {
-            net_back += 1;
-        } else if (k == .redo) {
-            if (net_back > 0) net_back -= 1;
-        } else break;
+        if (!isMeta(k)) break;
+        if (records[i - 1].joined) continue;
+        if (k == .undo) net_back += 1 else net_back -= 1;
     }
     const reals = realCount(records);
-    return if (net_back >= reals) 0 else reals - net_back;
+    if (net_back <= 0) return reals;
+    const back: usize = @intCast(net_back);
+    return if (back >= reals) 0 else reals - back;
 }
 
 // --- tests ---
@@ -418,6 +436,61 @@ test "the linear log keeps one operation head, and undo tracks it" {
     const lo = (try lastOp(&store, alloc)).?;
     defer alloc.free(lo.branch);
     try testing.expectEqual(OpKind.redo, lo.kind);
+}
+
+test "joined records undo and redo as one operation" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const a = Oid.ofBytes("main A");
+    const b = Oid.ofBytes("main B");
+    const x = Oid.ofBytes("feature X");
+    const y = Oid.ofBytes("feature Y");
+
+    try store.updateRef("main", a);
+    try record(&store, .{ .kind = .snapshot, .branch = "main", .prev = Oid.zero(), .new = a, .timestamp = 1 });
+    try store.updateRef("feature", x);
+    try record(&store, .{ .kind = .snapshot, .branch = "feature", .prev = Oid.zero(), .new = x, .timestamp = 2 });
+
+    try store.updateRef("feature", y);
+    try record(&store, .{ .kind = .other, .branch = "feature", .prev = x, .new = y, .timestamp = 3 });
+    try store.updateRef("main", b);
+    try record(&store, .{ .kind = .other, .branch = "main", .prev = a, .new = b, .timestamp = 3, .joined = true });
+
+    {
+        const records = try readAll(&store, alloc);
+        defer {
+            for (records) |r| alloc.free(r.branch);
+            alloc.free(records);
+        }
+        try testing.expectEqual(@as(usize, 4), records.len);
+        try testing.expect(records[3].joined);
+        try testing.expectEqual(OpKind.other, records[3].kind);
+        try testing.expectEqual(@as(usize, 3), realCount(records));
+    }
+
+    try undo(&store, null);
+    try testing.expect((try store.readRef("main")).eql(a));
+    try testing.expect((try store.readRef("feature")).eql(x));
+
+    try redo(&store, null);
+    try testing.expect((try store.readRef("main")).eql(b));
+    try testing.expect((try store.readRef("feature")).eql(y));
+    try testing.expectError(error.NothingToRedo, redo(&store, null));
+
+    try undo(&store, null);
+    try undo(&store, null);
+    try testing.expect(!store.refExists("feature"));
+    try testing.expect((try store.readRef("main")).eql(a));
+
+    try redo(&store, null);
+    try testing.expect((try store.readRef("feature")).eql(x));
+    try testing.expect((try store.readRef("main")).eql(a));
 }
 
 test "lastOp is null on empty log" {
