@@ -4,6 +4,7 @@ const workspace = @import("workspace.zig");
 const moment = @import("moment.zig");
 const sched = @import("sched.zig");
 const grade = @import("grade.zig");
+const git = @import("git.zig");
 const ui = @import("ui.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
@@ -65,6 +66,12 @@ pub fn signature(store: *Store, work_dir: std.Io.Dir) !Oid {
     return hasher.finalOid();
 }
 
+fn sameFingerprint(a: ?Oid, b: ?Oid) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.?.eql(b.?);
+}
+
 fn nowSeconds(store: *Store) i64 {
     return @intCast(@divTrunc(std.Io.Clock.now(.real, store.io).nanoseconds, 1_000_000_000));
 }
@@ -92,6 +99,7 @@ pub fn live(
     const out = &w.interface;
 
     var last = signature(store, work_dir) catch oid.Oid.zero();
+    var last_git = git.facadeFingerprint(store, work_dir);
 
     while (true) {
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(mset.interval_ms), .awake) catch {};
@@ -99,14 +107,27 @@ pub fn live(
         // The content signature is the cheap gate: unchanged tree, no work, and
         // therefore no CPU at all while the developer is thinking.
         const sig = signature(store, work_dir) catch continue;
-        if (sig.eql(last)) continue;
+        const git_sig = git.facadeFingerprint(store, work_dir);
+        const git_moved = !sameFingerprint(last_git, git_sig);
+        if (sig.eql(last) and !git_moved) continue;
         last = sig;
+        last_git = git_sig;
 
         if (!sched.due(store, sset)) continue;
 
         const r = sched.tick(store, work_dir, ctx, mset, sset) catch continue;
         if (r.skipped != null) continue;
 
+        if (r.absorbed) |a| {
+            if (a.commits != 0) {
+                out.print("{s}absorbed {d} git commit{s} on {s}{s}\n", .{
+                    ui.on(.dim), a.commits, if (a.commits == 1) "" else "s", a.branch(), ui.off(),
+                }) catch {};
+            }
+            if (a.followed) {
+                out.print("{s}followed git to {s}{s}\n", .{ ui.on(.dim), a.head(), ui.off() }) catch {};
+            }
+        }
         if (r.captured) {
             out.print("{s}captured{s}", .{ ui.on(.dim), ui.off() }) catch {};
             if (r.graded != 0) {

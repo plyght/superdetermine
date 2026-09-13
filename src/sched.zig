@@ -12,6 +12,7 @@ const proc = @import("proc.zig");
 const config = @import("config.zig");
 const freshness = @import("freshness.zig");
 const flow = @import("flow.zig");
+const git = @import("git.zig");
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Oid = oid.Oid;
@@ -158,6 +159,7 @@ pub const TickResult = struct {
     /// Set when a green-to-red flip was found and searched back to a boundary.
     boundary: ?grade.Break = null,
     skipped: ?[]const u8 = null,
+    absorbed: ?git.Absorbed = null,
 };
 
 /// Is this still a repo, or the husk of one somebody is deleting?
@@ -261,6 +263,13 @@ fn tickInner(
     // reads the recorded answer for free.
     out.freshened = freshen(store, alloc) catch false;
 
+    const facade_path: ?[]u8 = if (git.colocatedSyncOn(store, work_dir))
+        work_dir.realPathFileAlloc(io, ".", alloc) catch null
+    else
+        null;
+    defer if (facade_path) |p| alloc.free(p);
+    if (facade_path) |p| out.absorbed = git.absorbIfChanged(store, work_dir, p) catch null;
+
     const cap = try moment.capture(store, work_dir, .poll, mset);
     if (cap == .captured) {
         out.captured = true;
@@ -310,7 +319,10 @@ fn tickInner(
                     "verified",
                     @divTrunc(started, 1000),
                 ) catch null;
-                if (cut != null) out.cut = true;
+                if (cut != null) {
+                    out.cut = true;
+                    if (facade_path) |p| git.syncColocated(store, p) catch {};
+                }
             }
         }
     }
@@ -445,7 +457,7 @@ pub fn agentPlist(
         \\  <key>EnvironmentVariables</key>
         \\  <dict><key>PATH</key><string>{s}</string></dict>
         \\  <key>WatchPaths</key>
-        \\  <array><string>{s}</string></array>
+        \\  <array><string>{s}</string><string>{s}/.git</string></array>
         \\  <key>ThrottleInterval</key><integer>{d}</integer>
         \\  <key>RunAtLoad</key><false/>
         \\  <key>ProcessType</key><string>Background</string>
@@ -454,7 +466,7 @@ pub fn agentPlist(
         \\</dict>
         \\</plist>
         \\
-    , .{ label, gr_abs, repo_abs, installPath(), repo_abs, @divTrunc(set.min_interval_ms, 1000) });
+    , .{ label, gr_abs, repo_abs, installPath(), repo_abs, repo_abs, @divTrunc(set.min_interval_ms, 1000) });
 }
 
 pub const AgentStatus = enum { unsupported, not_installed, installed };
@@ -816,6 +828,7 @@ test "the plist watches the worktree and does not stay resident" {
     try testing.expect(std.mem.indexOf(u8, body, "<key>PATH</key>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "/usr/bin") != null);
     try testing.expect(std.mem.indexOf(u8, body, "/Users/x/repo") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "<string>/Users/x/repo/.git</string>") != null);
     try testing.expect(std.mem.indexOf(u8, body, "--once") != null);
     // Not KeepAlive and not RunAtLoad: the job exists only to run and exit.
     try testing.expect(std.mem.indexOf(u8, body, "KeepAlive") == null);

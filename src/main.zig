@@ -672,11 +672,46 @@ fn isWorkRoot(io: std.Io, dir: std.Io.Dir) bool {
 }
 
 fn openRepo(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !?Store {
-    return Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
+    var s = Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
         try w.print("{s}{s}{s} not a superdetermine repo\n", .{ ui.on(.red), ui.cross, ui.off() });
         try ui.hint(w, "run `sdt init` here, or cd into a repo");
         return null;
     };
+    absorbGitWrites(io, alloc, &s);
+    return s;
+}
+
+var facade_absorbed: ?git.Absorbed = null;
+
+fn absorbGitWrites(io: std.Io, alloc: std.mem.Allocator, s: *Store) void {
+    var work = openWork(io) catch return;
+    defer work.close(io);
+    if (!git.colocatedSyncOn(s, work)) return;
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    excludeFromColocatedGit(io, alloc, &sink.writer, work) catch {};
+    const path = work.realPathFileAlloc(io, ".", alloc) catch return;
+    defer alloc.free(path);
+    facade_absorbed = git.absorbIfChanged(s, work, path) catch null;
+}
+
+fn followGitHead(io: std.Io, alloc: std.mem.Allocator, s: *Store, branch: []const u8) void {
+    var work = openWork(io) catch return;
+    defer work.close(io);
+    if (!git.colocatedSyncOn(s, work)) return;
+    const path = work.realPathFileAlloc(io, ".", alloc) catch return;
+    defer alloc.free(path);
+    git.pointColocatedHead(s, path, branch) catch {};
+}
+
+fn reportAbsorbed(w: *std.Io.Writer, a: git.Absorbed) !void {
+    if (a.commits != 0) {
+        try w.print("{s}absorbed {d} git commit{s} on {s}{s}\n", .{
+            ui.on(.dim), a.commits, if (a.commits == 1) "" else "s", a.branch(), ui.off(),
+        });
+    }
+    if (a.followed) {
+        try w.print("{s}followed git to {s}{s}\n", .{ ui.on(.dim), a.head(), ui.off() });
+    }
 }
 
 fn shortHex(o: Oid, buf: []u8) []const u8 {
@@ -3626,6 +3661,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         var work2 = try openWork(io);
         defer work2.close(io);
         try branches.switchTo(&s, work2, name);
+        followGitHead(io, alloc, &s, name);
         try w.print("on new branch {s}, at that moment\n", .{name});
         return;
     }
@@ -3643,6 +3679,7 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     var work = try openWork(io);
     defer work.close(io);
     try branches.switchTo(&s, work, name);
+    followGitHead(io, alloc, &s, name);
     const default_branch = try repoDefaultBranch(io, alloc, &s);
     defer alloc.free(default_branch);
     if (!eq(from, default_branch) and s.refExists(from)) {
@@ -3674,6 +3711,7 @@ fn cmdSwitch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
         try w.print("could not switch to {s}: {s}\n", .{ rest[0], @errorName(e) });
         return;
     };
+    followGitHead(io, alloc, &s, rest[0]);
     try w.print("switched to {s}\n", .{rest[0]});
 }
 
@@ -4303,6 +4341,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer merge.freeMergeResult(alloc, result);
     const after = s.readRef(into) catch Oid.zero();
     oplog.record(&s, .{ .kind = .other, .branch = into, .prev = before, .new = after, .timestamp = nowSeconds(io) }) catch {};
+    maybeSyncGit(io, alloc, &s);
 
     // Materialize the merged tree into the working directory.
     var work = try openWork(io);
@@ -5359,6 +5398,8 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
         try w.print("{s}skipped: {s}{s}\n", .{ ui.on(.dim), why, ui.off() });
         return if (automated) 0 else report.exitCode();
     }
+    if (facade_absorbed) |a| try reportAbsorbed(w, a);
+    if (r.absorbed) |a| try reportAbsorbed(w, a);
     if (r.captured) try w.writeAll("captured a moment\n");
     if (!set.enabled) {
         if (r.captured) {
@@ -6144,6 +6185,42 @@ fn cmdDoctor(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
         try w.print("               retired {d} agent{s} whose repo no longer exists\n", .{
             pruned, if (pruned == 1) "" else "s",
         });
+    }
+
+    if (work.access(io, ".git", .{})) |_| {
+        if (git.colocatedSyncOn(&s, work)) {
+            const branch = s.headBranch() catch try alloc.dupe(u8, "?");
+            defer alloc.free(branch);
+            var head_buf: [256]u8 = undefined;
+            try w.writeAll("  git facade   on: ");
+            if (git.colocatedHead(&s, work_abs, &head_buf)) |gh| {
+                try w.print("git is on {s}, ", .{gh});
+            } else {
+                try w.writeAll("git HEAD is detached, ");
+            }
+            switch (git.colocatedState(&s, work_abs, null)) {
+                .in_step => try w.print("in step with sdt {s}\n", .{branch}),
+                .rewritten => try w.print("sdt rewrote {s}; the next save re-mirrors it\n", .{branch}),
+                .foreign => {
+                    try w.print("{s}{s} {d} commit{s} there {s} not in sdt{s}\n", .{
+                        ui.on(.yellow),
+                        ui.warn,
+                        git.at_risk.total,
+                        if (git.at_risk.total == 1) "" else "s",
+                        if (git.at_risk.total == 1) "is" else "are",
+                        ui.off(),
+                    });
+                    try ui.hint(w, "               `sdt import .` takes them; `sdt sync . --force` makes git match sdt instead");
+                },
+                .unavailable => try w.print("nothing saved on sdt {s} yet\n", .{branch}),
+            }
+            try ui.hint(w, "               commits, branches and checkouts made through git are absorbed on the next tick or command");
+        } else {
+            try w.writeAll("  git facade   off\n");
+            try ui.hint(w, "               `sdt config git-sync on` mirrors every save into .git and absorbs what git-only apps do there");
+        }
+    } else |_| {
+        try w.writeAll("  git facade   no colocated .git\n");
     }
 
     const verdicts = try verdict.readAll(&s, alloc);

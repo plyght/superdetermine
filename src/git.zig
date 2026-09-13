@@ -4,6 +4,12 @@ const object = @import("object.zig");
 const proc = @import("proc.zig");
 const lfs = @import("lfs.zig");
 const ui = @import("ui.zig");
+const branches = @import("branches.zig");
+const oplog = @import("oplog.zig");
+const config = @import("config.zig");
+const apricot = @import("apricot");
+const facade = apricot.git_facade;
+const contract = apricot.adapter;
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -720,11 +726,27 @@ pub fn importRefChange(store: *Store, git_repo_path: []const u8, git_ref: ?[]con
     var map = try Gitmap.load(store);
     defer map.deinit();
 
+    const tip = try importReachable(store, repo, &map, &head_oid, &.{}, null);
+
+    try map.save(store);
+
+    return tip;
+}
+
+fn importReachable(
+    store: *Store,
+    repo: ?*c.git_repository,
+    map: *Gitmap,
+    head_oid: *const c.git_oid,
+    hide: []const c.git_oid,
+    imported: ?*usize,
+) !Oid {
     var walk: ?*c.git_revwalk = null;
     try check(c.git_revwalk_new(&walk, repo));
     defer c.git_revwalk_free(walk);
     _ = c.git_revwalk_sorting(walk, c.GIT_SORT_TOPOLOGICAL | c.GIT_SORT_REVERSE);
-    try check(c.git_revwalk_push(walk, &head_oid));
+    try check(c.git_revwalk_push(walk, head_oid));
+    for (hide) |*h| _ = c.git_revwalk_hide(walk, h);
 
     lfs_unresolved = 0;
     var session = lfsSessionFor(store, repo, null);
@@ -736,11 +758,17 @@ pub fn importRefChange(store: *Store, git_repo_path: []const u8, git_ref: ?[]con
     var tip: Oid = Oid.zero();
     var woid: c.git_oid = undefined;
     while (c.git_revwalk_next(&woid, walk) == 0) {
-        tip = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
+        const before = map.git_to_gr.count();
+        tip = try importCommit(store, repo, map, &woid, if (session) |*s| s else null);
+        if (imported) |n| {
+            if (map.git_to_gr.count() != before) n.* += 1;
+        }
     }
 
-    try map.save(store);
-
+    if (tip.isZero()) {
+        const hex = gitOidHex(head_oid);
+        if (map.lookupGr(&hex)) |known| tip = known;
+    }
     return tip;
 }
 
@@ -1303,6 +1331,11 @@ const ExportMode = enum {
 };
 
 fn exportHeadMode(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, mode: ExportMode) !void {
+    const target = try exportHeadModeTarget(store, dest_git_repo_path, git_branch, mode);
+    store.alloc.free(target);
+}
+
+fn exportHeadModeTarget(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]const u8, mode: ExportMode) ![]u8 {
     ensureInit();
     exported_files = 0;
     exported_blobs = 0;
@@ -1322,7 +1355,7 @@ fn exportHeadMode(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]
     defer c.git_repository_free(repo);
 
     const target = try resolveTargetBranch(store, repo, git_branch, branch);
-    defer alloc.free(target);
+    errdefer alloc.free(target);
 
     var ref_buf: [512]u8 = undefined;
     const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{target});
@@ -1354,6 +1387,7 @@ fn exportHeadMode(store: *Store, dest_git_repo_path: []const u8, git_branch: ?[]
     try check(c.git_repository_set_head(repo, ref_name.ptr));
 
     try map.save(store);
+    return target;
 }
 
 /// Export ALL gr branches and tags (each with full history) into `dest`. Into a
@@ -2064,12 +2098,16 @@ pub fn syncColocatedTo(store: *Store, work_dir_path: []const u8, git_branch: ?[]
 /// Mirror a rewritten sdt history onto the colocated branch, reusing the commits
 /// the rewrite did not touch. See `exportHeadRewritten`.
 pub fn syncColocatedRewrite(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8) !void {
-    try exportHeadRewritten(store, work_dir_path, git_branch);
+    const target = try exportHeadModeTarget(store, work_dir_path, git_branch, .rewrite);
+    defer store.alloc.free(target);
+    rememberPair(store, target);
     resetIndexToHead(store, work_dir_path) catch {};
 }
 
 pub fn syncColocatedForced(store: *Store, work_dir_path: []const u8, git_branch: ?[]const u8, force: bool) !void {
-    try exportHeadToForced(store, work_dir_path, git_branch, force);
+    const target = try exportHeadModeTarget(store, work_dir_path, git_branch, if (force) .rebuild else .graft);
+    defer store.alloc.free(target);
+    rememberPair(store, target);
     // gr wrote the commit straight to the branch ref, which leaves git's index
     // stale relative to the new HEAD (so `git status`/`git diff` show garbage).
     // Reset the index (MIXED: HEAD + index, working tree untouched) so git stays
@@ -2151,6 +2189,350 @@ fn resetIndexToHead(store: *Store, work_dir_path: []const u8) !void {
     defer c.git_object_free(head);
 
     _ = c.git_reset(repo, head, c.GIT_RESET_MIXED, null);
+}
+
+pub fn colocatedSyncOn(store: *Store, work_dir: std.Io.Dir) bool {
+    work_dir.access(store.io, ".git", .{}) catch return false;
+    const v = (config.get(store, store.alloc, "sync.git") catch return false) orelse return false;
+    defer store.alloc.free(v);
+    return std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or
+        std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "on");
+}
+
+fn headBranchName(repo: ?*c.git_repository, buf: []u8) ?[]const u8 {
+    var ref: ?*c.git_reference = null;
+    if (c.git_reference_lookup(&ref, repo, "HEAD") != 0) return null;
+    defer c.git_reference_free(ref);
+    if (c.git_reference_type(ref) != c.GIT_REFERENCE_SYMBOLIC) return null;
+    const target = c.git_reference_symbolic_target(ref);
+    if (target == null) return null;
+    const full = std.mem.span(target);
+    const prefix = "refs/heads/";
+    if (!std.mem.startsWith(u8, full, prefix)) return null;
+    const name = full[prefix.len..];
+    const n = @min(name.len, buf.len);
+    @memcpy(buf[0..n], name[0..n]);
+    return buf[0..n];
+}
+
+pub fn colocatedHead(store: *Store, work_dir_path: []const u8, buf: []u8) ?[]const u8 {
+    ensureInit();
+    const path_z = store.alloc.dupeZ(u8, work_dir_path) catch return null;
+    defer store.alloc.free(path_z);
+    var repo: ?*c.git_repository = null;
+    if (c.git_repository_open(&repo, path_z.ptr) != 0) return null;
+    defer c.git_repository_free(repo);
+    return headBranchName(repo, buf);
+}
+
+pub const Absorbed = struct {
+    commits: usize = 0,
+    branches: usize = 0,
+    diverged: usize = 0,
+    stashes: usize = 0,
+    followed: bool = false,
+    branch_buf: [256]u8 = undefined,
+    branch_len: usize = 0,
+    head_buf: [256]u8 = undefined,
+    head_len: usize = 0,
+
+    pub fn branch(self: *const Absorbed) []const u8 {
+        return self.branch_buf[0..self.branch_len];
+    }
+
+    pub fn head(self: *const Absorbed) []const u8 {
+        return self.head_buf[0..self.head_len];
+    }
+
+    pub fn any(self: *const Absorbed) bool {
+        return self.commits != 0 or self.branches != 0 or self.followed or self.stashes != 0;
+    }
+
+    fn fromFacade(r: facade.Absorbed, commits: usize) Absorbed {
+        var out = Absorbed{
+            .commits = commits,
+            .branches = r.branches,
+            .diverged = r.diverged,
+            .stashes = r.stashes,
+            .followed = r.followed,
+        };
+        out.branch_len = copyName(&out.branch_buf, r.branch());
+        out.head_len = copyName(&out.head_buf, r.head());
+        return out;
+    }
+};
+
+fn copyName(buf: []u8, name: []const u8) usize {
+    const n = @min(name.len, buf.len);
+    @memcpy(buf[0..n], name[0..n]);
+    return n;
+}
+
+fn nowSeconds(store: *Store) i64 {
+    return @intCast(@divTrunc(std.Io.Clock.now(.real, store.io).nanoseconds, 1_000_000_000));
+}
+
+fn parseGitOid(hex: []const u8) ?c.git_oid {
+    var o: c.git_oid = undefined;
+    if (hex.len == 0 or c.git_oid_fromstrn(&o, hex.ptr, hex.len) != 0) return null;
+    return o;
+}
+
+pub const FacadeAdapter = struct {
+    store: *Store,
+    path: []const u8,
+    commits: usize = 0,
+    arena: std.heap.ArenaAllocator,
+    refs: std.ArrayList(contract.NativeRef) = .empty,
+    root: [1]contract.NativeRoot = .{.{ .role = "repository", .id = .{ .scheme = "superdetermine", .bytes = "store" } }},
+
+    const capabilities = [_]contract.Capability{
+        .{ .name = "foreign-operation-import", .support = .required },
+        .{ .name = "commit-dag", .support = .required },
+    };
+    const kinds = [_][]const u8{"superdetermine-change"};
+
+    pub fn init(store: *Store, path: []const u8) FacadeAdapter {
+        return .{ .store = store, .path = path, .arena = std.heap.ArenaAllocator.init(store.alloc) };
+    }
+
+    pub fn deinit(self: *FacadeAdapter) void {
+        self.arena.deinit();
+    }
+
+    pub fn adapter(self: *FacadeAdapter) contract.Adapter {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn cast(context: *anyopaque) *FacadeAdapter {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn openRepo(self: *FacadeAdapter) !?*c.git_repository {
+        ensureInit();
+        const path_z = try self.store.alloc.dupeZ(u8, self.path);
+        defer self.store.alloc.free(path_z);
+        var repo: ?*c.git_repository = null;
+        try check(c.git_repository_open(&repo, path_z.ptr));
+        return repo;
+    }
+
+    fn snapshot(context: *anyopaque) !contract.Snapshot {
+        const self = cast(context);
+        _ = self.arena.reset(.retain_capacity);
+        self.refs = .empty;
+        const a = self.arena.allocator();
+        const store = self.store;
+
+        var map = try Gitmap.load(store);
+        defer map.deinit();
+
+        const names = try branches.list(store, store.alloc);
+        defer {
+            for (names) |n| store.alloc.free(n);
+            store.alloc.free(names);
+        }
+        for (names) |n| {
+            const tip = store.readRef(n) catch continue;
+            var hex: [Oid.len * 2]u8 = undefined;
+            const name = try a.dupe(u8, n);
+            try self.refs.append(a, .{
+                .namespace = facade.RefNamespace.heads,
+                .name = name,
+                .target = .{ .scheme = "superdetermine-change", .bytes = try a.dupe(u8, tip.toHex(&hex)) },
+                .mutable = true,
+            });
+            if (map.lookupGit(tip)) |g| {
+                const ghex = gitOidHex(&g);
+                try self.refs.append(a, .{
+                    .namespace = facade.RefNamespace.mirror,
+                    .name = name,
+                    .target = .{ .scheme = facade.git_commit_scheme, .bytes = try a.dupe(u8, &ghex) },
+                    .mutable = true,
+                });
+            }
+        }
+        if (store.headBranch()) |head| {
+            defer store.alloc.free(head);
+            try self.refs.append(a, .{
+                .namespace = facade.RefNamespace.head,
+                .name = facade.head_ref_name,
+                .target = .{ .scheme = facade.native_branch_scheme, .bytes = try a.dupe(u8, head) },
+                .mutable = true,
+            });
+        } else |_| {}
+
+        return .{
+            .vcs = "superdetermine",
+            .format_version = "colocated-git-v1",
+            .roots = &self.root,
+            .refs = self.refs.items,
+            .capabilities = &capabilities,
+            .closure = .{ .tier = .semantic_lossless, .authoritative_kinds = &kinds, .exclusions = &.{} },
+        };
+    }
+
+    fn enumerate(_: *anyopaque, _: []const contract.NativeRoot, _: contract.ObjectSink) !void {
+        return error.Unsupported;
+    }
+
+    fn restore(_: *anyopaque, _: contract.Snapshot, _: contract.ObjectSource) !contract.RestoreReport {
+        return error.Unsupported;
+    }
+
+    fn project(_: *anyopaque, _: contract.Snapshot, _: contract.ProjectionSink) !void {
+        return error.Unsupported;
+    }
+
+    fn inspectForeign(context: *anyopaque, op: contract.ForeignOperation) !contract.ForeignInspection {
+        const self = cast(context);
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.branch_advance)) {
+            if (op.base_projection.len == 0) return .{ .importable = .{ .strategy = facade.Strategy.import, .affected_refs = &.{} } };
+            const base = parseGitOid(op.base_projection) orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+            const observed = parseGitOid(op.observed_projection) orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+            if (c.git_oid_equal(&base, &observed) != 0) return .{ .importable = .{ .strategy = facade.Strategy.in_step, .affected_refs = &.{} } };
+            const repo = try self.openRepo();
+            defer c.git_repository_free(repo);
+            if (c.git_graph_descendant_of(repo, &observed, &base) == 1) return .{ .importable = .{ .strategy = facade.Strategy.fast_forward, .affected_refs = &.{} } };
+            if (c.git_graph_descendant_of(repo, &base, &observed) == 1) return .{ .refused = .{ .reason = facade.Reason.native_ahead } };
+            return .{ .requires_resolution = .{ .reason = facade.Reason.diverged, .affected_refs = &.{} } };
+        }
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.head_move)) {
+            return .{ .importable = .{ .strategy = facade.Strategy.follow, .affected_refs = &.{} } };
+        }
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.stash)) {
+            var map = try Gitmap.load(self.store);
+            defer map.deinit();
+            if (map.lookupGr(op.observed_projection) != null) return .{ .refused = .{ .reason = facade.Reason.known } };
+            return .{ .importable = .{ .strategy = facade.Strategy.objects, .affected_refs = &.{} } };
+        }
+        return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+    }
+
+    fn hiddenTips(self: *FacadeAdapter, map: *Gitmap) !std.ArrayList(c.git_oid) {
+        const store = self.store;
+        var hide: std.ArrayList(c.git_oid) = .empty;
+        errdefer hide.deinit(store.alloc);
+        const names = try branches.list(store, store.alloc);
+        defer {
+            for (names) |n| store.alloc.free(n);
+            store.alloc.free(names);
+        }
+        for (names) |n| {
+            const t = store.readRef(n) catch continue;
+            if (map.lookupGit(t)) |g| try hide.append(store.alloc, g);
+        }
+        return hide;
+    }
+
+    fn importForeign(context: *anyopaque, op: contract.ForeignOperation, source: contract.ObjectSource) !contract.ForeignOutcome {
+        _ = source;
+        const self = cast(context);
+        const store = self.store;
+        switch (try inspectForeign(context, op)) {
+            .importable => {},
+            .requires_resolution => |r| return .{ .requires_resolution = .{ .reason = r.reason } },
+            .refused => |r| return .{ .refused = .{ .reason = r.reason } },
+        }
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.head_move)) {
+            try store.setHeadBranch(op.observed_projection);
+            return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
+        }
+        const tip = parseGitOid(op.observed_projection) orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+        const repo = try self.openRepo();
+        defer c.git_repository_free(repo);
+        var map = try Gitmap.load(store);
+        defer map.deinit();
+        var hide = try self.hiddenTips(&map);
+        defer hide.deinit(store.alloc);
+
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.stash)) {
+            _ = try importReachable(store, repo, &map, &tip, hide.items, null);
+            try map.save(store);
+            return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
+        }
+
+        const native = facade.evidenceField(op.evidence, "native") orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+        var imported: usize = 0;
+        const new = try importReachable(store, repo, &map, &tip, hide.items, &imported);
+        if (new.isZero()) return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+        const prev = store.readRef(native) catch Oid.zero();
+        try store.updateRef(native, new);
+        oplog.record(store, .{
+            .kind = .import,
+            .branch = native,
+            .prev = prev,
+            .new = new,
+            .timestamp = nowSeconds(store),
+        }) catch {};
+        try map.save(store);
+        self.commits += imported;
+        return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
+    }
+
+    const vtable = contract.Adapter.VTable{
+        .snapshot = snapshot,
+        .enumerate = enumerate,
+        .restore = restore,
+        .project = project,
+        .inspectForeign = inspectForeign,
+        .importForeign = importForeign,
+    };
+};
+
+fn facadeFor(store: *Store, work_dir: std.Io.Dir, fa: *FacadeAdapter) facade.Facade {
+    return .{
+        .allocator = store.alloc,
+        .io = store.io,
+        .work_dir = work_dir,
+        .state_dir = store.root,
+        .adapter = fa.adapter(),
+    };
+}
+
+pub fn facadeFingerprint(store: *Store, work_dir: std.Io.Dir) ?Oid {
+    const print = facade.fingerprint(store.alloc, store.io, work_dir) orelse return null;
+    return .{ .bytes = print };
+}
+
+pub fn absorbColocated(store: *Store, work_dir_path: []const u8, prev_head: ?[]const u8) !Absorbed {
+    var work = try std.Io.Dir.openDirAbsolute(store.io, work_dir_path, .{ .iterate = true });
+    defer work.close(store.io);
+    var fa = FacadeAdapter.init(store, work_dir_path);
+    defer fa.deinit();
+    const r = try facadeFor(store, work, &fa).absorb(prev_head);
+    return Absorbed.fromFacade(r, fa.commits);
+}
+
+pub fn absorbIfChanged(store: *Store, work_dir: std.Io.Dir, work_dir_path: []const u8) !?Absorbed {
+    var fa = FacadeAdapter.init(store, work_dir_path);
+    defer fa.deinit();
+    const r = (try facadeFor(store, work_dir, &fa).absorbIfChanged()) orelse return null;
+    return Absorbed.fromFacade(r, fa.commits);
+}
+
+fn rememberPair(store: *Store, git_branch: []const u8) void {
+    const head = store.headBranch() catch return;
+    defer store.alloc.free(head);
+    var fa = FacadeAdapter.init(store, "");
+    defer fa.deinit();
+    facadeFor(store, store.root, &fa).recordPair(head, git_branch);
+}
+
+pub fn pointColocatedHead(store: *Store, work_dir_path: []const u8, branch: []const u8) !void {
+    var work = std.Io.Dir.openDirAbsolute(store.io, work_dir_path, .{ .iterate = true }) catch return;
+    defer work.close(store.io);
+    var fa = FacadeAdapter.init(store, work_dir_path);
+    defer fa.deinit();
+    const f = facadeFor(store, work, &fa);
+    const pointed = f.pointHead(branch) catch false;
+    if (!pointed) {
+        if (!store.refExists(branch)) return;
+        const target = f.pairedGitBranch(branch) orelse try store.alloc.dupe(u8, branch);
+        defer store.alloc.free(target);
+        return syncColocatedTo(store, work_dir_path, target);
+    }
+    resetIndexToHead(store, work_dir_path) catch {};
 }
 
 // --- tests ---
@@ -3947,4 +4329,324 @@ test "importRefChange resolves a tag or a raw sha and moves no sdt ref" {
     const to_tip = try importRefTo(&store, abs, "master", "graded");
     try testing.expect(store.refExists("graded"));
     try testing.expect(to_tip.eql(by_sha));
+}
+
+fn openColocatedRepo(alloc: std.mem.Allocator, abs: []const u8) !?*c.git_repository {
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, abs_z.ptr));
+    return repo;
+}
+
+fn gitHeadTip(repo: ?*c.git_repository) !c.git_oid {
+    var head_ref: ?*c.git_reference = null;
+    try check(c.git_repository_head(&head_ref, repo));
+    defer c.git_reference_free(head_ref);
+    var tip: c.git_oid = undefined;
+    _ = c.git_oid_cpy(&tip, c.git_reference_target(head_ref));
+    return tip;
+}
+
+fn gitHeadRefName(repo: ?*c.git_repository, buf: []u8) ![]const u8 {
+    var head_ref: ?*c.git_reference = null;
+    try check(c.git_reference_lookup(&head_ref, repo, "HEAD"));
+    defer c.git_reference_free(head_ref);
+    const target = std.mem.span(c.git_reference_symbolic_target(head_ref));
+    const n = @min(target.len, buf.len);
+    @memcpy(buf[0..n], target[0..n]);
+    return buf[0..n];
+}
+
+test "a commit made through git on the colocated branch becomes an sdt change" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var dir = try tmp.dir.openDir(io, "repo", .{});
+    defer dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, dir);
+    defer store.deinit();
+    const abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(abs);
+    try syncColocated(&store, abs);
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const before = try store.readRef(branch);
+
+    const repo = try openColocatedRepo(alloc, abs);
+    defer c.git_repository_free(repo);
+    var parent = try gitHeadTip(repo);
+    var ref_buf: [256]u8 = undefined;
+    const head_name = try gitHeadRefName(repo, &ref_buf);
+    const head_z = try alloc.dupeZ(u8, head_name);
+    defer alloc.free(head_z);
+    const app = try commitOnto(repo, head_z.ptr, "app.txt", "from the app\n", "app: add app.txt\n", &parent, 1_700_000_100);
+
+    const r = try absorbColocated(&store, abs, null);
+    try testing.expectEqual(@as(usize, 1), r.commits);
+    try testing.expectEqual(@as(usize, 1), r.branches);
+    try testing.expectEqualStrings(branch, r.branch());
+    try testing.expect(!r.followed);
+
+    const after = try store.readRef(branch);
+    try testing.expect(!after.eql(before));
+    const change = try store.readChange(after);
+    defer object.freeChange(alloc, change);
+    try testing.expectEqualStrings("app: add app.txt\n", change.message);
+    try testing.expectEqual(@as(usize, 1), change.parents.len);
+    try testing.expect(change.parents[0].eql(before));
+
+    const again = try absorbColocated(&store, abs, null);
+    try testing.expectEqual(@as(usize, 0), again.commits);
+    try testing.expectEqual(@as(usize, 0), again.branches);
+    try testing.expectEqual(@as(usize, 0), again.diverged);
+
+    const next = try writeChangeWith(&store, &.{after}, "sdt.txt", "from sdt\n", "sdt: after the app\n", 9, 1_700_000_200);
+    try store.updateRef(branch, next);
+    try syncColocated(&store, abs);
+
+    const tip = try gitHeadTip(repo);
+    var commit: ?*c.git_commit = null;
+    try check(c.git_commit_lookup(&commit, repo, &tip));
+    defer c.git_commit_free(commit);
+    try testing.expectEqualStrings("sdt: after the app\n", std.mem.span(c.git_commit_message(commit)));
+    try testing.expectEqual(@as(c_uint, 1), c.git_commit_parentcount(commit));
+    try testing.expect(c.git_oid_equal(c.git_commit_parent_id(commit, 0), &app) != 0);
+}
+
+test "a branch checked out through git moves sdt HEAD only after git moved it" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var dir = try tmp.dir.openDir(io, "repo", .{});
+    defer dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, dir);
+    defer store.deinit();
+    const abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(abs);
+    try syncColocated(&store, abs);
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const tip_sdt = try store.readRef(branch);
+
+    const repo = try openColocatedRepo(alloc, abs);
+    defer c.git_repository_free(repo);
+    var tip = try gitHeadTip(repo);
+    var topic: ?*c.git_reference = null;
+    try check(c.git_reference_create(&topic, repo, "refs/heads/topic", &tip, 0, null));
+    c.git_reference_free(topic);
+    try check(c.git_repository_set_head(repo, "refs/heads/topic"));
+
+    const first = try absorbColocated(&store, abs, null);
+    try testing.expect(!first.followed);
+    try testing.expectEqual(@as(usize, 1), first.branches);
+    try testing.expect(store.refExists("topic"));
+    try testing.expect((try store.readRef("topic")).eql(tip_sdt));
+    const still = try store.headBranch();
+    defer alloc.free(still);
+    try testing.expectEqualStrings(branch, still);
+
+    const second = try absorbColocated(&store, abs, branch);
+    try testing.expect(second.followed);
+    try testing.expectEqualStrings("topic", second.head());
+    const now = try store.headBranch();
+    defer alloc.free(now);
+    try testing.expectEqualStrings("topic", now);
+}
+
+test "a git branch that diverged from sdt is left alone" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var dir = try tmp.dir.openDir(io, "repo", .{});
+    defer dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, dir);
+    defer store.deinit();
+    const abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(abs);
+    try syncColocated(&store, abs);
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const shared = try store.readRef(branch);
+    const ahead = try writeChangeWith(&store, &.{shared}, "sdt.txt", "sdt only\n", "sdt only\n", 5, 1_700_000_150);
+    try store.updateRef(branch, ahead);
+
+    const repo = try openColocatedRepo(alloc, abs);
+    defer c.git_repository_free(repo);
+    var parent = try gitHeadTip(repo);
+    var ref_buf: [256]u8 = undefined;
+    const head_name = try gitHeadRefName(repo, &ref_buf);
+    const head_z = try alloc.dupeZ(u8, head_name);
+    defer alloc.free(head_z);
+    _ = try commitOnto(repo, head_z.ptr, "app.txt", "app only\n", "app only\n", &parent, 1_700_000_160);
+
+    const r = try absorbColocated(&store, abs, null);
+    try testing.expectEqual(@as(usize, 0), r.commits);
+    try testing.expectEqual(@as(usize, 1), r.diverged);
+    try testing.expect((try store.readRef(branch)).eql(ahead));
+}
+
+test "absorbIfChanged does the work once per git-side change" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var dir = try tmp.dir.openDir(io, "repo", .{});
+    defer dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, dir);
+    defer store.deinit();
+    const abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(abs);
+    try syncColocated(&store, abs);
+    var work = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer work.close(io);
+
+    try testing.expect((try absorbIfChanged(&store, work, abs)) != null);
+    try testing.expect((try absorbIfChanged(&store, work, abs)) == null);
+
+    const repo = try openColocatedRepo(alloc, abs);
+    defer c.git_repository_free(repo);
+    var parent = try gitHeadTip(repo);
+    var ref_buf: [256]u8 = undefined;
+    const head_name = try gitHeadRefName(repo, &ref_buf);
+    const head_z = try alloc.dupeZ(u8, head_name);
+    defer alloc.free(head_z);
+    _ = try commitOnto(repo, head_z.ptr, "app.txt", "from the app\n", "app commit\n", &parent, 1_700_000_100);
+
+    const r = (try absorbIfChanged(&store, work, abs)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), r.commits);
+    try testing.expect((try absorbIfChanged(&store, work, abs)) == null);
+}
+
+test "pointColocatedHead moves git HEAD with sdt, exporting a branch git lacks" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    var dir = try tmp.dir.openDir(io, "repo", .{});
+    defer dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, dir);
+    defer store.deinit();
+    const abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(abs);
+    try syncColocated(&store, abs);
+
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    const tip = try store.readRef(branch);
+    try store.updateRef("feature", tip);
+    try store.setHeadBranch("feature");
+    try pointColocatedHead(&store, abs, "feature");
+
+    const repo = try openColocatedRepo(alloc, abs);
+    defer c.git_repository_free(repo);
+    var ref_buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("refs/heads/feature", try gitHeadRefName(repo, &ref_buf));
+    var feature_tip: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&feature_tip, repo, "refs/heads/feature"));
+    var main_buf: [512]u8 = undefined;
+    const main_ref = try std.fmt.bufPrintZ(&main_buf, "refs/heads/{s}", .{branch});
+    var main_tip: c.git_oid = undefined;
+    try check(c.git_reference_name_to_id(&main_tip, repo, main_ref.ptr));
+    try testing.expect(c.git_oid_equal(&feature_tip, &main_tip) != 0);
+
+    try store.setHeadBranch(branch);
+    try pointColocatedHead(&store, abs, branch);
+    try testing.expectEqualStrings(main_ref, try gitHeadRefName(repo, &ref_buf));
+}
+
+test "a git branch under another name stays paired with the sdt branch it mirrors" {
+    ensureInit();
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo");
+    const abs = try tmp.dir.realPathFileAlloc(io, "repo", alloc);
+    defer alloc.free(abs);
+    const abs_z = try alloc.dupeZ(u8, abs);
+    defer alloc.free(abs_z);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, abs_z.ptr, 0));
+    defer c.git_repository_free(repo);
+    _ = try commitOnto(repo, "refs/heads/master", "seed.txt", "seed\n", "seed master\n", null, 1_600_000_000);
+    try check(c.git_repository_set_head(repo, "refs/heads/master"));
+
+    var dir = try tmp.dir.openDir(io, "repo", .{});
+    defer dir.close(io);
+    var store = try buildStoreWithChange(io, alloc, dir);
+    defer store.deinit();
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    try testing.expect(!std.mem.eql(u8, branch, "master"));
+    try syncColocated(&store, abs);
+    const mirrored = try store.readRef(branch);
+
+    var parent = try gitHeadTip(repo);
+    _ = try commitOnto(repo, "refs/heads/master", "app.txt", "from the app\n", "app on master\n", &parent, 1_700_000_100);
+
+    const r = try absorbColocated(&store, abs, "master");
+    try testing.expectEqual(@as(usize, 1), r.commits);
+    try testing.expectEqualStrings(branch, r.branch());
+    try testing.expect(!r.followed);
+    try testing.expect(!store.refExists("master"));
+    const after = try store.readRef(branch);
+    try testing.expect(!after.eql(mirrored));
+    const change = try store.readChange(after);
+    defer object.freeChange(alloc, change);
+    try testing.expect(change.parents[0].eql(mirrored));
+}
+
+test "the facade fingerprint moves when git moves a ref" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/.git/refs/heads");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/HEAD", .data = "ref: refs/heads/main\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/refs/heads/main", .data = "aaaa\n" });
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+    var work = try tmp.dir.openDir(io, "repo", .{ .iterate = true });
+    defer work.close(io);
+
+    const a = facadeFingerprint(&store, work) orelse return error.TestUnexpectedResult;
+    const a2 = facadeFingerprint(&store, work) orelse return error.TestUnexpectedResult;
+    try testing.expect(a.eql(a2));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/refs/heads/main", .data = "bbbb\n" });
+    const b = facadeFingerprint(&store, work) orelse return error.TestUnexpectedResult;
+    try testing.expect(!a.eql(b));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/.git/HEAD", .data = "ref: refs/heads/topic\n" });
+    const d = facadeFingerprint(&store, work) orelse return error.TestUnexpectedResult;
+    try testing.expect(!b.eql(d));
+
+    try tmp.dir.createDirPath(io, "bare");
+    var bare = try tmp.dir.openDir(io, "bare", .{ .iterate = true });
+    defer bare.close(io);
+    try testing.expect(facadeFingerprint(&store, bare) == null);
 }
