@@ -120,6 +120,12 @@ pub fn collect(store: *Store, alloc: std.mem.Allocator, dry_run: bool) !Stats {
         if (r.timestamp < cutoff) continue;
         try markObject(store, &marked, r.prev);
         try markObject(store, &marked, r.new);
+        const moves = oplog.stackMoves(alloc, r) catch continue;
+        defer alloc.free(moves);
+        for (moves) |m| {
+            try markObject(store, &marked, m.prev);
+            try markObject(store, &marked, m.new);
+        }
     }
 
     // Expired moments only ever dropped out of the log during a capture, so a

@@ -34,6 +34,8 @@ Continuous capture gives you an address for each state. Grading gives you an ans
 | Instant copy-on-write worktrees | `sdt work <dir>` spins up a workspace in milliseconds (APFS clonefile, Linux reflink). `sdt work list`, `status`, `merge`, `remove`, and `restore` run its whole life from the repo it came from. |
 | Stat-cache index | `status` and `save` skip re-hashing unchanged files (mtime/size/inode). |
 | Three-way merge + resolve | Conflict markers, then `sdt resolve <file>` / `sdt resolve --abort`. |
+| Resolutions that stick | A resolved conflict is recorded once the tree grades green. When the same hunk conflicts again, in a merge or a rebase, the recorded resolution is applied and named. `sdt resolve --list` / `--forget <id>`. |
+| Stacked branches | `sdt new` off a feature branch stacks the new branch on it. `sdt stack` shows the levels with their grades; `stack rebase`, `stack merge`, `stack squash` work the whole stack as one reversible operation. |
 | Absorb | `sdt absorb` folds working edits into the changes they belong to. |
 | Probe any state | `sdt probe @2h -- zig build` runs any command against any captured state in a throwaway clone and streams its output; `sdt probe @green..@ -- <cmd>` bisects the moments between two states, several clones at a time. The worktree is never touched. |
 | Send one state | `sdt send @a3f91c` ships one exact tree, its check, and its verdict. `sdt get` materialises it as a copy-on-write worktree and says whether `sdt grade` there reproduces the verdict. |
@@ -161,6 +163,25 @@ sdt mesh join <secret>     # join the room that secret names
 sdt mesh                   # mp   go live: everyone a writer, no server
 sdt mesh status            # what is configured, and what it means
 sdt mesh leave             # forget the secret
+```
+
+Stacked branches. One `sdt undo` reverses a whole stack operation:
+
+```
+sdt stack                  # sk   this stack, base to tip, with each branch's grade
+sdt stack add ui --on api  #      stack a branch on its parent
+sdt stack remove ui        #      take a branch out of its stack
+sdt stack rebase           #      replay every branch onto its rewritten parent, in order
+sdt stack merge            #      merge the stack into the base branch, bottom up (--into <base>)
+sdt stack squash [branch]  #      collapse one level's changes into one
+```
+
+Resolving conflicts once:
+
+```
+sdt resolve <file>         # res  mark a conflict resolved; recorded once the tree grades green
+sdt resolve --list         #      every recorded resolution, and any waiting for a grade
+sdt resolve --forget <id>  #      drop one
 ```
 
 Editing history. Every one of these is reversible with `sdt undo`:

@@ -59,6 +59,8 @@ const discovery = @import("discovery.zig");
 const apricot_bridge = @import("apricot_bridge.zig");
 const worktrees = @import("worktrees.zig");
 const transfer = @import("transfer.zig");
+const stack = @import("stack.zig");
+const resolution = @import("resolution.zig");
 const ipnet = std.Io.net;
 
 const Oid = oid.Oid;
@@ -91,9 +93,17 @@ const sections = [_]Section{
         .{ .name = "work restore", .args = "<dir|name>", .desc = "put a removed worktree back" },
         .{ .name = "restore", .alias = "rs", .args = "<file>... [--at ref]", .desc = "put one file back, from the last save or any state" },
         .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
-        .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort to bail)" },
+        .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort, --list, --forget <id>)" },
         .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
         .{ .name = "absorb", .alias = "ab", .args = "[-- <paths>]", .desc = "fold edits into the changes they belong to" },
+    } },
+    .{ .title = "stacked branches", .entries = &.{
+        .{ .name = "stack", .alias = "sk", .desc = "this stack, base to tip, with each branch's grade" },
+        .{ .name = "stack add", .args = "<branch> --on <parent>", .desc = "stack a branch on its parent" },
+        .{ .name = "stack remove", .args = "<branch>", .desc = "take a branch out of its stack" },
+        .{ .name = "stack rebase", .desc = "replay every branch onto its rewritten parent, in order" },
+        .{ .name = "stack merge", .args = "[--into <base>]", .desc = "merge the stack into the base branch, bottom up" },
+        .{ .name = "stack squash", .args = "[branch] [-m msg]", .desc = "collapse one level's changes into one" },
     } },
     .{ .title = "reshaping history", .entries = &.{
         .{ .name = "point", .alias = "pt", .args = "<ref>", .desc = "move this branch's tip to any ref" },
@@ -271,6 +281,8 @@ const aliases = [_]Alias{
     .{ .short = "res", .full = "resolve" },
     .{ .short = "rev", .full = "revert" },
     .{ .short = "ab", .full = "absorb" },
+    .{ .short = "sk", .full = "stack" },
+    .{ .short = "stacks", .full = "stack" },
     .{ .short = "pt", .full = "point" },
     .{ .short = "rb", .full = "rebase" },
     .{ .short = "am", .full = "amend" },
@@ -537,6 +549,8 @@ fn run(init: std.process.Init) !void {
         try cmdPoint(io, alloc, w, rest);
     } else if (eq(cmd, "rebase")) {
         try cmdRebase(io, alloc, w, rest);
+    } else if (eq(cmd, "stack")) {
+        try cmdStack(io, alloc, w, rest);
     } else if (eq(cmd, "squash")) {
         try cmdSquash(io, alloc, w, rest);
     } else if (eq(cmd, "split")) {
@@ -799,6 +813,18 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     resolveOps(alloc, &s);
+
+    if (hasFlag(rest, "--list")) return resolveList(io, alloc, w, &s, hasFlag(rest, "--json"));
+    if (hasFlag(rest, "--forget")) {
+        const id = flagValue(rest, "--forget", "--forget");
+        if (id.len == 0) {
+            try w.writeAll("usage: sdt resolve --forget <id>\n");
+            try ui.hint(w, "`sdt resolve --list` shows every recorded resolution and its id");
+            return;
+        }
+        return resolveForget(alloc, w, &s, id);
+    }
+
     var work = try openWork(io);
     defer work.close(io);
 
@@ -810,6 +836,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
             },
             else => return e,
         };
+        resolution.clearPending(&s) catch {};
         try w.writeAll("merge aborted. working tree restored\n");
         return;
     }
@@ -823,10 +850,11 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
             try w.writeAll("no merge in progress\n");
             return;
         }
-        try w.writeAll("usage: sdt resolve <file>   (or --abort)\nunresolved:\n");
+        try w.writeAll("usage: sdt resolve <file>   (or --abort, --list, --forget <id>)\nunresolved:\n");
         for (rem) |p| try w.print("  ! {s}\n", .{p});
         return;
     }
+    const identity = conflictIdentity(alloc, &s, rest[0]);
     merge.markResolved(&s, alloc, work, rest[0]) catch |e| switch (e) {
         error.StillConflicted => {
             try w.print("{s} still has conflict markers. fix them first\n", .{rest[0]});
@@ -838,6 +866,7 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
         },
         else => return e,
     };
+    const remembered = if (identity) |id| stageResolution(io, alloc, &s, work, rest[0], id) else false;
     const rem = try merge.remainingConflicts(&s, alloc);
     defer {
         for (rem) |p| alloc.free(p);
@@ -848,6 +877,126 @@ fn cmdResolve(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []c
     } else {
         try w.print("resolved {s}. {d} conflict(s) left\n", .{ rest[0], rem.len });
     }
+    if (remembered) try ui.hint(w, "once this tree grades green, the resolution is recorded and reused next time");
+}
+
+fn conflictIdentity(alloc: std.mem.Allocator, s: *Store, path: []const u8) ?merge.ConflictIdentity {
+    const state = (merge.loadState(s, alloc) catch return null) orelse return null;
+    defer merge.freeState(alloc, state);
+    for (state.conflicts, state.identities) |p, identity| {
+        if (eq(p, path)) return identity;
+    }
+    return null;
+}
+
+fn stageResolution(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    s: *Store,
+    work: std.Io.Dir,
+    path: []const u8,
+    identity: merge.ConflictIdentity,
+) bool {
+    const conflict: resolution.Conflict = .{ .base = identity.base, .candidates = &identity.candidates };
+    const data = work.readFileAlloc(io, path, alloc, .unlimited) catch |e| switch (e) {
+        error.FileNotFound => {
+            resolution.stage(s, alloc, path, conflict, .deleted) catch return false;
+            return true;
+        },
+        else => return false,
+    };
+    defer alloc.free(data);
+    resolution.stage(s, alloc, path, conflict, .{ .content = data }) catch return false;
+    return true;
+}
+
+fn resolveList(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, s: *Store, json: bool) !void {
+    _ = resolution.settle(s, alloc) catch 0;
+    const entries = try resolution.list(s, alloc);
+    defer resolution.freeEntries(alloc, entries);
+    const waiting = resolution.pending(s, alloc) catch try alloc.alloc(resolution.Pending, 0);
+    defer resolution.freePending(alloc, waiting);
+
+    if (json) {
+        try w.writeAll("{\"recorded\":[");
+        for (entries, 0..) |e, i| {
+            if (i != 0) try w.writeByte(',');
+            var hex: [Oid.len * 2]u8 = undefined;
+            try w.print("{{\"id\":\"{s}\",\"kind\":\"{s}\",\"recorded_ms\":{d},\"verified\":{s}", .{
+                e.fingerprint.toHex(&hex),
+                @tagName(e.resolution),
+                e.recorded_ms,
+                if (e.evidence != null) "true" else "false",
+            });
+            if (e.evidence) |ev| try w.print(",\"tier\":\"{s}\"", .{ev.tier.label()});
+            try w.writeByte('}');
+        }
+        try w.writeAll("],\"pending\":[");
+        for (waiting, 0..) |item, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll("{\"path\":");
+            try writeJsonString(w, item.path);
+            try w.print(",\"kind\":\"{s}\"}}", .{@tagName(item.resolution)});
+        }
+        try w.writeAll("]}\n");
+        return;
+    }
+
+    if (entries.len == 0 and waiting.len == 0) {
+        try w.writeAll("no recorded resolutions\n");
+        try ui.hint(w, "a conflict you `sdt resolve` is recorded once the tree grades green, and reused when it recurs");
+        return;
+    }
+    const now_ms = nowMillis(io);
+    for (entries) |e| {
+        var hex: [Oid.len * 2]u8 = undefined;
+        try w.print("{s}{s}{s}  ", .{ ui.on(.cyan), shortHex(e.fingerprint, &hex), ui.off() });
+        try writeAge(w, now_ms, e.recorded_ms);
+        try w.print("{s: <7}  ", .{@tagName(e.resolution)});
+        if (e.evidence) |ev| {
+            try w.print("{s}green{s} {s}{s}{s}\n", .{ ui.on(.green), ui.off(), ui.on(.dim), ev.tier.label(), ui.off() });
+        } else {
+            try w.print("{s}unverified{s}\n", .{ ui.on(.dim), ui.off() });
+        }
+    }
+    for (waiting) |item| {
+        try w.print("{s}{s}{s}  {s: <7}  {s}waiting for a green grade{s}\n", .{
+            ui.on(.dim), item.path, ui.off(), @tagName(item.resolution), ui.on(.dim), ui.off(),
+        });
+    }
+    if (entries.len != 0) try ui.hint(w, "`sdt resolve --forget <id>` drops one");
+}
+
+fn resolveForget(alloc: std.mem.Allocator, w: *std.Io.Writer, s: *Store, id: []const u8) !void {
+    const entries = try resolution.list(s, alloc);
+    defer resolution.freeEntries(alloc, entries);
+    var found: ?Oid = null;
+    var matches: usize = 0;
+    for (entries) |e| {
+        var hex: [Oid.len * 2]u8 = undefined;
+        const full = e.fingerprint.toHex(&hex);
+        if (id.len > full.len or !std.ascii.eqlIgnoreCase(full[0..id.len], id)) continue;
+        matches += 1;
+        found = e.fingerprint;
+    }
+    if (matches == 0) {
+        try w.print("no recorded resolution matches {s}\n", .{id});
+        try ui.hint(w, "`sdt resolve --list` shows the ids");
+        return;
+    }
+    if (matches > 1) {
+        try w.print("{s} is ambiguous: {d} resolutions start with it\n", .{ id, matches });
+        return;
+    }
+    _ = resolution.forget(s, alloc, found.?) catch |e| switch (e) {
+        resolution.Error.CorruptResolutionRecord => {
+            try w.writeAll("that resolution's record is corrupt and already unusable\n");
+            return;
+        },
+        else => return e,
+    };
+    var hex: [Oid.len * 2]u8 = undefined;
+    try w.print("forgot resolution {s}\n", .{shortHex(found.?, &hex)});
 }
 
 fn cmdRevert(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -1168,6 +1317,7 @@ fn reportRewrite(
             r.rewritten,   ui.on(.cyan), shortHex(r.new, &buf), ui.off(),
         });
     }
+    try reportReused(w, r.reused);
     if (!r.clean()) {
         try w.print("{d} path(s) came out conflicted, with both sides marked:\n", .{r.conflicts.len});
         for (r.conflicts) |p| try w.print("  ! {s}\n", .{p});
@@ -1176,6 +1326,10 @@ fn reportRewrite(
     }
     try mirrorRewriteToGit(io, alloc, w, s);
     try ui.hint(w, "`sdt undo` puts the old history back");
+}
+
+fn reportReused(w: *std.Io.Writer, reused: []const []u8) !void {
+    for (reused) |p| try w.print("resolved {s} from a recorded resolution\n", .{p});
 }
 
 fn reportHistoryError(w: *std.Io.Writer, e: anyerror, what: []const u8) !bool {
@@ -1254,6 +1408,434 @@ fn cmdRebase(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     };
     defer r.deinit(alloc);
     try reportRewrite(io, alloc, w, &s, before_tree, r, "rebased", .checkout);
+}
+
+fn repoDefaultBranch(io: std.Io, alloc: std.mem.Allocator, s: *Store) ![]u8 {
+    const configured = config.defaultBranch(io, alloc) catch try alloc.dupe(u8, "main");
+    if (s.refExists(configured)) return configured;
+    defer alloc.free(configured);
+    for ([_][]const u8{ "main", "master" }) |name| {
+        if (s.refExists(name)) return alloc.dupe(u8, name);
+    }
+    return alloc.dupe(u8, configured);
+}
+
+fn stackUsage(w: *std.Io.Writer) !void {
+    try w.writeAll("usage: sdt stack                      (this stack, base to tip)\n");
+    try w.writeAll("       sdt stack add <branch> --on <parent>\n");
+    try w.writeAll("       sdt stack remove <branch>\n");
+    try w.writeAll("       sdt stack rebase | merge [--into <base>] | squash [branch] [-m msg]\n");
+    try ui.hint(w, "`sdt new <name>` from a branch other than the default stacks the new one on it");
+}
+
+fn cmdStack(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    if (rest.len == 0 or rest[0].len == 0 or rest[0][0] == '-') return stackShow(io, alloc, w, rest);
+    const sub = rest[0];
+    const args = rest[1..];
+    if (eq(sub, "show") or eq(sub, "list")) return stackShow(io, alloc, w, args);
+    if (eq(sub, "add")) return stackAdd(io, alloc, w, args);
+    if (eq(sub, "remove")) return stackRemove(io, alloc, w, args);
+    if (eq(sub, "rebase")) return stackRebase(io, alloc, w);
+    if (eq(sub, "merge")) return stackMerge(io, alloc, w, args);
+    if (eq(sub, "squash")) return stackSquash(io, alloc, w, args);
+    try w.print("unknown stack command: {s}\n", .{sub});
+    try stackUsage(w);
+}
+
+const StackRow = struct {
+    name: []u8,
+    parent: ?[]u8,
+    depth: usize,
+};
+
+fn stackDescendants(s: *Store, alloc: std.mem.Allocator, rows: *std.ArrayList(StackRow), parent: []const u8, depth: usize) !void {
+    const kids = try stack.childrenOf(s, alloc, parent);
+    defer stack.freeNames(alloc, kids);
+    for (kids) |kid| {
+        try rows.append(alloc, .{
+            .name = try alloc.dupe(u8, kid),
+            .parent = try alloc.dupe(u8, parent),
+            .depth = depth,
+        });
+        try stackDescendants(s, alloc, rows, kid, depth + 1);
+    }
+}
+
+fn stackShow(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
+    const json = hasFlag(rest, "--json");
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    resolveOps(alloc, &s);
+    const cur = try s.headBranch();
+    defer alloc.free(cur);
+    const names = try stack.lineage(&s, alloc, cur);
+    defer stack.freeNames(alloc, names);
+    const default_branch = try repoDefaultBranch(io, alloc, &s);
+    defer alloc.free(default_branch);
+
+    var rows: std.ArrayList(StackRow) = .empty;
+    defer {
+        for (rows.items) |r| {
+            alloc.free(r.name);
+            if (r.parent) |p| alloc.free(p);
+        }
+        rows.deinit(alloc);
+    }
+    if (!eq(names[0], default_branch) and s.refExists(default_branch)) {
+        try rows.append(alloc, .{ .name = try alloc.dupe(u8, default_branch), .parent = null, .depth = 0 });
+    }
+    for (names) |n| {
+        const parent: ?[]u8 = if (rows.items.len == 0) null else try alloc.dupe(u8, rows.items[rows.items.len - 1].name);
+        errdefer if (parent) |p| alloc.free(p);
+        try rows.append(alloc, .{ .name = try alloc.dupe(u8, n), .parent = parent, .depth = 0 });
+    }
+    try stackDescendants(&s, alloc, &rows, cur, 1);
+
+    if (rows.items.len == 1) {
+        if (json) {
+            try w.writeAll("{\"current\":");
+            try writeJsonString(w, cur);
+            try w.writeAll(",\"branches\":[]}\n");
+            return;
+        }
+        try w.print("{s} is not stacked\n", .{cur});
+        try ui.hint(w, "`sdt stack add <branch> --on <parent>` stacks it; `sdt new <name>` from here stacks the new one on it");
+        return;
+    }
+
+    const set = checks.settings(&s, alloc);
+    defer set.deinit(alloc);
+    var ix = try verdict.Index.load(&s, alloc);
+    defer ix.deinit();
+    const fast = verdict.commandHash(set.command(.fast));
+    const full = verdict.commandHash(set.command(.full));
+
+    if (json) {
+        try w.writeAll("{\"current\":");
+        try writeJsonString(w, cur);
+        try w.writeAll(",\"branches\":[");
+    }
+    for (rows.items, 0..) |row, i| {
+        const tip: Oid = s.readRef(row.name) catch Oid.zero();
+        var grade_of: ?verdict.Verdict = null;
+        if (s.readChange(tip)) |change| {
+            defer object.freeChange(alloc, change);
+            grade_of = ix.best(change.tree, fast, full);
+        } else |_| {}
+        var changes: ?usize = null;
+        var in_place = true;
+        if (row.parent) |parent| {
+            if (stack.uniqueChanges(&s, alloc, row.name, parent)) |unique| {
+                changes = unique.len;
+                alloc.free(unique);
+            } else |_| {}
+            in_place = stack.settled(&s, alloc, row.name, parent);
+        }
+        var hex: [Oid.len * 2]u8 = undefined;
+        if (json) {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll("{\"name\":");
+            try writeJsonString(w, row.name);
+            try w.writeAll(",\"parent\":");
+            if (row.parent) |parent| try writeJsonString(w, parent) else try w.writeAll("null");
+            try w.print(",\"tip\":\"{s}\",\"current\":{s},\"settled\":{s},\"changes\":", .{
+                tip.toHex(&hex),
+                if (eq(row.name, cur)) "true" else "false",
+                if (in_place) "true" else "false",
+            });
+            if (changes) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
+            try w.writeAll(",\"grade\":");
+            if (grade_of) |v| {
+                try w.print("{{\"result\":\"{s}\",\"tier\":\"{s}\"}}", .{ v.result.label(), v.tier.label() });
+            } else try w.writeAll("null");
+            try w.writeByte('}');
+            continue;
+        }
+        if (eq(row.name, cur)) {
+            try w.print("{s}{s}{s} ", .{ ui.on(.cyan), ui.branch_mark, ui.off() });
+        } else {
+            try w.print("{s}{s}{s} ", .{ ui.on(.dim), ui.bullet, ui.off() });
+        }
+        try w.splatByteAll(' ', row.depth * 2);
+        try w.writeAll(row.name);
+        try ui.pad(w, row.name, 16 -| row.depth * 2);
+        try w.print("  {s}{s}{s}  ", .{ ui.on(.dim), shortHex(tip, &hex), ui.off() });
+        if (grade_of) |v| {
+            const colour: ui.Color = if (v.result == .green) .green else .red;
+            try w.print("{s}{s}{s} {s}{s}{s}", .{ ui.on(colour), v.result.label(), ui.off(), ui.on(.dim), v.tier.label(), ui.off() });
+        } else {
+            try w.print("{s}ungraded{s}", .{ ui.on(.dim), ui.off() });
+        }
+        if (changes) |n| {
+            try w.print("  {s}{d} change{s}{s}", .{ ui.on(.dim), n, if (n == 1) "" else "s", ui.off() });
+        }
+        if (!in_place) {
+            try w.print("  {s}behind {s}{s}", .{ ui.on(.yellow), row.parent.?, ui.off() });
+        }
+        try w.writeAll("\n");
+    }
+    if (json) {
+        try w.writeAll("]}\n");
+        return;
+    }
+    for (rows.items) |row| {
+        if (row.parent != null and !stack.settled(&s, alloc, row.name, row.parent.?)) {
+            try ui.hint(w, "`sdt stack rebase` replays every branch onto its parent again");
+            break;
+        }
+    }
+}
+
+fn stackAdd(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, args: []const []const u8) !void {
+    const parent = flagValue(args, "--on", "--on");
+    var name: []const u8 = "";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (eq(args[i], "--on")) {
+            i += 1;
+        } else if (name.len == 0 and args[i].len != 0 and args[i][0] != '-') {
+            name = args[i];
+        }
+    }
+    if (parent.len == 0) {
+        try w.writeAll("usage: sdt stack add <branch> --on <parent>\n");
+        return;
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const cur = try s.headBranch();
+    defer alloc.free(cur);
+    const child = if (name.len != 0) name else cur;
+    stack.setParent(&s, alloc, child, parent) catch |e| switch (e) {
+        stack.Error.InvalidName => {
+            try w.print("{s} cannot be stacked on {s}\n", .{ child, parent });
+            return;
+        },
+        stack.Error.NoSuchBranch => {
+            try w.print("no such branch: {s}\n", .{if (s.refExists(child)) parent else child});
+            return;
+        },
+        stack.Error.Cycle => {
+            try w.print("{s} is already above {s} in this stack\n", .{ parent, child });
+            return;
+        },
+        else => return e,
+    };
+    try w.print("stacked {s} on {s}\n", .{ child, parent });
+}
+
+fn stackRemove(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, args: []const []const u8) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    const cur = try s.headBranch();
+    defer alloc.free(cur);
+    const name = if (args.len != 0 and args[0].len != 0 and args[0][0] != '-') args[0] else cur;
+    if (try stack.remove(&s, alloc, name)) {
+        try w.print("removed {s} from its stack\n", .{name});
+    } else {
+        try w.print("{s} is not stacked\n", .{name});
+    }
+}
+
+fn reportMoved(w: *std.Io.Writer, m: stack.Moved, what: []const u8) !void {
+    var buf: [Oid.len * 2]u8 = undefined;
+    if (m.rewritten == 0) {
+        try w.print("{s}{s}{s} {s} {s} onto {s}, now at {s}{s}{s}\n", .{
+            ui.on(.green), ui.check, ui.off(), what, m.child, m.parent, ui.on(.cyan), shortHex(m.new, &buf), ui.off(),
+        });
+    } else {
+        try w.print("{s}{s}{s} {s} {s} onto {s}: {d} change(s) rewritten, now at {s}{s}{s}\n", .{
+            ui.on(.green), ui.check, ui.off(), what, m.child, m.parent, m.rewritten, ui.on(.cyan), shortHex(m.new, &buf), ui.off(),
+        });
+    }
+    try reportReused(w, m.reused);
+    if (!m.clean()) {
+        try w.print("{d} path(s) came out conflicted on {s}, with both sides marked:\n", .{ m.conflicts.len, m.child });
+        for (m.conflicts) |p| try w.print("  ! {s}\n", .{p});
+    }
+}
+
+fn finishStack(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    before_tree: ?Oid,
+    cur: []const u8,
+    report: stack.Report,
+) !void {
+    if (report.find(cur)) |m| {
+        if (s.readChange(m.new)) |tip| {
+            defer object.freeChange(alloc, tip);
+            var work = try openWork(io);
+            defer work.close(io);
+            workspace.checkout(s, work, before_tree, tip.tree) catch {};
+        } else |_| {}
+    }
+    var conflicted = false;
+    for (report.moved) |m| {
+        if (!m.clean()) conflicted = true;
+    }
+    if (conflicted) {
+        try ui.hint(w, "fix the markers on that branch and `sdt save`, or `sdt undo` to put every branch back");
+        return;
+    }
+    try mirrorRewriteToGit(io, alloc, w, s);
+    try ui.hint(w, "`sdt undo` puts every branch back");
+}
+
+fn reportStackError(w: *std.Io.Writer, e: anyerror, what: []const u8) !bool {
+    switch (e) {
+        stack.Error.NoSuchBranch => try w.writeAll("a branch in this stack no longer exists\n"),
+        stack.Error.ParentNotAncestor => try w.writeAll("a branch in this stack shares no history with its parent\n"),
+        else => return reportHistoryError(w, e, what),
+    }
+    return true;
+}
+
+fn stackRebase(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "stack rebase");
+    const cur = try s.headBranch();
+    defer alloc.free(cur);
+    const root = try stack.rootOf(&s, alloc, cur);
+    defer alloc.free(root);
+    const before_tree = branches.headTree(&s);
+
+    const report = stack.restackAll(&s, alloc, root, nowSeconds(io)) catch |e| {
+        if (try reportStackError(w, e, "rebase")) return;
+        return e;
+    };
+    defer report.deinit(alloc);
+    if (report.moved.len == 0) {
+        if (report.settled.len == 0) {
+            try w.print("{s} is not stacked\n", .{cur});
+            try ui.hint(w, "`sdt stack add <branch> --on <parent>` stacks it");
+        } else {
+            try w.writeAll("every branch is already on its parent\n");
+        }
+        return;
+    }
+    for (report.moved) |m| try reportMoved(w, m, "rebased");
+    try finishStack(io, alloc, w, &s, before_tree, cur, report);
+}
+
+fn stackMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, args: []const []const u8) !void {
+    const into = flagValue(args, "--into", "--into");
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "stack merge");
+    const cur = try s.headBranch();
+    defer alloc.free(cur);
+    const names = try stack.lineage(&s, alloc, cur);
+    defer stack.freeNames(alloc, names);
+    const default_branch = try repoDefaultBranch(io, alloc, &s);
+    defer alloc.free(default_branch);
+    const base = if (into.len != 0) into else default_branch;
+    if (!s.refExists(base)) {
+        try w.print("no such branch: {s}\n", .{base});
+        return;
+    }
+    const levels = if (eq(names[0], base)) names[1..] else names;
+    if (levels.len == 0) {
+        try w.print("{s} is the base, nothing to merge into it\n", .{cur});
+        return;
+    }
+    for (levels) |level| {
+        if (!s.refExists(level)) {
+            try w.print("no such branch: {s}\n", .{level});
+            return;
+        }
+    }
+
+    var work = try openWork(io);
+    defer work.close(io);
+    if (!eq(cur, base)) {
+        branches.switchTo(&s, work, base) catch |e| {
+            try w.print("could not switch to {s}: {s}\n", .{ base, @errorName(e) });
+            return;
+        };
+        try w.print("switched to {s}\n", .{base});
+    }
+    const author = try config.author(&s, alloc);
+    defer alloc.free(author);
+    const before = s.readRef(base) catch Oid.zero();
+    var tree = branches.headTree(&s);
+
+    for (levels) |level| {
+        const pre = s.readRef(base) catch Oid.zero();
+        const result = merge.merge(&s, alloc, base, level, author, nowSeconds(io)) catch |e| {
+            try w.print("merge of {s} failed: {s}\n", .{ level, @errorName(e) });
+            break;
+        };
+        defer merge.freeMergeResult(alloc, result);
+        workspace.checkout(&s, work, tree, result.tree) catch {};
+        tree = result.tree;
+        try reportReused(w, result.reused);
+        if (result.conflicts.len == 0) {
+            try w.print("merged {s} into {s}, clean\n", .{ level, base });
+            continue;
+        }
+        merge.saveState(&s, level, pre, result.conflicts) catch {};
+        try w.print("merged {s} into {s} with {d} conflict(s):\n", .{ level, base, result.conflicts.len });
+        for (result.conflicts) |p| try w.print("  ! {s}\n", .{p});
+        try w.writeAll("fix the markers, then `sdt resolve <file>` each, or `sdt resolve --abort`\n");
+        break;
+    }
+    const after = s.readRef(base) catch Oid.zero();
+    if (!after.eql(before)) {
+        const moves = [_]oplog.Move{.{ .branch = base, .prev = before, .new = after }};
+        oplog.recordStack(&s, &moves, nowSeconds(io)) catch {};
+        try ui.hint(w, "`sdt undo` puts the base back where it was");
+    }
+}
+
+fn stackSquash(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, args: []const []const u8) !void {
+    const message = messageFlag(args);
+    var name: []const u8 = "";
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (eq(args[i], "-m") or eq(args[i], "--message")) {
+            i += 1;
+        } else if (name.len == 0 and args[i].len != 0 and args[i][0] != '-') {
+            name = args[i];
+        }
+    }
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
+    captureBefore(io, alloc, &s);
+    try autoSaveIfDirty(io, alloc, w, &s, "stack squash");
+    const cur = try s.headBranch();
+    defer alloc.free(cur);
+    const branch = if (name.len != 0) name else cur;
+    const before_tree = branches.headTree(&s);
+
+    const report = stack.squashLevel(&s, alloc, branch, message, nowSeconds(io)) catch |e| switch (e) {
+        stack.Error.NoParent => {
+            try w.print("{s} is not stacked\n", .{branch});
+            try ui.hint(w, "`sdt stack add <branch> --on <parent>` stacks it; `sdt squash` collapses changes on any branch");
+            return;
+        },
+        history.Error.NothingToDo => {
+            try w.print("nothing to squash: {s} holds at most one change over its parent\n", .{branch});
+            return;
+        },
+        else => {
+            if (try reportStackError(w, e, "squash")) return;
+            return e;
+        },
+    };
+    defer report.deinit(alloc);
+    var buf: [Oid.len * 2]u8 = undefined;
+    const first = report.moved[0];
+    try w.print("{s}{s}{s} squashed {s} into one change, now at {s}{s}{s}\n", .{
+        ui.on(.green), ui.check, ui.off(), first.child, ui.on(.cyan), shortHex(first.new, &buf), ui.off(),
+    });
+    for (report.moved[1..]) |m| try reportMoved(w, m, "rebased");
+    try finishStack(io, alloc, w, &s, before_tree, cur, report);
 }
 
 fn cmdSquash(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
@@ -2997,6 +3579,8 @@ fn branchDelete(
         else => return e,
     };
 
+    _ = stack.remove(&s, alloc, name) catch false;
+
     var buf: [Oid.len * 2]u8 = undefined;
     try w.print("{s}{s}{s} deleted branch {s}{s}{s}, was at {s}{s}{s}\n", .{
         ui.on(.green), ui.check,            ui.off(),
@@ -3047,6 +3631,8 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     }
 
     try autoSaveIfDirty(io, alloc, w, &s, "new");
+    const from = try s.headBranch();
+    defer alloc.free(from);
     branches.create(&s, name) catch |e| switch (e) {
         branches.Error.BranchExists => {
             try w.print("branch {s} already exists\n", .{name});
@@ -3057,6 +3643,16 @@ fn cmdNew(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
     var work = try openWork(io);
     defer work.close(io);
     try branches.switchTo(&s, work, name);
+    const default_branch = try repoDefaultBranch(io, alloc, &s);
+    defer alloc.free(default_branch);
+    if (!eq(from, default_branch) and s.refExists(from)) {
+        stack.setParent(&s, alloc, name, from) catch {
+            try w.print("on new branch {s}\n", .{name});
+            return;
+        };
+        try w.print("on new branch {s}, stacked on {s}\n", .{ name, from });
+        return;
+    }
     try w.print("on new branch {s}\n", .{name});
 }
 
@@ -3713,6 +4309,7 @@ fn cmdMerge(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     defer work.close(io);
     workspace.checkout(&s, work, before_tree, result.tree) catch {};
 
+    try reportReused(w, result.reused);
     if (result.conflicts.len == 0) {
         try w.print("merged {s} into {s}, clean\n", .{ rest[0], into });
     } else {
@@ -8510,4 +9107,120 @@ test "init writes the exclude file when git has none, and skips a repo without g
     defer without.close(io);
     try excludeFromColocatedGit(io, alloc, &aw.writer, without);
     try std.testing.expectEqualStrings("", aw.written());
+}
+
+test "new stacks a branch made off a non-default branch, and stack shows the levels" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "a\n");
+    _ = try f.save("root");
+
+    try cmdNew(io, alloc, f.w(), &.{"api"});
+    try std.testing.expectEqualStrings("on new branch api\n", f.said());
+    try f.write("g.txt", "b\n");
+    _ = try f.save("api work");
+
+    f.clear();
+    try cmdNew(io, alloc, f.w(), &.{"ui"});
+    try std.testing.expectEqualStrings("on new branch ui, stacked on api\n", f.said());
+    try f.write("h.txt", "c\n");
+    _ = try f.save("ui work");
+
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "1 change") != null);
+
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{"--json"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "\"current\":\"ui\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "\"name\":\"api\",\"parent\":\"main\"") != null);
+
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{ "remove", "ui" });
+    try std.testing.expectEqualStrings("removed ui from its stack\n", f.said());
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{ "add", "ui", "--on", "api" });
+    try std.testing.expectEqualStrings("stacked ui on api\n", f.said());
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{ "add", "api", "--on", "ui" });
+    try std.testing.expectEqualStrings("ui is already above api in this stack\n", f.said());
+}
+
+test "stack rebase replays the levels after the base moves and undo puts them back" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "a\n");
+    _ = try f.save("root");
+    try cmdNew(io, alloc, f.w(), &.{"api"});
+    try f.write("g.txt", "b\n");
+    const api_tip = try f.save("api work");
+    try cmdNew(io, alloc, f.w(), &.{"ui"});
+    try f.write("h.txt", "c\n");
+    const ui_tip = try f.save("ui work");
+    try cmdStack(io, alloc, f.w(), &.{ "add", "api", "--on", "main" });
+
+    try branches.switchTo(&f.store, f.root, "main");
+    try f.write("f.txt", "a2\n");
+    _ = try f.save("base moved");
+    try branches.switchTo(&f.store, f.root, "ui");
+
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{"rebase"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "rebased api onto main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "rebased ui onto api") != null);
+    try std.testing.expect(!(try f.store.readRef("api")).eql(api_tip));
+    try std.testing.expect(!(try f.store.readRef("ui")).eql(ui_tip));
+    const on_disk = try f.read("f.txt");
+    defer alloc.free(on_disk);
+    try std.testing.expectEqualStrings("a2\n", on_disk);
+
+    f.clear();
+    try cmdStack(io, alloc, f.w(), &.{"rebase"});
+    try std.testing.expectEqualStrings("every branch is already on its parent\n", f.said());
+
+    try cmdUndo(io, alloc, f.w());
+    try std.testing.expect((try f.store.readRef("api")).eql(api_tip));
+    try std.testing.expect((try f.store.readRef("ui")).eql(ui_tip));
+}
+
+test "resolve stages a merge resolution and lists it as waiting for a grade" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = try CliFixture.init();
+    defer f.deinit();
+
+    try f.write("f.txt", "a\nb\nc\n");
+    _ = try f.save("root");
+    try cmdNew(io, alloc, f.w(), &.{"left"});
+    try f.write("f.txt", "X\nb\nc\n");
+    _ = try f.save("left");
+    try branches.switchTo(&f.store, f.root, "main");
+    try f.write("f.txt", "Y\nb\nc\n");
+    _ = try f.save("right");
+
+    f.clear();
+    try cmdMerge(io, alloc, f.w(), &.{"left"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "1 conflict(s)") != null);
+    try f.write("f.txt", "Z\nb\nc\n");
+
+    f.clear();
+    try cmdResolve(io, alloc, f.w(), &.{"f.txt"});
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "resolved f.txt. all conflicts cleared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "once this tree grades green") != null);
+
+    f.clear();
+    try cmdResolve(io, alloc, f.w(), &.{ "--list", "--json" });
+    try std.testing.expectEqualStrings("{\"recorded\":[],\"pending\":[{\"path\":\"f.txt\",\"kind\":\"content\"}]}\n", f.said());
+
+    f.clear();
+    try cmdResolve(io, alloc, f.w(), &.{ "--forget", "abc" });
+    try std.testing.expect(std.mem.indexOf(u8, f.said(), "no recorded resolution matches abc") != null);
 }

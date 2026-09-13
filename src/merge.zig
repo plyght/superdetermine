@@ -61,11 +61,14 @@ fn collectAncestors(store: *Store, alloc: std.mem.Allocator, start: Oid, set: *s
 pub const MergeResult = struct {
     tree: Oid,
     conflicts: [][]u8,
+    reused: [][]u8 = &.{},
 };
 
 pub fn freeMergeResult(alloc: std.mem.Allocator, r: MergeResult) void {
     for (r.conflicts) |p| alloc.free(p);
     alloc.free(r.conflicts);
+    for (r.reused) |p| alloc.free(p);
+    alloc.free(r.reused);
 }
 
 const PathMap = std.StringHashMap(object.TreeEntry);
@@ -95,6 +98,7 @@ fn looksBinary(data: []const u8) bool {
 
 /// Three-way merge of two tree Oids against an optional base tree.
 pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid, theirs: Oid) !MergeResult {
+    _ = resolution.settle(store, alloc) catch 0;
     var base_map = PathMap.init(alloc);
     defer freePathMap(alloc, &base_map);
     var ours_map = PathMap.init(alloc);
@@ -128,6 +132,11 @@ pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid
         for (conflicts.items) |p| alloc.free(p);
         conflicts.deinit(alloc);
     }
+    var reused: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (reused.items) |p| alloc.free(p);
+        reused.deinit(alloc);
+    }
 
     // Superposition is off unless the repo asks for it, and defaults off for
     // existing repos: a file quietly holding a second value is a real change to
@@ -143,7 +152,7 @@ pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid
         const o = ours_map.get(path);
         const t = theirs_map.get(path);
 
-        const result: ?object.TreeEntry = try resolveEntry(store, alloc, path, b, o, t, &conflicts, sset, &superposed);
+        const result: ?object.TreeEntry = try resolveEntry(store, alloc, path, b, o, t, &conflicts, &reused, sset, &superposed);
         if (result) |e| {
             try entries.append(alloc, .{
                 .mode = e.mode,
@@ -161,6 +170,7 @@ pub fn mergeTrees(store: *Store, alloc: std.mem.Allocator, base: ?Oid, ours: Oid
     return .{
         .tree = tree_oid,
         .conflicts = try conflicts.toOwnedSlice(alloc),
+        .reused = try reused.toOwnedSlice(alloc),
     };
 }
 
@@ -222,6 +232,7 @@ pub fn resolveEntry(
     ours: ?object.TreeEntry,
     theirs: ?object.TreeEntry,
     conflicts: *std.ArrayList([]u8),
+    reused: *std.ArrayList([]u8),
     sset: superpose.Settings,
     superposed: *usize,
 ) !?object.TreeEntry {
@@ -239,7 +250,7 @@ pub fn resolveEntry(
         try conflicts.append(alloc, try alloc.dupe(u8, path));
         blob = tb;
     } else {
-        blob = try resolvePath(store, alloc, path, fb, ob, tb, conflicts, sset, superposed);
+        blob = try resolvePath(store, alloc, path, fb, ob, tb, conflicts, reused, sset, superposed);
     }
 
     const b = blob orelse return null;
@@ -260,6 +271,7 @@ pub fn resolvePath(
     ours: ?Oid,
     theirs: ?Oid,
     conflicts: *std.ArrayList([]u8),
+    reused: *std.ArrayList([]u8),
     sset: superpose.Settings,
     superposed: *usize,
 ) !?Oid {
@@ -279,7 +291,10 @@ pub fn resolvePath(
     if (ours == null) {
         switch (try reuseResolution(store, alloc, base, ours, theirs)) {
             .miss => {},
-            .resolved => |reused| return reused,
+            .resolved => |found| {
+                try reused.append(alloc, try alloc.dupe(u8, path));
+                return found;
+            },
         }
         // deleted on ours, modified on theirs → conflict, keep theirs.
         try conflicts.append(alloc, try alloc.dupe(u8, path));
@@ -288,7 +303,10 @@ pub fn resolvePath(
     if (theirs == null) {
         switch (try reuseResolution(store, alloc, base, ours, theirs)) {
             .miss => {},
-            .resolved => |reused| return reused,
+            .resolved => |found| {
+                try reused.append(alloc, try alloc.dupe(u8, path));
+                return found;
+            },
         }
         try conflicts.append(alloc, try alloc.dupe(u8, path));
         return ours;
@@ -305,7 +323,10 @@ pub fn resolvePath(
     if (looksBinary(ours_data) or looksBinary(theirs_data) or looksBinary(base_data)) {
         switch (try reuseResolution(store, alloc, base, ours, theirs)) {
             .miss => {},
-            .resolved => |reused| return reused,
+            .resolved => |found| {
+                try reused.append(alloc, try alloc.dupe(u8, path));
+                return found;
+            },
         }
         if (try superposeCandidates(store, alloc, path, ours.?, theirs.?, sset, superposed)) |primary| {
             return primary;
@@ -319,7 +340,10 @@ pub fn resolvePath(
     if (merged.conflict) {
         switch (try reuseResolution(store, alloc, base, ours, theirs)) {
             .miss => {},
-            .resolved => |reused| return reused,
+            .resolved => |found| {
+                try reused.append(alloc, try alloc.dupe(u8, path));
+                return found;
+            },
         }
         // The three-way merge ran first and could not reconcile this path.
         // Only now does superposition apply, and it replaces the conflict
@@ -1397,4 +1421,39 @@ test "merge conflicts a symlink against a regular file" {
     defer alloc.free(p_data);
     try testing.expectEqualStrings("some/target", p_data);
     try testing.expect(!hasConflictMarkers(p_data));
+}
+
+test "a recorded resolution replaces the conflict and is reported as reused" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const base_blob = try store.writeFileContent("a\nb\nc\n");
+    const ours_blob = try store.writeFileContent("X\nb\nc\n");
+    const theirs_blob = try store.writeFileContent("Y\nb\nc\n");
+    const base_tree = try singleFileTree(&store, "f", base_blob);
+    const ours_tree = try singleFileTree(&store, "f", ours_blob);
+    const theirs_tree = try singleFileTree(&store, "f", theirs_blob);
+
+    const before = try mergeTrees(&store, alloc, base_tree, ours_tree, theirs_tree);
+    defer freeMergeResult(alloc, before);
+    try testing.expectEqual(@as(usize, 1), before.conflicts.len);
+    try testing.expectEqual(@as(usize, 0), before.reused.len);
+
+    const candidates = [_]?Oid{ ours_blob, theirs_blob };
+    _ = try resolution.record(&store, alloc, .{ .base = base_blob, .candidates = &candidates }, .{ .content = "Z\nb\nc\n" }, null);
+
+    const after = try mergeTrees(&store, alloc, base_tree, theirs_tree, ours_tree);
+    defer freeMergeResult(alloc, after);
+    try testing.expectEqual(@as(usize, 0), after.conflicts.len);
+    try testing.expectEqual(@as(usize, 1), after.reused.len);
+    try testing.expectEqualStrings("f", after.reused[0]);
+    const merged = try store.readTree(after.tree);
+    defer object.freeTree(alloc, merged);
+    const data = try store.readFileContent(merged.entries[0].blob);
+    defer alloc.free(data);
+    try testing.expectEqualStrings("Z\nb\nc\n", data);
 }

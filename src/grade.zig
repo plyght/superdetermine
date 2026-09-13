@@ -3,6 +3,7 @@ const oid = @import("oid.zig");
 const object = @import("object.zig");
 const moment = @import("moment.zig");
 const verdict = @import("verdict.zig");
+const resolution = @import("resolution.zig");
 const checks = @import("checks.zig");
 const warrant = @import("warrant.zig");
 const readset = @import("readset.zig");
@@ -355,6 +356,7 @@ pub fn gradeState(
     }
 
     try verdict.record(ctx.store, v);
+    _ = resolution.promote(ctx.store, ctx.alloc, v) catch 0;
     return v;
 }
 
@@ -437,6 +439,7 @@ pub fn gradeChange(
     };
 
     try verdict.record(ctx.store, v);
+    _ = resolution.promote(ctx.store, ctx.alloc, v) catch 0;
     return v;
 }
 

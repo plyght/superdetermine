@@ -1,11 +1,13 @@
 const std = @import("std");
 const oid = @import("oid.zig");
+const object = @import("object.zig");
 const applog = @import("applog.zig");
 const verdict = @import("verdict.zig");
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
 pub const log_path = "resolutions";
+pub const pending_path = "resolutions-pending";
 
 pub const Error = error{
     InvalidConflict,
@@ -444,6 +446,194 @@ pub fn lookup(store: *Store, alloc: std.mem.Allocator, conflict: Conflict) !?Mat
     return resolved;
 }
 
+pub const Pending = struct {
+    path: []u8,
+    base: ?Oid,
+    candidates: [2]?Oid,
+    resolution: StoredResolution,
+
+    pub fn conflict(self: *const Pending) Conflict {
+        return .{ .base = self.base, .candidates = &self.candidates };
+    }
+};
+
+pub fn freePending(alloc: std.mem.Allocator, items: []Pending) void {
+    for (items) |item| alloc.free(item.path);
+    alloc.free(items);
+}
+
+fn writePending(store: *Store, alloc: std.mem.Allocator, items: []const Pending) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (items) |item| {
+        var base_hex: [Oid.len * 2]u8 = undefined;
+        var ours_hex: [Oid.len * 2]u8 = undefined;
+        var theirs_hex: [Oid.len * 2]u8 = undefined;
+        var blob_hex: [Oid.len * 2]u8 = undefined;
+        var digest_hex: [Oid.len * 2]u8 = undefined;
+        const kind: []const u8 = switch (item.resolution) {
+            .content => "content",
+            .deleted => "deleted",
+        };
+        const blob: ?Oid = switch (item.resolution) {
+            .content => |stored| stored.blob,
+            .deleted => null,
+        };
+        const digest: ?Oid = switch (item.resolution) {
+            .content => |stored| stored.digest,
+            .deleted => null,
+        };
+        try out.print(alloc, "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            item.path,
+            oidToken(item.base, &base_hex),
+            oidToken(item.candidates[0], &ours_hex),
+            oidToken(item.candidates[1], &theirs_hex),
+            kind,
+            oidToken(blob, &blob_hex),
+            oidToken(digest, &digest_hex),
+        });
+    }
+    if (out.items.len == 0) {
+        store.root.deleteFile(store.io, pending_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        return;
+    }
+    try store.writeFileAtomic(pending_path, out.items);
+}
+
+pub fn pending(store: *Store, alloc: std.mem.Allocator) ![]Pending {
+    const data = store.root.readFileAlloc(store.io, pending_path, alloc, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return alloc.alloc(Pending, 0),
+        else => return err,
+    };
+    defer alloc.free(data);
+    var out: std.ArrayList(Pending) = .empty;
+    errdefer {
+        for (out.items) |item| alloc.free(item.path);
+        out.deinit(alloc);
+    }
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const path = fields.next() orelse continue;
+        const base = parseOptionalOid(fields.next() orelse continue) catch continue;
+        const ours = parseOptionalOid(fields.next() orelse continue) catch continue;
+        const theirs = parseOptionalOid(fields.next() orelse continue) catch continue;
+        const kind = fields.next() orelse continue;
+        const blob = parseOptionalOid(fields.next() orelse continue) catch continue;
+        const digest = parseOptionalOid(fields.next() orelse continue) catch continue;
+        const stored: StoredResolution = if (std.mem.eql(u8, kind, "content")) blk: {
+            if (blob == null or digest == null) continue;
+            break :blk .{ .content = .{ .blob = blob.?, .digest = digest.? } };
+        } else if (std.mem.eql(u8, kind, "deleted")) .deleted else continue;
+        try out.append(alloc, .{
+            .path = try alloc.dupe(u8, path),
+            .base = base,
+            .candidates = .{ ours, theirs },
+            .resolution = stored,
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn stage(store: *Store, alloc: std.mem.Allocator, path: []const u8, conflict: Conflict, res: Resolution) !void {
+    if (conflict.candidates.len != 2 or std.mem.indexOfAny(u8, path, "\t\n") != null) return Error.InvalidConflict;
+    _ = try fingerprint(alloc, conflict);
+    const stored: StoredResolution = switch (res) {
+        .content => |bytes| .{ .content = .{
+            .blob = try store.writeFileContent(bytes),
+            .digest = Oid.ofBytes(bytes),
+        } },
+        .deleted => .deleted,
+    };
+    const existing = try pending(store, alloc);
+    defer freePending(alloc, existing);
+    var items: std.ArrayList(Pending) = .empty;
+    defer items.deinit(alloc);
+    for (existing) |item| {
+        if (std.mem.eql(u8, item.path, path)) continue;
+        try items.append(alloc, item);
+    }
+    try items.append(alloc, .{
+        .path = @constCast(path),
+        .base = conflict.base,
+        .candidates = .{ conflict.candidates[0], conflict.candidates[1] },
+        .resolution = stored,
+    });
+    try writePending(store, alloc, items.items);
+}
+
+pub fn clearPending(store: *Store) !void {
+    store.root.deleteFile(store.io, pending_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn blobAt(tree: object.Tree, path: []const u8) ?Oid {
+    for (tree.entries) |entry| {
+        if (std.mem.eql(u8, entry.path, path)) return entry.blob;
+    }
+    return null;
+}
+
+pub fn promote(store: *Store, alloc: std.mem.Allocator, v: verdict.Verdict) !usize {
+    if (!v.isGreen()) return 0;
+    const items = try pending(store, alloc);
+    defer freePending(alloc, items);
+    if (items.len == 0) return 0;
+
+    const tree = try store.readTree(v.tree);
+    defer object.freeTree(alloc, tree);
+    const evidence: HistoricalEvidence = .{ .tree = v.tree, .tier = v.tier, .command = v.command, .inputs = v.inputs };
+
+    var kept: std.ArrayList(Pending) = .empty;
+    defer kept.deinit(alloc);
+    var promoted: usize = 0;
+    for (items) |item| {
+        const held = blobAt(tree, item.path);
+        const matches = switch (item.resolution) {
+            .deleted => held == null,
+            .content => |stored| held != null and held.?.eql(stored.blob),
+        };
+        if (!matches) {
+            try kept.append(alloc, item);
+            continue;
+        }
+        switch (item.resolution) {
+            .deleted => _ = try record(store, alloc, item.conflict(), .deleted, evidence),
+            .content => |stored| {
+                const bytes = try store.readFileContent(stored.blob);
+                defer alloc.free(bytes);
+                _ = try record(store, alloc, item.conflict(), .{ .content = bytes }, evidence);
+            },
+        }
+        promoted += 1;
+    }
+    if (promoted != 0) try writePending(store, alloc, kept.items);
+    return promoted;
+}
+
+pub fn settle(store: *Store, alloc: std.mem.Allocator) !usize {
+    const items = try pending(store, alloc);
+    defer freePending(alloc, items);
+    if (items.len == 0) return 0;
+    const all = try verdict.readAll(store, alloc);
+    defer alloc.free(all);
+    var promoted: usize = 0;
+    var i = all.len;
+    while (i > 0) : (i -= 1) {
+        const v = all[i - 1];
+        if (!v.isGreen()) continue;
+        promoted += promote(store, alloc, v) catch 0;
+        if (promoted >= items.len) break;
+    }
+    return promoted;
+}
+
 fn entryLess(_: void, a: Entry, b: Entry) bool {
     return std.mem.order(u8, &a.fingerprint.bytes, &b.fingerprint.bytes) == .lt;
 }
@@ -660,4 +850,66 @@ test "gc compacts superseded and forgotten records" {
     defer found.deinit(alloc);
     try testing.expectEqualStrings("two", found.resolution.content);
     try testing.expect((try lookup(&store, alloc, second)) == null);
+}
+
+test "a staged resolution is recorded once a green verdict holds the resolved blob" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const candidates = [_]?Oid{ testOid("ours"), testOid("theirs") };
+    const conflict: Conflict = .{ .base = testOid("base"), .candidates = &candidates };
+    try stage(&store, alloc, "a.txt", conflict, .{ .content = "resolved\n" });
+    const waiting = try pending(&store, alloc);
+    defer freePending(alloc, waiting);
+    try testing.expectEqual(@as(usize, 1), waiting.len);
+    try testing.expectEqualStrings("a.txt", waiting[0].path);
+    try testing.expect((try lookup(&store, alloc, conflict)) == null);
+
+    const resolved_blob = try store.writeFileContent("resolved\n");
+    const other_blob = try store.writeFileContent("other\n");
+    const other_tree = try store.writeTree(.{ .entries = &[_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a.txt", .blob = other_blob },
+    } });
+    const resolved_tree = try store.writeTree(.{ .entries = &[_]object.TreeEntry{
+        .{ .mode = .regular, .path = "a.txt", .blob = resolved_blob },
+    } });
+    const command = verdict.commandHash("zig build test");
+    const unrelated: verdict.Verdict = .{
+        .tree = other_tree,
+        .tier = .full,
+        .command = command,
+        .result = .green,
+        .exit_code = 0,
+        .duration_ms = 1,
+        .ms = 1,
+        .readset = Oid.zero(),
+    };
+    try testing.expectEqual(@as(usize, 0), try promote(&store, alloc, unrelated));
+    var red = unrelated;
+    red.tree = resolved_tree;
+    red.result = .red;
+    try testing.expectEqual(@as(usize, 0), try promote(&store, alloc, red));
+
+    try verdict.record(&store, .{
+        .tree = resolved_tree,
+        .tier = .full,
+        .command = command,
+        .result = .green,
+        .exit_code = 0,
+        .duration_ms = 1,
+        .ms = 2,
+        .readset = Oid.zero(),
+    });
+    try testing.expectEqual(@as(usize, 1), try settle(&store, alloc));
+    var found = (try lookup(&store, alloc, conflict)).?;
+    defer found.deinit(alloc);
+    try testing.expectEqualStrings("resolved\n", found.resolution.content);
+    try testing.expect(found.evidence.?.tree.eql(resolved_tree));
+    const after = try pending(&store, alloc);
+    defer freePending(alloc, after);
+    try testing.expectEqual(@as(usize, 0), after.len);
 }

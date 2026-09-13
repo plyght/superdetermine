@@ -14,6 +14,7 @@ pub const Error = error{
 pub const Result = struct {
     tree: Oid,
     conflicts: [][]u8,
+    reused: [][]u8 = &.{},
 
     pub fn clean(self: Result) bool {
         return self.conflicts.len == 0;
@@ -23,6 +24,8 @@ pub const Result = struct {
 pub fn freeResult(alloc: std.mem.Allocator, r: Result) void {
     for (r.conflicts) |p| alloc.free(p);
     alloc.free(r.conflicts);
+    for (r.reused) |p| alloc.free(p);
+    alloc.free(r.reused);
 }
 
 pub fn emptyTree(store: *Store) !Oid {
@@ -50,19 +53,33 @@ pub fn applyChain(store: *Store, alloc: std.mem.Allocator, base_tree: Oid, chang
         for (conflicts.items) |p| alloc.free(p);
         conflicts.deinit(alloc);
     }
+    var reused: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (reused.items) |p| alloc.free(p);
+        reused.deinit(alloc);
+    }
 
     var tree = base_tree;
     for (changes) |c| {
         const r = try applyChange(store, alloc, tree, c);
         defer alloc.free(r.conflicts);
+        defer alloc.free(r.reused);
         tree = r.tree;
         for (r.conflicts) |p| {
             errdefer alloc.free(p);
             try conflicts.append(alloc, p);
         }
+        for (r.reused) |p| {
+            errdefer alloc.free(p);
+            try reused.append(alloc, p);
+        }
     }
 
-    return .{ .tree = tree, .conflicts = try conflicts.toOwnedSlice(alloc) };
+    return .{
+        .tree = tree,
+        .conflicts = try conflicts.toOwnedSlice(alloc),
+        .reused = try reused.toOwnedSlice(alloc),
+    };
 }
 
 const EntryMap = std.StringHashMap(object.TreeEntry);
@@ -122,6 +139,11 @@ pub fn applyTreeDelta(
         for (conflicts.items) |p| alloc.free(p);
         conflicts.deinit(alloc);
     }
+    var reused: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (reused.items) |p| alloc.free(p);
+        reused.deinit(alloc);
+    }
 
     const sset = superpose.settings(store, alloc);
     var superposed: usize = superpose.count(store, alloc) catch 0;
@@ -137,6 +159,7 @@ pub fn applyTreeDelta(
             base_map.get(path),
             to_map.get(path),
             &conflicts,
+            &reused,
             sset,
             &superposed,
         );
@@ -154,7 +177,11 @@ pub fn applyTreeDelta(
     for (entries.items) |e| alloc.free(e.path);
     entries.deinit(alloc);
 
-    return .{ .tree = tree_oid, .conflicts = try conflicts.toOwnedSlice(alloc) };
+    return .{
+        .tree = tree_oid,
+        .conflicts = try conflicts.toOwnedSlice(alloc),
+        .reused = try reused.toOwnedSlice(alloc),
+    };
 }
 
 // --- tests ---

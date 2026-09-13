@@ -35,6 +35,7 @@ pub const Result = struct {
     new: Oid,
     rewritten: usize,
     conflicts: [][]u8,
+    reused: [][]u8 = &.{},
 
     pub fn clean(self: Result) bool {
         return self.conflicts.len == 0;
@@ -43,8 +44,12 @@ pub const Result = struct {
     pub fn deinit(self: Result, alloc: std.mem.Allocator) void {
         for (self.conflicts) |p| alloc.free(p);
         alloc.free(self.conflicts);
+        for (self.reused) |p| alloc.free(p);
+        alloc.free(self.reused);
     }
 };
+
+pub const Logging = enum { record, quiet };
 
 pub fn tipOf(store: *Store, branch: []const u8) !Oid {
     if (!store.refExists(branch)) return Error.UnbornBranch;
@@ -158,6 +163,7 @@ const Rewriter = struct {
     tree: Oid,
     parent: ?Oid,
     conflicts: std.ArrayList([]u8),
+    reused: std.ArrayList([]u8),
     count: usize,
 
     fn init(store: *Store, alloc: std.mem.Allocator, base_tree: Oid, parent: ?Oid) Rewriter {
@@ -167,6 +173,7 @@ const Rewriter = struct {
             .tree = base_tree,
             .parent = parent,
             .conflicts = .empty,
+            .reused = .empty,
             .count = 0,
         };
     }
@@ -174,23 +181,34 @@ const Rewriter = struct {
     fn deinit(self: *Rewriter) void {
         for (self.conflicts.items) |p| self.alloc.free(p);
         self.conflicts.deinit(self.alloc);
+        for (self.reused.items) |p| self.alloc.free(p);
+        self.reused.deinit(self.alloc);
     }
 
     fn take(self: *Rewriter, r: replay.Result) !void {
         defer self.alloc.free(r.conflicts);
+        defer self.alloc.free(r.reused);
         self.tree = r.tree;
         for (r.conflicts) |p| {
             errdefer self.alloc.free(p);
-            if (self.holds(p)) {
+            if (holds(self.conflicts.items, p)) {
                 self.alloc.free(p);
                 continue;
             }
             try self.conflicts.append(self.alloc, p);
         }
+        for (r.reused) |p| {
+            errdefer self.alloc.free(p);
+            if (holds(self.reused.items, p)) {
+                self.alloc.free(p);
+                continue;
+            }
+            try self.reused.append(self.alloc, p);
+        }
     }
 
-    fn holds(self: *Rewriter, path: []const u8) bool {
-        for (self.conflicts.items) |p| {
+    fn holds(items: []const []u8, path: []const u8) bool {
+        for (items) |p| {
             if (std.mem.eql(u8, p, path)) return true;
         }
         return false;
@@ -237,21 +255,27 @@ const Rewriter = struct {
         for (sources) |s| _ = try self.push(s);
     }
 
-    fn finish(self: *Rewriter, branch: []const u8, prev: Oid, timestamp: i64) !Result {
+    fn finish(self: *Rewriter, branch: []const u8, prev: Oid, timestamp: i64, logging: Logging) !Result {
         const new = self.parent orelse return Error.NothingToDo;
         try self.store.updateRef(branch, new);
-        try oplog.record(self.store, .{
+        if (logging == .record) try oplog.record(self.store, .{
             .kind = .other,
             .branch = branch,
             .prev = prev,
             .new = new,
             .timestamp = timestamp,
         });
+        const conflicts = try self.conflicts.toOwnedSlice(self.alloc);
+        errdefer {
+            for (conflicts) |p| self.alloc.free(p);
+            self.alloc.free(conflicts);
+        }
         return .{
             .prev = prev,
             .new = new,
             .rewritten = self.count,
-            .conflicts = try self.conflicts.toOwnedSlice(self.alloc),
+            .conflicts = conflicts,
+            .reused = try self.reused.toOwnedSlice(self.alloc),
         };
     }
 };
@@ -270,6 +294,10 @@ fn derivedChangeId(tree: Oid, timestamp: i64) object.ChangeId {
 /// Move a branch tip to any change, forwards or backwards. This is the primitive
 /// every rewriter needs and the one the ref layer never exposed.
 pub fn point(store: *Store, alloc: std.mem.Allocator, branch: []const u8, target: Oid, timestamp: i64) !Result {
+    return pointWith(store, alloc, branch, target, timestamp, .record);
+}
+
+pub fn pointWith(store: *Store, alloc: std.mem.Allocator, branch: []const u8, target: Oid, timestamp: i64, logging: Logging) !Result {
     const change = store.readChange(target) catch return Error.NotAChange;
     object.freeChange(alloc, change);
 
@@ -277,7 +305,7 @@ pub fn point(store: *Store, alloc: std.mem.Allocator, branch: []const u8, target
     if (prev.eql(target)) return Error.NothingToDo;
 
     try store.updateRef(branch, target);
-    try oplog.record(store, .{
+    if (logging == .record) try oplog.record(store, .{
         .kind = .other,
         .branch = branch,
         .prev = prev,
@@ -288,6 +316,10 @@ pub fn point(store: *Store, alloc: std.mem.Allocator, branch: []const u8, target
 }
 
 pub fn rebase(store: *Store, alloc: std.mem.Allocator, branch: []const u8, onto: Oid, timestamp: i64) !Result {
+    return rebaseWith(store, alloc, branch, onto, timestamp, .record);
+}
+
+pub fn rebaseWith(store: *Store, alloc: std.mem.Allocator, branch: []const u8, onto: Oid, timestamp: i64, logging: Logging) !Result {
     const tip = try tipOf(store, branch);
     if (tip.eql(onto)) return Error.NothingToDo;
 
@@ -297,7 +329,7 @@ pub fn rebase(store: *Store, alloc: std.mem.Allocator, branch: []const u8, onto:
     const ancestor = merge.commonAncestor(store, alloc, tip, onto) catch null;
     if (ancestor) |a| {
         if (a.eql(onto)) return Error.NothingToDo;
-        if (a.eql(tip)) return point(store, alloc, branch, onto, timestamp);
+        if (a.eql(tip)) return pointWith(store, alloc, branch, onto, timestamp, logging);
     }
 
     const span = try spanTo(store, alloc, tip, ancestor);
@@ -308,7 +340,35 @@ pub fn rebase(store: *Store, alloc: std.mem.Allocator, branch: []const u8, onto:
     var rw = Rewriter.init(store, alloc, onto_change.tree, onto);
     defer rw.deinit();
     try rw.pushAll(span);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, logging);
+}
+
+pub fn rebaseFrom(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    onto: Oid,
+    after: Oid,
+    timestamp: i64,
+    logging: Logging,
+) !Result {
+    const tip = try tipOf(store, branch);
+    if (tip.eql(onto)) return Error.NothingToDo;
+
+    const onto_change = store.readChange(onto) catch return Error.NotAChange;
+    defer object.freeChange(alloc, onto_change);
+
+    const chain = try chainOf(store, alloc, tip);
+    defer alloc.free(chain);
+    const at = indexOf(chain, after) orelse return Error.NotAChange;
+    const span = chain[at + 1 ..];
+    if (span.len == 0) return pointWith(store, alloc, branch, onto, timestamp, logging);
+    try requireLinear(store, alloc, span);
+
+    var rw = Rewriter.init(store, alloc, onto_change.tree, onto);
+    defer rw.deinit();
+    try rw.pushAll(span);
+    return rw.finish(branch, tip, timestamp, logging);
 }
 
 pub fn squash(
@@ -319,6 +379,19 @@ pub fn squash(
     count: usize,
     message: []const u8,
     timestamp: i64,
+) !Result {
+    return squashWith(store, alloc, branch, end, count, message, timestamp, .record);
+}
+
+pub fn squashWith(
+    store: *Store,
+    alloc: std.mem.Allocator,
+    branch: []const u8,
+    end: Oid,
+    count: usize,
+    message: []const u8,
+    timestamp: i64,
+    logging: Logging,
 ) !Result {
     if (count < 2) return Error.OutOfRange;
     const tip = try tipOf(store, branch);
@@ -356,7 +429,7 @@ pub fn squash(
     _ = try rw.write(meta, rw.tree, first.change_id, text);
 
     try rw.pushAll(chain[end_idx + 1 ..]);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, logging);
 }
 
 fn pathSelected(paths: []const []const u8, p: []const u8) bool {
@@ -547,7 +620,7 @@ fn splitBy(
     _ = try rw.write(metaOf(change), rw.tree, change.change_id, change.message);
 
     try rw.pushAll(chain[idx + 1 ..]);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, .record);
 }
 
 /// Reorder the last `order.len` changes. `order` is a permutation of 1..n where
@@ -587,7 +660,7 @@ pub fn reorder(
     var rw = Rewriter.init(store, alloc, base_tree, parent);
     defer rw.deinit();
     for (order) |p| _ = try rw.push(span[p - 1]);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, .record);
 }
 
 /// Rename any change, not only the tip. The change keeps its identity and its
@@ -620,7 +693,7 @@ pub fn reword(
     defer rw.deinit();
     _ = try rw.write(metaOf(change), change.tree, change.change_id, message);
     try rw.pushAll(chain[idx + 1 ..]);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, .record);
 }
 
 /// Fold part of the working tree into a change that is already history.
@@ -665,7 +738,7 @@ pub fn amendInto(
     _ = try rw.write(metaOf(change), rw.tree, change.change_id, change.message);
 
     try rw.pushAll(chain[idx + 1 ..]);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, .record);
 }
 
 /// Remove one change from history and leave its content alone. The caller keeps
@@ -707,7 +780,7 @@ pub fn drop(
     var rw = Rewriter.init(store, alloc, base_tree, parent);
     defer rw.deinit();
     try rw.pushAll(chain[idx + 1 ..]);
-    return rw.finish(branch, tip, timestamp);
+    return rw.finish(branch, tip, timestamp, .record);
 }
 
 fn deleteRef(store: *Store, name: []const u8) !void {
