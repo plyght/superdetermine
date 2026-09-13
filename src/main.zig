@@ -1866,6 +1866,11 @@ fn cmdSave(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     var s = (try openRepo(io, alloc, w)) orelse return;
     defer s.deinit();
     resolveOps(alloc, &s);
+    {
+        var work = try openWork(io);
+        defer work.close(io);
+        try noteSealMigration(io, alloc, w, &s, work);
+    }
     const change = try doSave(io, alloc, &s, messageFlag(rest));
     recordProvenance(io, alloc, &s, change, rest);
     const branch = try s.headBranch();
@@ -2192,6 +2197,7 @@ fn cmdStatus(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []co
     defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);
+    try noteSealMigration(io, alloc, w, &s, work);
     const entries = try workspace.status(&s, work, alloc);
     defer {
         for (entries) |e| alloc.free(e.path);
@@ -5385,6 +5391,12 @@ fn defaultCloneDir(src: []const u8) ?[]const u8 {
     return t;
 }
 
+fn warnSealedAbsent(w: *std.Io.Writer) !void {
+    try w.print("{s}{s} SEALED ENTRIES ABSENT: this clone came without a native carrier, and git never carries a sealed .env{s}\n", .{
+        ui.on(.yellow), ui.warn, ui.off(),
+    });
+}
+
 fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const []const u8) !void {
     if (rest.len < 1) {
         try w.writeAll("usage: sdt clone <forge-src|share-url|bundle#k=...> [dir]\n");
@@ -5416,6 +5428,7 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
                     ui.on(.yellow), ui.warn, ui.off(), rest[0],
                 });
                 try ui.hint(w, "moments, verdicts and the op-log live in the carrier, and are not in git");
+                try warnSealedAbsent(w);
                 break :blk null;
             },
             else => {
@@ -5432,8 +5445,17 @@ fn cmdClone(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             try w.print("{s}{s}{s} cloned exact native repository into {s}{s}{s}\n", .{
                 ui.on(.green), ui.check, ui.off(), ui.on(.cyan), into, ui.off(),
             });
+            const arrived = try keyring.sealedPathsAt(io, alloc, destination);
+            defer keyring.freePaths(alloc, arrived);
+            if (arrived.len != 0) {
+                try w.print("  {s}{d} sealed path(s) arrived with the carrier. `sdt unseal` writes the plaintext if you hold a key{s}\n", .{
+                    ui.on(.dim), arrived.len, ui.off(),
+                });
+            }
             return;
         }
+    } else {
+        try warnSealedAbsent(w);
     }
     // Create the destination as a superdetermine repo, then clone git into it.
     var progress = git.Progress.init(io, w);
@@ -5940,7 +5962,7 @@ fn cloneShare(
 
 fn sealUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\usage: sdt seal <path>       start sealing a file (creates .sdtsealed)
+        \\usage: sdt seal <path>       start sealing a file
         \\       sdt seal             re-seal every tracked path now
         \\       sdt seal status      show sealed paths and who can read them
         \\       sdt unseal           write the plaintext files back out
@@ -5960,14 +5982,33 @@ fn keyUsage(w: *std.Io.Writer) !void {
     );
 }
 
+fn noteSealMigration(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    s: *Store,
+    work: std.Io.Dir,
+) !void {
+    const moved = keyring.migrateSidecar(io, alloc, s, work) catch |e| {
+        try w.print("cannot convert {s}: {t}\n", .{ seal.legacy_manifest_name, e });
+        return;
+    };
+    if (!moved) return;
+    try w.print("{s}{s}{s} moved {s} into {s}/{s} and deleted the sidecar\n", .{
+        ui.on(.yellow), ui.warn, ui.off(), seal.legacy_manifest_name, store.dir_name, seal.meta_name,
+    });
+    try ui.hint(w, "sealed values now live in sdt history only, and never reach git. `sdt save` records the change");
+}
+
 fn loadRepoManifest(
     io: std.Io,
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
+    s: *Store,
     work: std.Io.Dir,
 ) !?seal.Manifest {
-    return (keyring.loadManifest(io, alloc, work) catch |e| {
-        try w.print("cannot read {s}: {t}\n", .{ seal.manifest_name, e });
+    return (keyring.loadManifest(io, alloc, s, work) catch |e| {
+        try w.print("cannot read {s}/{s}: {t}\n", .{ store.dir_name, seal.meta_name, e });
         return null;
     }) orelse {
         try w.print("nothing is sealed here yet (run `sdt seal <path>`)\n", .{});
@@ -6010,11 +6051,14 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
         return;
     }
 
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);
+    try noteSealMigration(io, alloc, w, &s, work);
 
     if (eq(sub, "list")) {
-        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        var manifest = (try loadRepoManifest(io, alloc, w, &s, work)) orelse return;
         defer manifest.deinit();
         const mine = if (try keyring.loadIdentity(io, alloc)) |id| id.publicId() else null;
         for (manifest.members.items) |m| {
@@ -6037,7 +6081,7 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             try w.writeAll("that does not look like an sdt public key\n");
             return;
         };
-        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        var manifest = (try loadRepoManifest(io, alloc, w, &s, work)) orelse return;
         defer manifest.deinit();
 
         const key = (try keyring.repoKey(io, alloc, &manifest)) orelse {
@@ -6053,26 +6097,26 @@ fn cmdKey(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []const
             }
         }
         try manifest.putMember(io, key, name, public);
-        try keyring.saveManifest(io, alloc, work, &manifest);
+        try keyring.saveManifest(alloc, &s, &manifest);
 
         const fp = try public.fingerprint(alloc);
         defer alloc.free(fp);
         try w.print("{s}{s}{s} {s} can now read the sealed values\n", .{ ui.on(.green), ui.check, ui.off(), name });
         try w.print("  {s}fingerprint{s}  {s}{s}{s}\n", .{ ui.on(.dim), ui.off(), ui.on(.magenta), fp, ui.off() });
-        try w.print("{s}confirm that out loud with them, then commit {s}{s}\n", .{ ui.on(.dim), seal.manifest_name, ui.off() });
+        try w.print("{s}confirm that out loud with them, then push. the grant travels in the native carrier, never in git{s}\n", .{ ui.on(.dim), ui.off() });
         return;
     }
 
     if (eq(sub, "remove")) {
         if (rest.len < 2) return keyUsage(w);
-        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        var manifest = (try loadRepoManifest(io, alloc, w, &s, work)) orelse return;
         defer manifest.deinit();
         if (!manifest.removeMember(rest[1])) {
             try w.print("no member named {s}\n", .{rest[1]});
             return;
         }
-        try keyring.saveManifest(io, alloc, work, &manifest);
-        try w.print("removed {s} from {s}\n", .{ rest[1], seal.manifest_name });
+        try keyring.saveManifest(alloc, &s, &manifest);
+        try w.print("removed {s} from the members\n", .{rest[1]});
         try w.writeAll("they still hold the old key and every commit they already cloned.\n");
         try w.writeAll("run `sdt rotate`, then rotate the underlying secrets themselves\n");
         try w.writeAll("(new database password, new API keys). only that actually revokes them.\n");
@@ -6115,6 +6159,7 @@ fn pathInHistory(alloc: std.mem.Allocator, s: *Store, path: []const u8) !bool {
         const tree = s.readTree(change.tree) catch continue;
         defer object.freeTree(alloc, tree);
         for (tree.entries) |e| {
+            if (e.mode == .sealed) continue;
             if (std.mem.eql(u8, e.path, path)) return true;
         }
         for (change.parents) |p| try queue.append(alloc, p);
@@ -6127,16 +6172,20 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
     defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);
+    try noteSealMigration(io, alloc, w, &s, work);
 
     if (rest.len != 0 and eq(rest[0], "status")) {
-        var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+        var manifest = (try loadRepoManifest(io, alloc, w, &s, work)) orelse return;
         defer manifest.deinit();
         for (manifest.files.items) |f| {
             const present = if (work.access(io, f.path, .{})) |_| true else |_| false;
+            const recorded = try keyring.headSealedForm(&s, f.path);
+            defer if (recorded) |r| alloc.free(r);
+            const where: []const u8 = if (recorded != null) "sealed in history" else "not saved yet";
             try w.print("  {s}{s}{s} {s} {s}{s}{s} {s}{s}{s}\n", .{
                 ui.on(if (present) .green else .yellow), if (present) ui.check else ui.warn, ui.off(),
                 f.path,                                  ui.on(.dim),                        ui.arrow,
-                ui.off(),                                ui.on(.cyan),                       seal.manifest_name,
+                ui.off(),                                ui.on(.cyan),                       where,
                 ui.off(),
             });
             if (!present) try ui.hint(w, "      no local plaintext. run `sdt unseal`");
@@ -6157,7 +6206,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         };
         const id = (try requireIdentity(io, alloc, w)) orelse return;
 
-        var manifest = (try keyring.loadManifest(io, alloc, work)) orelse
+        var manifest = (try keyring.loadManifest(io, alloc, &s, work)) orelse
             seal.Manifest.empty(alloc);
         defer manifest.deinit();
 
@@ -6181,7 +6230,7 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         if (!try manifest.addPath(path)) {
             try w.print("{s} is already sealed\n", .{path});
         }
-        try keyring.saveManifest(io, alloc, work, &manifest);
+        try keyring.saveManifest(alloc, &s, &manifest);
         try keyring.protectPath(io, alloc, work, path);
 
         if (try pathInHistory(alloc, &s, path)) {
@@ -6192,13 +6241,13 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         }
     }
 
-    var plan = keyring.prepare(io, alloc, work) catch |e| {
+    var plan = keyring.prepare(&s, work) catch |e| {
         try w.print("seal failed: {t}\n", .{e});
         return;
     };
     defer plan.deinit();
 
-    if (plan.outputs.len == 0) {
+    if (plan.sources.len == 0) {
         try w.writeAll("nothing is sealed here yet (run `sdt seal <path>`)\n");
         return;
     }
@@ -6207,23 +6256,27 @@ fn cmdSeal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []cons
         return;
     }
     for (plan.sources) |src| {
+        const ready = plan.isSealed(src);
         try w.print("  {s}{s}{s} {s} {s}{s}{s} {s}{s}{s}\n", .{
-            ui.on(.green), ui.check,     ui.off(),
-            src,           ui.on(.dim),  ui.arrow,
-            ui.off(),      ui.on(.cyan), seal.manifest_name,
+            ui.on(if (ready) .green else .yellow), if (ready) ui.check else ui.warn, ui.off(),
+            src,                                   ui.on(.dim),                      ui.arrow,
+            ui.off(),                              ui.on(.cyan),                     if (ready) "sealed" else "no plaintext to seal",
             ui.off(),
         });
     }
-    try w.print("\n{s}commit {s}; the plaintext stays out of every change{s}\n", .{
-        ui.on(.dim), seal.manifest_name, ui.off(),
+    try w.print("\n{s}`sdt save` records it sealed. the plaintext stays out of every change, and git never sees the path at all{s}\n", .{
+        ui.on(.dim), ui.off(),
     });
 }
 
 fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);
+    try noteSealMigration(io, alloc, w, &s, work);
 
-    const out = keyring.unsealAll(io, alloc, work) catch |e| switch (e) {
+    const out = keyring.unsealAll(io, alloc, &s, work) catch |e| switch (e) {
         keyring.Error.NoManifest => {
             try w.writeAll("nothing is sealed here yet (run `sdt seal <path>`)\n");
             return;
@@ -6245,10 +6298,13 @@ fn cmdUnseal(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 }
 
 fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
+    var s = (try openRepo(io, alloc, w)) orelse return;
+    defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);
+    try noteSealMigration(io, alloc, w, &s, work);
 
-    var manifest = (try loadRepoManifest(io, alloc, w, work)) orelse return;
+    var manifest = (try loadRepoManifest(io, alloc, w, &s, work)) orelse return;
     defer manifest.deinit();
 
     const old = (try keyring.repoKey(io, alloc, &manifest)) orelse {
@@ -6258,7 +6314,9 @@ fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
 
     for (manifest.files.items) |f| {
         if (work.access(io, f.path, .{})) |_| continue else |_| {}
-        const sealed = f.body orelse continue;
+        const recorded = try keyring.headSealedForm(&s, f.path);
+        defer if (recorded) |r| alloc.free(r);
+        const sealed = recorded orelse f.body orelse continue;
         const plain = try seal.unsealText(alloc, old, f.path, sealed);
         defer alloc.free(plain);
         try work.writeFile(io, .{
@@ -6272,17 +6330,19 @@ fn cmdRotate(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     try manifest.rewrapAll(io, fresh);
 
     for (manifest.files.items) |f| {
+        if (f.body == null) continue;
         const plain = work.readFileAlloc(io, f.path, alloc, .unlimited) catch continue;
         defer alloc.free(plain);
         const sealed = try seal.sealText(alloc, fresh, f.path, plain);
         defer alloc.free(sealed);
         _ = try manifest.setBody(f.path, sealed);
     }
-    try keyring.saveManifest(io, alloc, work, &manifest);
+    try keyring.saveManifest(alloc, &s, &manifest);
 
     try w.print("{s}{s}{s} rotated the repo key, re-wrapped to {d} member(s)\n", .{
         ui.on(.green), ui.check, ui.off(), manifest.members.items.len,
     });
+    try ui.hint(w, "`sdt save` records every sealed value under the new key");
     try w.writeAll("anyone removed earlier still holds the OLD key and any commit they cloned.\n");
     try w.writeAll("rotate the secrets themselves too (new password, new API key), or they keep working.\n");
 }

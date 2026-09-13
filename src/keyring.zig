@@ -1,6 +1,9 @@
 const std = @import("std");
 const seal = @import("seal.zig");
 const config = @import("config.zig");
+const object = @import("object.zig");
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
 
 pub const Error = error{
     NoHome,
@@ -73,49 +76,100 @@ pub fn createIdentity(io: std.Io, alloc: std.mem.Allocator, overwrite: bool) !se
     return id;
 }
 
+pub fn migrateSidecar(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    store: *Store,
+    work_dir: std.Io.Dir,
+) !bool {
+    if (store.root.access(io, seal.meta_name, .{})) |_| return false else |_| {}
+    const text = work_dir.readFileAlloc(io, seal.legacy_manifest_name, alloc, .unlimited) catch
+        return false;
+    defer alloc.free(text);
+    var manifest = try seal.Manifest.parse(alloc, text);
+    defer manifest.deinit();
+    try saveManifest(alloc, store, &manifest);
+    work_dir.deleteFile(io, seal.legacy_manifest_name) catch {};
+    return true;
+}
+
 pub fn loadManifest(
     io: std.Io,
     alloc: std.mem.Allocator,
+    store: *Store,
     work_dir: std.Io.Dir,
 ) !?seal.Manifest {
-    const text = work_dir.readFileAlloc(io, seal.manifest_name, alloc, .unlimited) catch
+    _ = try migrateSidecar(io, alloc, store, work_dir);
+    const text = store.root.readFileAlloc(io, seal.meta_name, alloc, .unlimited) catch
         return null;
     defer alloc.free(text);
     return try seal.Manifest.parse(alloc, text);
 }
 
 pub fn saveManifest(
-    io: std.Io,
     alloc: std.mem.Allocator,
-    work_dir: std.Io.Dir,
+    store: *Store,
     manifest: *const seal.Manifest,
 ) !void {
     const text = try manifest.render(alloc);
     defer alloc.free(text);
-    try work_dir.writeFile(io, .{ .sub_path = seal.manifest_name, .data = text });
+    try store.writeFileAtomic(seal.meta_name, text);
 }
+
+pub fn sealedPathsAt(io: std.Io, alloc: std.mem.Allocator, repository_path: []const u8) ![][]u8 {
+    const meta_path = try std.fs.path.join(alloc, &.{ repository_path, store_mod.dir_name, seal.meta_name });
+    defer alloc.free(meta_path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, meta_path, alloc, .unlimited) catch
+        return try alloc.alloc([]u8, 0);
+    defer alloc.free(text);
+    var manifest = seal.Manifest.parse(alloc, text) catch return try alloc.alloc([]u8, 0);
+    defer manifest.deinit();
+
+    const out = try alloc.alloc([]u8, manifest.files.items.len);
+    errdefer alloc.free(out);
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |p| alloc.free(p);
+    for (manifest.files.items) |f| {
+        out[filled] = try alloc.dupe(u8, f.path);
+        filled += 1;
+    }
+    return out;
+}
+
+pub fn freePaths(alloc: std.mem.Allocator, paths: [][]u8) void {
+    for (paths) |p| alloc.free(p);
+    alloc.free(paths);
+}
+
+pub const SealedForm = struct {
+    path: []u8,
+    text: []u8,
+};
 
 pub const Plan = struct {
     alloc: std.mem.Allocator,
     sources: [][]u8,
-    outputs: [][]u8,
+    sealed: []SealedForm,
     sealed_any: bool,
     have_key: bool,
 
     pub const none: Plan = .{
         .alloc = undefined,
         .sources = &.{},
-        .outputs = &.{},
+        .sealed = &.{},
         .sealed_any = false,
         .have_key = false,
     };
 
     pub fn deinit(self: *Plan) void {
-        if (self.sources.len == 0 and self.outputs.len == 0) return;
+        if (self.sources.len == 0 and self.sealed.len == 0) return;
         for (self.sources) |p| self.alloc.free(p);
         self.alloc.free(self.sources);
-        for (self.outputs) |p| self.alloc.free(p);
-        self.alloc.free(self.outputs);
+        for (self.sealed) |s| {
+            self.alloc.free(s.path);
+            self.alloc.free(s.text);
+        }
+        self.alloc.free(self.sealed);
     }
 
     pub fn isSource(self: *const Plan, path: []const u8) bool {
@@ -125,9 +179,9 @@ pub const Plan = struct {
         return false;
     }
 
-    pub fn isOutput(self: *const Plan, path: []const u8) bool {
-        for (self.outputs) |p| {
-            if (std.mem.eql(u8, p, path)) return true;
+    pub fn isSealed(self: *const Plan, path: []const u8) bool {
+        for (self.sealed) |s| {
+            if (std.mem.eql(u8, s.path, path)) return true;
         }
         return false;
     }
@@ -145,8 +199,27 @@ pub fn repoKey(
     };
 }
 
-pub fn prepare(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Plan {
-    var manifest = (try loadManifest(io, alloc, work_dir)) orelse return .none;
+pub fn headSealedForm(store: *Store, path: []const u8) !?[]u8 {
+    const alloc = store.alloc;
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    if (!store.refExists(branch)) return null;
+    const change = store.readChange(store.readRef(branch) catch return null) catch return null;
+    defer object.freeChange(alloc, change);
+    const tree = store.readTree(change.tree) catch return null;
+    defer object.freeTree(alloc, tree);
+    for (tree.entries) |e| {
+        if (e.mode != .sealed) continue;
+        if (!std.mem.eql(u8, e.path, path)) continue;
+        return try store.readFileContent(e.blob);
+    }
+    return null;
+}
+
+pub fn prepare(store: *Store, work_dir: std.Io.Dir) !Plan {
+    const io = store.io;
+    const alloc = store.alloc;
+    var manifest = (try loadManifest(io, alloc, store, work_dir)) orelse return .none;
     defer manifest.deinit();
     if (manifest.files.items.len == 0) return .none;
 
@@ -155,34 +228,58 @@ pub fn prepare(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Plan
         for (sources.items) |p| alloc.free(p);
         sources.deinit(alloc);
     }
-    var outputs: std.ArrayList([]u8) = .empty;
+    var sealed: std.ArrayList(SealedForm) = .empty;
     errdefer {
-        for (outputs.items) |p| alloc.free(p);
-        outputs.deinit(alloc);
+        for (sealed.items) |s| {
+            alloc.free(s.path);
+            alloc.free(s.text);
+        }
+        sealed.deinit(alloc);
     }
 
     for (manifest.files.items) |f| {
         try sources.append(alloc, try alloc.dupe(u8, f.path));
     }
-    try outputs.append(alloc, try alloc.dupe(u8, seal.manifest_name));
 
     const key = try repoKey(io, alloc, &manifest);
     var sealed_any = false;
-    if (key) |k| {
-        for (manifest.files.items) |f| {
-            const plain = work_dir.readFileAlloc(io, f.path, alloc, .unlimited) catch continue;
-            defer alloc.free(plain);
-            const sealed = try seal.sealText(alloc, k, f.path, plain);
-            defer alloc.free(sealed);
-            if (try manifest.setBody(f.path, sealed)) sealed_any = true;
+    var dropped_body = false;
+    for (manifest.files.items) |f| {
+        var text: ?[]u8 = null;
+        if (key) |k| {
+            if (work_dir.readFileAlloc(io, f.path, alloc, .unlimited)) |plain| {
+                defer alloc.free(plain);
+                text = try seal.sealText(alloc, k, f.path, plain);
+                sealed_any = true;
+            } else |_| {}
         }
-        if (sealed_any) try saveManifest(io, alloc, work_dir, &manifest);
+        if (text == null) text = try headSealedForm(store, f.path);
+        if (text == null) {
+            if (f.body) |b| text = try alloc.dupe(u8, b);
+        } else if (f.body != null) {
+            dropped_body = true;
+        }
+        const form = text orelse continue;
+        errdefer alloc.free(form);
+        const path = try alloc.dupe(u8, f.path);
+        errdefer alloc.free(path);
+        try sealed.append(alloc, .{ .path = path, .text = form });
+    }
+
+    if (dropped_body) {
+        for (manifest.files.items) |*f| {
+            if (f.body) |b| {
+                alloc.free(b);
+                f.body = null;
+            }
+        }
+        try saveManifest(alloc, store, &manifest);
     }
 
     return .{
         .alloc = alloc,
         .sources = try sources.toOwnedSlice(alloc),
-        .outputs = try outputs.toOwnedSlice(alloc),
+        .sealed = try sealed.toOwnedSlice(alloc),
         .sealed_any = sealed_any,
         .have_key = key != null,
     };
@@ -193,15 +290,17 @@ pub const Unsealed = struct {
     skipped: usize,
 };
 
-pub fn unsealAll(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Unsealed {
-    var manifest = (try loadManifest(io, alloc, work_dir)) orelse return Error.NoManifest;
+pub fn unsealAll(io: std.Io, alloc: std.mem.Allocator, store: *Store, work_dir: std.Io.Dir) !Unsealed {
+    var manifest = (try loadManifest(io, alloc, store, work_dir)) orelse return Error.NoManifest;
     defer manifest.deinit();
 
     const key = (try repoKey(io, alloc, &manifest)) orelse return seal.Error.NotAMember;
 
     var result: Unsealed = .{ .written = 0, .skipped = 0 };
     for (manifest.files.items) |f| {
-        const sealed = f.body orelse {
+        const from_head = try headSealedForm(store, f.path);
+        defer if (from_head) |t| alloc.free(t);
+        const sealed = from_head orelse f.body orelse {
             result.skipped += 1;
             continue;
         };
@@ -216,6 +315,12 @@ pub fn unsealAll(io: std.Io, alloc: std.mem.Allocator, work_dir: std.Io.Dir) !Un
         result.written += 1;
     }
     return result;
+}
+
+pub fn currentKey(store: *Store, work_dir: std.Io.Dir) !?seal.RepoKey {
+    var manifest = (try loadManifest(store.io, store.alloc, store, work_dir)) orelse return null;
+    defer manifest.deinit();
+    return repoKey(store.io, store.alloc, &manifest);
 }
 
 fn ensureIgnoreLine(
@@ -281,6 +386,26 @@ const Fixture = struct {
     }
 };
 
+fn commitSealed(store: *Store, path: []const u8, sealed_text: []const u8) !void {
+    const alloc = store.alloc;
+    const blob = try store.writeFileContent(sealed_text);
+    const entries = [_]object.TreeEntry{.{ .mode = .sealed, .path = path, .blob = blob }};
+    const tree = try store.writeTree(.{ .entries = &entries });
+    const change = object.Change{
+        .tree = tree,
+        .parents = &.{},
+        .change_id = [_]u8{1} ** 16,
+        .timestamp = 1_700_000_000,
+        .tz_offset_min = 0,
+        .author = "Nico <n@x>",
+        .message = "sealed",
+    };
+    const change_oid = try store.writeChange(change);
+    const branch = try store.headBranch();
+    defer alloc.free(branch);
+    try store.updateRef(branch, change_oid);
+}
+
 test "identity is created once and reloads" {
     const io = std.testing.io;
     const alloc = testing.allocator;
@@ -295,7 +420,7 @@ test "identity is created once and reloads" {
     try testing.expectEqualSlices(u8, &id.kem_pub, &loaded.kem_pub);
 }
 
-test "prepare seals sources and leaves plaintext out of the plan" {
+test "prepare seals sources into the plan and unseal reads them back from HEAD" {
     const io = std.testing.io;
     const alloc = testing.allocator;
     var fx = try Fixture.init(io, alloc);
@@ -306,37 +431,40 @@ test "prepare seals sources and leaves plaintext out of the plan" {
     try fx.tmp.dir.createDirPath(io, "work");
     var work = try fx.tmp.dir.openDir(io, "work", .{ .iterate = true });
     defer work.close(io);
+    var store = try Store.init(io, alloc, work);
+    defer store.deinit();
 
     var manifest = seal.Manifest.empty(alloc);
     defer manifest.deinit();
     _ = try manifest.addPath(".env");
     const k = seal.newRepoKey(io);
     try manifest.putMember(io, k, "nico", id.publicId());
-    try saveManifest(io, alloc, work, &manifest);
+    try saveManifest(alloc, &store, &manifest);
 
     try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=sk-live-1\n" });
 
-    var plan = try prepare(io, alloc, work);
+    var plan = try prepare(&store, work);
     defer plan.deinit();
     try testing.expect(plan.have_key);
+    try testing.expect(plan.sealed_any);
     try testing.expect(plan.isSource(".env"));
-    try testing.expect(plan.isOutput(seal.manifest_name));
+    try testing.expectEqual(@as(usize, 1), plan.sealed.len);
+    try testing.expectEqualStrings(".env", plan.sealed[0].path);
+    try testing.expect(std.mem.indexOf(u8, plan.sealed[0].text, "sk-live-1") == null);
+    try testing.expect(std.mem.indexOf(u8, plan.sealed[0].text, "API_KEY=gr1:") != null);
+    try testing.expectError(error.FileNotFound, work.access(io, seal.legacy_manifest_name, .{}));
 
-    try testing.expectError(error.FileNotFound, work.access(io, ".env.sealed", .{}));
-    const stored = try work.readFileAlloc(io, seal.manifest_name, alloc, .unlimited);
-    defer alloc.free(stored);
-    try testing.expect(std.mem.indexOf(u8, stored, "sk-live-1") == null);
-    try testing.expect(std.mem.indexOf(u8, stored, "API_KEY=gr1:") != null);
+    try commitSealed(&store, ".env", plan.sealed[0].text);
 
     try work.deleteFile(io, ".env");
-    const out = try unsealAll(io, alloc, work);
+    const out = try unsealAll(io, alloc, &store, work);
     try testing.expectEqual(@as(usize, 1), out.written);
     const back = try work.readFileAlloc(io, ".env", alloc, .unlimited);
     defer alloc.free(back);
     try testing.expectEqualStrings("API_KEY=sk-live-1\n", back);
 }
 
-test "prepare still excludes plaintext when the key is unavailable" {
+test "prepare carries the HEAD sealed form forward when the key is unavailable" {
     const io = std.testing.io;
     const alloc = testing.allocator;
     var fx = try Fixture.init(io, alloc);
@@ -345,20 +473,30 @@ test "prepare still excludes plaintext when the key is unavailable" {
     try fx.tmp.dir.createDirPath(io, "work");
     var work = try fx.tmp.dir.openDir(io, "work", .{ .iterate = true });
     defer work.close(io);
+    var store = try Store.init(io, alloc, work);
+    defer store.deinit();
 
     var manifest = seal.Manifest.empty(alloc);
     defer manifest.deinit();
     _ = try manifest.addPath(".env");
     const stranger = seal.Identity.generate(io);
-    try manifest.putMember(io, seal.newRepoKey(io), "someone", stranger.publicId());
-    try saveManifest(io, alloc, work, &manifest);
-    try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=sk-live-1\n" });
+    const k = seal.newRepoKey(io);
+    try manifest.putMember(io, k, "someone", stranger.publicId());
+    try saveManifest(alloc, &store, &manifest);
 
-    var plan = try prepare(io, alloc, work);
+    const sealed = try seal.sealText(alloc, k, ".env", "API_KEY=sk-live-1\n");
+    defer alloc.free(sealed);
+    try commitSealed(&store, ".env", sealed);
+    try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=edited-locally\n" });
+
+    var plan = try prepare(&store, work);
     defer plan.deinit();
     try testing.expect(!plan.have_key);
+    try testing.expect(!plan.sealed_any);
     try testing.expect(plan.isSource(".env"));
-    try testing.expectError(seal.Error.NotAMember, unsealAll(io, alloc, work));
+    try testing.expectEqual(@as(usize, 1), plan.sealed.len);
+    try testing.expectEqualStrings(sealed, plan.sealed[0].text);
+    try testing.expectError(seal.Error.NotAMember, unsealAll(io, alloc, &store, work));
 }
 
 test "no manifest means an empty plan" {
@@ -366,11 +504,89 @@ test "no manifest means an empty plan" {
     const alloc = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
 
-    var plan = try prepare(io, alloc, tmp.dir);
+    var plan = try prepare(&store, tmp.dir);
     defer plan.deinit();
     try testing.expect(!plan.isSource(".env"));
-    try testing.expectEqual(@as(usize, 0), plan.outputs.len);
+    try testing.expectEqual(@as(usize, 0), plan.sealed.len);
+}
+
+test "a legacy sidecar migrates into repo metadata and is deleted" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(io, alloc);
+    defer fx.deinit();
+
+    const id = try createIdentity(io, alloc, false);
+    try fx.tmp.dir.createDirPath(io, "work");
+    var work = try fx.tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+    var store = try Store.init(io, alloc, work);
+    defer store.deinit();
+
+    const k = seal.newRepoKey(io);
+    const sealed = try seal.sealText(alloc, k, ".env", "API_KEY=sk-live-1\n");
+    defer alloc.free(sealed);
+    var legacy = seal.Manifest.empty(alloc);
+    defer legacy.deinit();
+    _ = try legacy.addPath(".env");
+    try legacy.putMember(io, k, "nico", id.publicId());
+    _ = try legacy.setBody(".env", sealed);
+    const text = try legacy.render(alloc);
+    defer alloc.free(text);
+    try work.writeFile(io, .{ .sub_path = seal.legacy_manifest_name, .data = text });
+
+    try testing.expect(try migrateSidecar(io, alloc, &store, work));
+    try testing.expect(!try migrateSidecar(io, alloc, &store, work));
+    try testing.expectError(error.FileNotFound, work.access(io, seal.legacy_manifest_name, .{}));
+    try store.root.access(io, seal.meta_name, .{});
+
+    var plan = try prepare(&store, work);
+    defer plan.deinit();
+    try testing.expectEqual(@as(usize, 1), plan.sealed.len);
+    try testing.expectEqualStrings(sealed, plan.sealed[0].text);
+
+    const out = try unsealAll(io, alloc, &store, work);
+    try testing.expectEqual(@as(usize, 1), out.written);
+    const back = try work.readFileAlloc(io, ".env", alloc, .unlimited);
+    defer alloc.free(back);
+    try testing.expectEqualStrings("API_KEY=sk-live-1\n", back);
+
+    var again = try prepare(&store, work);
+    defer again.deinit();
+    try testing.expect(again.sealed_any);
+    var stored = (try loadManifest(io, alloc, &store, work)).?;
+    defer stored.deinit();
+    try testing.expect(stored.bodyOf(".env") == null);
+}
+
+test "sealedPathsAt reads the metadata by repository path" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(abs);
+    const nothing = try sealedPathsAt(io, alloc, abs);
+    defer freePaths(alloc, nothing);
+    try testing.expectEqual(@as(usize, 0), nothing.len);
+
+    var manifest = seal.Manifest.empty(alloc);
+    defer manifest.deinit();
+    _ = try manifest.addPath(".env");
+    _ = try manifest.addPath("config/secrets.env");
+    try saveManifest(alloc, &store, &manifest);
+
+    const paths = try sealedPathsAt(io, alloc, abs);
+    defer freePaths(alloc, paths);
+    try testing.expectEqual(@as(usize, 2), paths.len);
+    try testing.expectEqualStrings(".env", paths[0]);
+    try testing.expectEqualStrings("config/secrets.env", paths[1]);
 }
 
 test "protectPath adds ignore rules and re-running is idempotent" {

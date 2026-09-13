@@ -4,6 +4,7 @@ const proc = @import("proc.zig");
 const net = @import("net.zig");
 const oid = @import("oid.zig");
 const store = @import("store.zig");
+const keyring = @import("keyring.zig");
 
 pub const Published = apricot.git_forge.Published;
 pub const Fetched = apricot.git_forge.Fetched;
@@ -123,6 +124,8 @@ pub fn publish(
 ) !Published {
     var captured = try apricot.sdt_codec.capture(allocator, io, repository_path, remote);
     defer captured.deinit(allocator);
+    const projection = try projectionWithoutSealed(allocator, io, repository_path, captured.projection);
+    defer allocator.free(projection);
     var session = Session.init(allocator, io, remote, .configured);
     defer session.deinit();
     return apricot.git_forge.publish(
@@ -131,11 +134,31 @@ pub fn publish(
         branch,
         captured.encoded.bytes,
         captured.encoded.root,
-        captured.projection,
+        projection,
         projection_message,
         commit_signature,
         timestamp,
     );
+}
+
+fn projectionWithoutSealed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository_path: []const u8,
+    entries: []const apricot.git_forge.ProjectionEntry,
+) ![]apricot.git_forge.ProjectionEntry {
+    const sealed = try keyring.sealedPathsAt(io, allocator, repository_path);
+    defer keyring.freePaths(allocator, sealed);
+    var kept: std.ArrayList(apricot.git_forge.ProjectionEntry) = .empty;
+    errdefer kept.deinit(allocator);
+    for (entries) |entry| {
+        var omit = false;
+        for (sealed) |path| {
+            if (std.mem.eql(u8, path, entry.path)) omit = true;
+        }
+        if (!omit) try kept.append(allocator, entry);
+    }
+    return kept.toOwnedSlice(allocator);
 }
 
 pub fn fetch(allocator: std.mem.Allocator, io: std.Io, remote: []const u8, branch: []const u8) !Fetched {
@@ -209,6 +232,95 @@ pub fn fetchInto(
     const tip = try net.fetchSparse(destination, source_store, native_branch, "");
     try destination.updateRef(destination_ref, tip);
     return tip;
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "a sealed entry rides the carrier and never the projection" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const seal = @import("seal.zig");
+    const workspace = @import("workspace.zig");
+    const object = @import("object.zig");
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(abs);
+    const absz = try alloc.dupeZ(u8, abs);
+    defer alloc.free(absz);
+    _ = setenv("XDG_CONFIG_HOME", absz.ptr, 1);
+    defer _ = unsetenv("XDG_CONFIG_HOME");
+
+    try tmp.dir.createDirPath(io, "work");
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+    var source = try Store.init(io, alloc, work);
+    defer source.deinit();
+
+    const id = try keyring.createIdentity(io, alloc, true);
+    var manifest = seal.Manifest.empty(alloc);
+    defer manifest.deinit();
+    _ = try manifest.addPath(".env");
+    try manifest.putMember(io, seal.newRepoKey(io), "nico", id.publicId());
+    try keyring.saveManifest(alloc, &source, &manifest);
+
+    try work.writeFile(io, .{ .sub_path = "main.zig", .data = "pub fn main() void {}\n" });
+    try work.writeFile(io, .{ .sub_path = ".env", .data = "API_KEY=sk-live-1\n" });
+    _ = try workspace.snapshot(&source, work, "Nico <n@x>", "seal", 1_700_000_000);
+
+    const work_path = try tmp.dir.realPathFileAlloc(io, "work", alloc);
+    defer alloc.free(work_path);
+    var captured = try apricot.sdt_codec.capture(alloc, io, work_path, "fixture");
+    defer captured.deinit(alloc);
+    for (captured.projection) |entry| {
+        try std.testing.expect(!std.mem.eql(u8, entry.path, ".env"));
+        try std.testing.expect(std.mem.indexOf(u8, entry.data, "sk-live-1") == null);
+    }
+
+    const forged = [_]apricot.git_forge.ProjectionEntry{
+        .{ .path = ".env", .kind = .file, .executable = false, .data = "leak" },
+        .{ .path = "main.zig", .kind = .file, .executable = false, .data = "code" },
+    };
+    const filtered = try projectionWithoutSealed(alloc, io, work_path, &forged);
+    defer alloc.free(filtered);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("main.zig", filtered[0].path);
+
+    try tmp.dir.createDirPath(io, "clone");
+    const clone_path = try tmp.dir.realPathFileAlloc(io, "clone", alloc);
+    defer alloc.free(clone_path);
+    try apricot.sdt_codec.restore(alloc, io, clone_path, captured.encoded.bytes, captured.encoded.root);
+
+    var clone = try tmp.dir.openDir(io, "clone", .{ .iterate = true });
+    defer clone.close(io);
+    try std.testing.expectError(error.FileNotFound, clone.access(io, ".env", .{}));
+    var restored = try Store.open(io, alloc, clone);
+    defer restored.deinit();
+    const branch = try restored.headBranch();
+    defer alloc.free(branch);
+    const change = try restored.readChange(try restored.readRef(branch));
+    defer object.freeChange(alloc, change);
+    const tree = try restored.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+    var saw = false;
+    for (tree.entries) |e| {
+        if (!std.mem.eql(u8, e.path, ".env")) continue;
+        saw = true;
+        try std.testing.expectEqual(object.Mode.sealed, e.mode);
+    }
+    try std.testing.expect(saw);
+
+    const arrived = try keyring.sealedPathsAt(io, alloc, clone_path);
+    defer keyring.freePaths(alloc, arrived);
+    try std.testing.expectEqual(@as(usize, 1), arrived.len);
+
+    const out = try keyring.unsealAll(io, alloc, &restored, clone);
+    try std.testing.expectEqual(@as(usize, 1), out.written);
+    const plain = try clone.readFileAlloc(io, ".env", alloc, .unlimited);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("API_KEY=sk-live-1\n", plain);
 }
 
 test "credentials are withheld from a cleartext remote" {
