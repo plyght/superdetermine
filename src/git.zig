@@ -7,6 +7,9 @@ const ui = @import("ui.zig");
 const branches = @import("branches.zig");
 const oplog = @import("oplog.zig");
 const config = @import("config.zig");
+const apricot = @import("apricot");
+const facade = apricot.git_facade;
+const contract = apricot.adapter;
 const Store = @import("store.zig").Store;
 const Oid = oid.Oid;
 
@@ -2187,139 +2190,12 @@ fn resetIndexToHead(store: *Store, work_dir_path: []const u8) !void {
     _ = c.git_reset(repo, head, c.GIT_RESET_MIXED, null);
 }
 
-const pair_file = "gitbranches";
-const facade_file = "gitfacade";
-
 pub fn colocatedSyncOn(store: *Store, work_dir: std.Io.Dir) bool {
     work_dir.access(store.io, ".git", .{}) catch return false;
     const v = (config.get(store, store.alloc, "sync.git") catch return false) orelse return false;
     defer store.alloc.free(v);
     return std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or
         std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "on");
-}
-
-fn pairOf(store: *Store, sdt_branch: []const u8) ?[]u8 {
-    return pairLookup(store, sdt_branch, 0);
-}
-
-fn pairFor(store: *Store, git_branch: []const u8) ?[]u8 {
-    return pairLookup(store, git_branch, 1);
-}
-
-fn pairLookup(store: *Store, name: []const u8, column: usize) ?[]u8 {
-    const data = store.root.readFileAlloc(store.io, pair_file, store.alloc, .unlimited) catch return null;
-    defer store.alloc.free(data);
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        const sep = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-        const sdt_name = line[0..sep];
-        const git_name = line[sep + 1 ..];
-        if (sdt_name.len == 0 or git_name.len == 0) continue;
-        if (column == 0 and std.mem.eql(u8, sdt_name, name)) return store.alloc.dupe(u8, git_name) catch null;
-        if (column == 1 and std.mem.eql(u8, git_name, name)) return store.alloc.dupe(u8, sdt_name) catch null;
-    }
-    return null;
-}
-
-fn setPair(store: *Store, sdt_branch: []const u8, git_branch: []const u8) void {
-    const alloc = store.alloc;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    const data: ?[]u8 = store.root.readFileAlloc(store.io, pair_file, alloc, .unlimited) catch null;
-    defer if (data) |d| alloc.free(d);
-    if (data) |d| {
-        var lines = std.mem.splitScalar(u8, d, '\n');
-        while (lines.next()) |line| {
-            const sep = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-            if (std.mem.eql(u8, line[0..sep], sdt_branch)) continue;
-            if (std.mem.eql(u8, line[sep + 1 ..], git_branch)) continue;
-            out.appendSlice(alloc, line) catch return;
-            out.append(alloc, '\n') catch return;
-        }
-    }
-    if (!std.mem.eql(u8, sdt_branch, git_branch)) {
-        out.appendSlice(alloc, sdt_branch) catch return;
-        out.append(alloc, ' ') catch return;
-        out.appendSlice(alloc, git_branch) catch return;
-        out.append(alloc, '\n') catch return;
-    }
-    store.writeFileAtomic(pair_file, out.items) catch {};
-}
-
-fn rememberPair(store: *Store, git_branch: []const u8) void {
-    const head = store.headBranch() catch return;
-    defer store.alloc.free(head);
-    setPair(store, head, git_branch);
-}
-
-pub fn facadeFingerprint(store: *Store, work_dir: std.Io.Dir) ?Oid {
-    const io = store.io;
-    const alloc = store.alloc;
-    var git_dir = work_dir.openDir(io, ".git", .{}) catch return null;
-    defer git_dir.close(io);
-
-    var hasher = oid.Hasher.init();
-    for ([_][]const u8{ "HEAD", "packed-refs", "refs/stash" }) |name| {
-        const data = git_dir.readFileAlloc(io, name, alloc, .unlimited) catch continue;
-        defer alloc.free(data);
-        hasher.update(name);
-        hasher.update(data);
-    }
-
-    if (git_dir.openDir(io, "refs/heads", .{ .iterate = true })) |heads_const| {
-        var heads = heads_const;
-        defer heads.close(io);
-        var walker = heads.walkSelectively(alloc) catch return hasher.finalOid();
-        defer walker.deinit();
-        while (walker.next(io) catch null) |entry| {
-            switch (entry.kind) {
-                .directory => walker.enter(io, entry) catch continue,
-                .file => {
-                    const data = heads.readFileAlloc(io, entry.path, alloc, .unlimited) catch continue;
-                    defer alloc.free(data);
-                    hasher.update(entry.path);
-                    hasher.update(data);
-                },
-                else => {},
-            }
-        }
-    } else |_| {}
-    return hasher.finalOid();
-}
-
-const Stamp = struct {
-    fingerprint: ?Oid,
-    head_buf: [256]u8 = undefined,
-    head_len: usize = 0,
-
-    fn head(self: *const Stamp) ?[]const u8 {
-        if (self.head_len == 0) return null;
-        return self.head_buf[0..self.head_len];
-    }
-};
-
-fn readStamp(store: *Store) ?Stamp {
-    const data = store.root.readFileAlloc(store.io, facade_file, store.alloc, .limited(4096)) catch return null;
-    defer store.alloc.free(data);
-    const line = std.mem.trimEnd(u8, data, "\n");
-    const sep = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
-    var stamp = Stamp{ .fingerprint = null };
-    if (!std.mem.eql(u8, line[0..sep], "-")) {
-        stamp.fingerprint = Oid.fromHex(line[0..sep]) catch return null;
-    }
-    const head = line[sep + 1 ..];
-    const n = @min(head.len, stamp.head_buf.len);
-    @memcpy(stamp.head_buf[0..n], head[0..n]);
-    stamp.head_len = n;
-    return stamp;
-}
-
-fn writeStamp(store: *Store, fingerprint: ?Oid, head: []const u8) void {
-    var hex: [Oid.len * 2]u8 = undefined;
-    const fp: []const u8 = if (fingerprint) |f| f.toHex(&hex) else "-";
-    const line = std.fmt.allocPrint(store.alloc, "{s} {s}\n", .{ fp, head }) catch return;
-    defer store.alloc.free(line);
-    store.writeFileAtomic(facade_file, line) catch {};
 }
 
 fn headBranchName(repo: ?*c.git_repository, buf: []u8) ?[]const u8 {
@@ -2370,6 +2246,19 @@ pub const Absorbed = struct {
     pub fn any(self: *const Absorbed) bool {
         return self.commits != 0 or self.branches != 0 or self.followed or self.stashes != 0;
     }
+
+    fn fromFacade(r: facade.Absorbed, commits: usize) Absorbed {
+        var out = Absorbed{
+            .commits = commits,
+            .branches = r.branches,
+            .diverged = r.diverged,
+            .stashes = r.stashes,
+            .followed = r.followed,
+        };
+        out.branch_len = copyName(&out.branch_buf, r.branch());
+        out.head_len = copyName(&out.head_buf, r.head());
+        return out;
+    }
 };
 
 fn copyName(buf: []u8, name: []const u8) usize {
@@ -2378,221 +2267,270 @@ fn copyName(buf: []u8, name: []const u8) usize {
     return n;
 }
 
-fn related(repo: ?*c.git_repository, a: *const c.git_oid, b: *const c.git_oid) bool {
-    if (c.git_oid_equal(a, b) != 0) return true;
-    if (c.git_graph_descendant_of(repo, a, b) == 1) return true;
-    return c.git_graph_descendant_of(repo, b, a) == 1;
-}
-
-fn counterpart(store: *Store, repo: ?*c.git_repository, map: *Gitmap, gname: []const u8, tip: ?*const c.git_oid) ![]u8 {
-    const alloc = store.alloc;
-    if (store.refExists(gname)) return alloc.dupe(u8, gname);
-    if (pairFor(store, gname)) |paired| return paired;
-
-    const head = store.headBranch() catch return alloc.dupe(u8, gname);
-    if (headClaims(store, repo, map, head, tip)) {
-        setPair(store, head, gname);
-        return head;
-    }
-    alloc.free(head);
-    return alloc.dupe(u8, gname);
-}
-
-fn headClaims(store: *Store, repo: ?*c.git_repository, map: *Gitmap, head: []const u8, tip: ?*const c.git_oid) bool {
-    if (pairOf(store, head)) |elsewhere| {
-        store.alloc.free(elsewhere);
-        return false;
-    }
-    var ref_buf: [512]u8 = undefined;
-    const same_ref = std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{head}) catch return false;
-    var same: c.git_oid = undefined;
-    if (c.git_reference_name_to_id(&same, repo, same_ref.ptr) == 0) return false;
-    if (!store.refExists(head)) return true;
-    const sdt_tip = store.readRef(head) catch return false;
-    const mirrored = map.lookupGit(sdt_tip) orelse return false;
-    const t = tip orelse return false;
-    return related(repo, t, &mirrored);
-}
-
 fn nowSeconds(store: *Store) i64 {
     return @intCast(@divTrunc(std.Io.Clock.now(.real, store.io).nanoseconds, 1_000_000_000));
 }
 
-fn absorbBranch(
-    store: *Store,
-    repo: ?*c.git_repository,
-    map: *Gitmap,
-    gname: []const u8,
-    tip: *const c.git_oid,
-    hide: []const c.git_oid,
-    out: *Absorbed,
-) !void {
-    const alloc = store.alloc;
-    const target = try counterpart(store, repo, map, gname, tip);
-    defer alloc.free(target);
-
-    var prev = Oid.zero();
-    if (store.refExists(target)) {
-        prev = try store.readRef(target);
-        const mirrored = map.lookupGit(prev) orelse {
-            out.diverged += 1;
-            return;
-        };
-        if (c.git_oid_equal(&mirrored, tip) != 0) return;
-        if (c.git_graph_descendant_of(repo, tip, &mirrored) != 1) {
-            if (c.git_graph_descendant_of(repo, &mirrored, tip) != 1) out.diverged += 1;
-            return;
-        }
-    }
-
-    var imported: usize = 0;
-    const new = try importReachable(store, repo, map, tip, hide, &imported);
-    if (new.isZero()) return;
-    try store.updateRef(target, new);
-    oplog.record(store, .{
-        .kind = .import,
-        .branch = target,
-        .prev = prev,
-        .new = new,
-        .timestamp = nowSeconds(store),
-    }) catch {};
-    out.commits += imported;
-    out.branches += 1;
-    out.branch_len = copyName(&out.branch_buf, target);
+fn parseGitOid(hex: []const u8) ?c.git_oid {
+    var o: c.git_oid = undefined;
+    if (hex.len == 0 or c.git_oid_fromstrn(&o, hex.ptr, hex.len) != 0) return null;
+    return o;
 }
 
-pub fn absorbColocated(store: *Store, work_dir_path: []const u8, prev_head: ?[]const u8) !Absorbed {
-    ensureInit();
-    const alloc = store.alloc;
-    var out: Absorbed = .{};
+pub const FacadeAdapter = struct {
+    store: *Store,
+    path: []const u8,
+    commits: usize = 0,
+    arena: std.heap.ArenaAllocator,
+    refs: std.ArrayList(contract.NativeRef) = .empty,
+    root: [1]contract.NativeRoot = .{.{ .role = "repository", .id = .{ .scheme = "superdetermine", .bytes = "store" } }},
 
-    const path_z = try alloc.dupeZ(u8, work_dir_path);
-    defer alloc.free(path_z);
-    var repo: ?*c.git_repository = null;
-    if (c.git_repository_open(&repo, path_z.ptr) != 0) return out;
-    defer c.git_repository_free(repo);
+    const capabilities = [_]contract.Capability{
+        .{ .name = "foreign-operation-import", .support = .required },
+        .{ .name = "commit-dag", .support = .required },
+    };
+    const kinds = [_][]const u8{"superdetermine-change"};
 
-    var map = try Gitmap.load(store);
-    defer map.deinit();
+    pub fn init(store: *Store, path: []const u8) FacadeAdapter {
+        return .{ .store = store, .path = path, .arena = std.heap.ArenaAllocator.init(store.alloc) };
+    }
 
-    var hide: std.ArrayList(c.git_oid) = .empty;
-    defer hide.deinit(alloc);
-    {
-        const names = try branches.list(store, alloc);
+    pub fn deinit(self: *FacadeAdapter) void {
+        self.arena.deinit();
+    }
+
+    pub fn adapter(self: *FacadeAdapter) contract.Adapter {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn cast(context: *anyopaque) *FacadeAdapter {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn openRepo(self: *FacadeAdapter) !?*c.git_repository {
+        ensureInit();
+        const path_z = try self.store.alloc.dupeZ(u8, self.path);
+        defer self.store.alloc.free(path_z);
+        var repo: ?*c.git_repository = null;
+        try check(c.git_repository_open(&repo, path_z.ptr));
+        return repo;
+    }
+
+    fn snapshot(context: *anyopaque) !contract.Snapshot {
+        const self = cast(context);
+        _ = self.arena.reset(.retain_capacity);
+        self.refs = .empty;
+        const a = self.arena.allocator();
+        const store = self.store;
+
+        var map = try Gitmap.load(store);
+        defer map.deinit();
+
+        const names = try branches.list(store, store.alloc);
         defer {
-            for (names) |n| alloc.free(n);
-            alloc.free(names);
+            for (names) |n| store.alloc.free(n);
+            store.alloc.free(names);
+        }
+        for (names) |n| {
+            const tip = store.readRef(n) catch continue;
+            var hex: [Oid.len * 2]u8 = undefined;
+            const name = try a.dupe(u8, n);
+            try self.refs.append(a, .{
+                .namespace = facade.RefNamespace.heads,
+                .name = name,
+                .target = .{ .scheme = "superdetermine-change", .bytes = try a.dupe(u8, tip.toHex(&hex)) },
+                .mutable = true,
+            });
+            if (map.lookupGit(tip)) |g| {
+                const ghex = gitOidHex(&g);
+                try self.refs.append(a, .{
+                    .namespace = facade.RefNamespace.mirror,
+                    .name = name,
+                    .target = .{ .scheme = facade.git_commit_scheme, .bytes = try a.dupe(u8, &ghex) },
+                    .mutable = true,
+                });
+            }
+        }
+        if (store.headBranch()) |head| {
+            defer store.alloc.free(head);
+            try self.refs.append(a, .{
+                .namespace = facade.RefNamespace.head,
+                .name = facade.head_ref_name,
+                .target = .{ .scheme = facade.native_branch_scheme, .bytes = try a.dupe(u8, head) },
+                .mutable = true,
+            });
+        } else |_| {}
+
+        return .{
+            .vcs = "superdetermine",
+            .format_version = "colocated-git-v1",
+            .roots = &self.root,
+            .refs = self.refs.items,
+            .capabilities = &capabilities,
+            .closure = .{ .tier = .semantic_lossless, .authoritative_kinds = &kinds, .exclusions = &.{} },
+        };
+    }
+
+    fn enumerate(_: *anyopaque, _: []const contract.NativeRoot, _: contract.ObjectSink) !void {
+        return error.Unsupported;
+    }
+
+    fn restore(_: *anyopaque, _: contract.Snapshot, _: contract.ObjectSource) !contract.RestoreReport {
+        return error.Unsupported;
+    }
+
+    fn project(_: *anyopaque, _: contract.Snapshot, _: contract.ProjectionSink) !void {
+        return error.Unsupported;
+    }
+
+    fn inspectForeign(context: *anyopaque, op: contract.ForeignOperation) !contract.ForeignInspection {
+        const self = cast(context);
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.branch_advance)) {
+            if (op.base_projection.len == 0) return .{ .importable = .{ .strategy = facade.Strategy.import, .affected_refs = &.{} } };
+            const base = parseGitOid(op.base_projection) orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+            const observed = parseGitOid(op.observed_projection) orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+            if (c.git_oid_equal(&base, &observed) != 0) return .{ .importable = .{ .strategy = facade.Strategy.in_step, .affected_refs = &.{} } };
+            const repo = try self.openRepo();
+            defer c.git_repository_free(repo);
+            if (c.git_graph_descendant_of(repo, &observed, &base) == 1) return .{ .importable = .{ .strategy = facade.Strategy.fast_forward, .affected_refs = &.{} } };
+            if (c.git_graph_descendant_of(repo, &base, &observed) == 1) return .{ .refused = .{ .reason = facade.Reason.native_ahead } };
+            return .{ .requires_resolution = .{ .reason = facade.Reason.diverged, .affected_refs = &.{} } };
+        }
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.head_move)) {
+            return .{ .importable = .{ .strategy = facade.Strategy.follow, .affected_refs = &.{} } };
+        }
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.stash)) {
+            var map = try Gitmap.load(self.store);
+            defer map.deinit();
+            if (map.lookupGr(op.observed_projection) != null) return .{ .refused = .{ .reason = facade.Reason.known } };
+            return .{ .importable = .{ .strategy = facade.Strategy.objects, .affected_refs = &.{} } };
+        }
+        return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+    }
+
+    fn hiddenTips(self: *FacadeAdapter, map: *Gitmap) !std.ArrayList(c.git_oid) {
+        const store = self.store;
+        var hide: std.ArrayList(c.git_oid) = .empty;
+        errdefer hide.deinit(store.alloc);
+        const names = try branches.list(store, store.alloc);
+        defer {
+            for (names) |n| store.alloc.free(n);
+            store.alloc.free(names);
         }
         for (names) |n| {
             const t = store.readRef(n) catch continue;
-            if (map.lookupGit(t)) |g| try hide.append(alloc, g);
+            if (map.lookupGit(t)) |g| try hide.append(store.alloc, g);
         }
+        return hide;
     }
 
-    var head_buf: [256]u8 = undefined;
-    const git_head = headBranchName(repo, &head_buf);
-
-    if (git_head) |gh| {
-        var ref_buf: [512]u8 = undefined;
-        const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{gh});
-        var tip: c.git_oid = undefined;
-        if (c.git_reference_name_to_id(&tip, repo, ref_name.ptr) == 0) {
-            try absorbBranch(store, repo, &map, gh, &tip, hide.items, &out);
+    fn importForeign(context: *anyopaque, op: contract.ForeignOperation, source: contract.ObjectSource) !contract.ForeignOutcome {
+        _ = source;
+        const self = cast(context);
+        const store = self.store;
+        switch (try inspectForeign(context, op)) {
+            .importable => {},
+            .requires_resolution => |r| return .{ .requires_resolution = .{ .reason = r.reason } },
+            .refused => |r| return .{ .refused = .{ .reason = r.reason } },
         }
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.head_move)) {
+            try store.setHeadBranch(op.observed_projection);
+            return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
+        }
+        const tip = parseGitOid(op.observed_projection) orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+        const repo = try self.openRepo();
+        defer c.git_repository_free(repo);
+        var map = try Gitmap.load(store);
+        defer map.deinit();
+        var hide = try self.hiddenTips(&map);
+        defer hide.deinit(store.alloc);
+
+        if (std.mem.eql(u8, op.kind, facade.OperationKind.stash)) {
+            _ = try importReachable(store, repo, &map, &tip, hide.items, null);
+            try map.save(store);
+            return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
+        }
+
+        const native = facade.evidenceField(op.evidence, "native") orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+        var imported: usize = 0;
+        const new = try importReachable(store, repo, &map, &tip, hide.items, &imported);
+        if (new.isZero()) return .{ .refused = .{ .reason = facade.Reason.unsupported } };
+        const prev = store.readRef(native) catch Oid.zero();
+        try store.updateRef(native, new);
+        oplog.record(store, .{
+            .kind = .import,
+            .branch = native,
+            .prev = prev,
+            .new = new,
+            .timestamp = nowSeconds(store),
+        }) catch {};
+        try map.save(store);
+        self.commits += imported;
+        return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
     }
 
-    var iter: ?*c.git_branch_iterator = null;
-    try check(c.git_branch_iterator_new(&iter, repo, c.GIT_BRANCH_LOCAL));
-    defer c.git_branch_iterator_free(iter);
-    var ref: ?*c.git_reference = null;
-    var btype: c.git_branch_t = undefined;
-    while (c.git_branch_next(&ref, &btype, iter) == 0) {
-        defer c.git_reference_free(ref);
-        const short = c.git_reference_shorthand(ref);
-        if (short == null) continue;
-        const gname = std.mem.span(short);
-        if (git_head) |gh| {
-            if (std.mem.eql(u8, gh, gname)) continue;
-        }
-        var tip: c.git_oid = undefined;
-        {
-            var obj: ?*c.git_object = null;
-            if (c.git_reference_peel(&obj, ref, c.GIT_OBJECT_COMMIT) != 0) continue;
-            defer c.git_object_free(obj);
-            _ = c.git_oid_cpy(&tip, c.git_object_id(obj));
-        }
-        try absorbBranch(store, repo, &map, gname, &tip, hide.items, &out);
-    }
+    const vtable = contract.Adapter.VTable{
+        .snapshot = snapshot,
+        .enumerate = enumerate,
+        .restore = restore,
+        .project = project,
+        .inspectForeign = inspectForeign,
+        .importForeign = importForeign,
+    };
+};
 
-    {
-        var stash: c.git_oid = undefined;
-        if (c.git_reference_name_to_id(&stash, repo, "refs/stash") == 0) {
-            const hex = gitOidHex(&stash);
-            if (map.lookupGr(&hex) == null) {
-                _ = try importReachable(store, repo, &map, &stash, hide.items, null);
-                out.stashes += 1;
-            }
-        }
-    }
+fn facadeFor(store: *Store, work_dir: std.Io.Dir, fa: *FacadeAdapter) facade.Facade {
+    return .{
+        .allocator = store.alloc,
+        .io = store.io,
+        .work_dir = work_dir,
+        .state_dir = store.root,
+        .adapter = fa.adapter(),
+    };
+}
 
-    if (git_head) |gh| {
-        if (prev_head) |ph| {
-            if (!std.mem.eql(u8, ph, gh)) {
-                var ref_buf: [512]u8 = undefined;
-                const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{gh});
-                var tip: c.git_oid = undefined;
-                const has_tip = c.git_reference_name_to_id(&tip, repo, ref_name.ptr) == 0;
-                const target = try counterpart(store, repo, &map, gh, if (has_tip) &tip else null);
-                defer alloc.free(target);
-                const cur = store.headBranch() catch null;
-                defer if (cur) |x| alloc.free(x);
-                if (cur == null or !std.mem.eql(u8, cur.?, target)) {
-                    try store.setHeadBranch(target);
-                    out.followed = true;
-                    out.head_len = copyName(&out.head_buf, target);
-                }
-            }
-        }
-    }
+pub fn facadeFingerprint(store: *Store, work_dir: std.Io.Dir) ?Oid {
+    const print = facade.fingerprint(store.alloc, store.io, work_dir) orelse return null;
+    return .{ .bytes = print };
+}
 
-    try map.save(store);
-    return out;
+pub fn absorbColocated(store: *Store, work_dir_path: []const u8, prev_head: ?[]const u8) !Absorbed {
+    var work = try std.Io.Dir.openDirAbsolute(store.io, work_dir_path, .{ .iterate = true });
+    defer work.close(store.io);
+    var fa = FacadeAdapter.init(store, work_dir_path);
+    defer fa.deinit();
+    const r = try facadeFor(store, work, &fa).absorb(prev_head);
+    return Absorbed.fromFacade(r, fa.commits);
 }
 
 pub fn absorbIfChanged(store: *Store, work_dir: std.Io.Dir, work_dir_path: []const u8) !?Absorbed {
-    const fingerprint = facadeFingerprint(store, work_dir);
-    const stamp = readStamp(store);
-    if (fingerprint != null and stamp != null and stamp.?.fingerprint != null) {
-        if (fingerprint.?.eql(stamp.?.fingerprint.?)) return null;
-    }
-    const prev_head: ?[]const u8 = if (stamp) |*s| s.head() else null;
-    const result = try absorbColocated(store, work_dir_path, prev_head);
-    var head_buf: [256]u8 = undefined;
-    const head = colocatedHead(store, work_dir_path, &head_buf) orelse (prev_head orelse "");
-    writeStamp(store, facadeFingerprint(store, work_dir), head);
-    return result;
+    var fa = FacadeAdapter.init(store, work_dir_path);
+    defer fa.deinit();
+    const r = (try facadeFor(store, work_dir, &fa).absorbIfChanged()) orelse return null;
+    return Absorbed.fromFacade(r, fa.commits);
+}
+
+fn rememberPair(store: *Store, git_branch: []const u8) void {
+    const head = store.headBranch() catch return;
+    defer store.alloc.free(head);
+    var fa = FacadeAdapter.init(store, "");
+    defer fa.deinit();
+    facadeFor(store, store.root, &fa).recordPair(head, git_branch);
 }
 
 pub fn pointColocatedHead(store: *Store, work_dir_path: []const u8, branch: []const u8) !void {
-    ensureInit();
-    const alloc = store.alloc;
-    const path_z = try alloc.dupeZ(u8, work_dir_path);
-    defer alloc.free(path_z);
-
-    const target = pairOf(store, branch) orelse try alloc.dupe(u8, branch);
-    defer alloc.free(target);
-    var ref_buf: [512]u8 = undefined;
-    const ref_name = try std.fmt.bufPrintZ(&ref_buf, "refs/heads/{s}", .{target});
-
-    var repo: ?*c.git_repository = null;
-    if (c.git_repository_open(&repo, path_z.ptr) != 0) return;
-    defer c.git_repository_free(repo);
-
-    var tip: c.git_oid = undefined;
-    if (c.git_reference_name_to_id(&tip, repo, ref_name.ptr) != 0 and store.refExists(branch)) {
+    var work = std.Io.Dir.openDirAbsolute(store.io, work_dir_path, .{ .iterate = true }) catch return;
+    defer work.close(store.io);
+    var fa = FacadeAdapter.init(store, work_dir_path);
+    defer fa.deinit();
+    const f = facadeFor(store, work, &fa);
+    const pointed = f.pointHead(branch) catch false;
+    if (!pointed) {
+        if (!store.refExists(branch)) return;
+        const target = f.pairedGitBranch(branch) orelse try store.alloc.dupe(u8, branch);
+        defer store.alloc.free(target);
         return syncColocatedTo(store, work_dir_path, target);
     }
-    try check(c.git_repository_set_head(repo, ref_name.ptr));
     resetIndexToHead(store, work_dir_path) catch {};
 }
 
