@@ -268,6 +268,14 @@ pub const table = [_]Setting{
         .default = "strict",
         .choices = &.{ "strict", "fast" },
     },
+    .{
+        .name = "compress",
+        .key = "store.compress",
+        .kind = .toggle,
+        .group = "what is captured",
+        .desc = "whether new objects are deflated on disk",
+        .default = "on",
+    },
 
     .{
         .name = "cut",

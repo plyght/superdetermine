@@ -178,6 +178,53 @@ pub fn restore(
     try apricot.sdt_codec.restore(allocator, io, destination, fetched.carrier_bytes, fetched.carrier_root);
 }
 
+const fetched_file = "apricot-fetched";
+
+fn fetchedKey(remote: []const u8, branch: []const u8) [64]u8 {
+    var h = std.crypto.hash.Blake3.init(.{});
+    h.update(remote);
+    h.update(&[_]u8{0});
+    h.update(branch);
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn rememberedTip(destination: *Store, allocator: std.mem.Allocator, remote: []const u8, branch: []const u8, carrier_hex: []const u8) ?Oid {
+    const data = destination.root.readFileAlloc(destination.io, fetched_file, allocator, .unlimited) catch return null;
+    defer allocator.free(data);
+    const key = fetchedKey(remote, branch);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeAny(u8, line, " \t\r");
+        const k = it.next() orelse continue;
+        const carrier = it.next() orelse continue;
+        const tip = it.next() orelse continue;
+        if (!std.mem.eql(u8, k, &key) or !std.mem.eql(u8, carrier, carrier_hex)) continue;
+        return Oid.fromHex(tip) catch null;
+    }
+    return null;
+}
+
+fn rememberTip(destination: *Store, allocator: std.mem.Allocator, remote: []const u8, branch: []const u8, carrier_hex: []const u8, tip: Oid) !void {
+    const key = fetchedKey(remote, branch);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    if (destination.root.readFileAlloc(destination.io, fetched_file, allocator, .unlimited)) |data| {
+        defer allocator.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (t.len == 0 or std.mem.startsWith(u8, t, &key)) continue;
+            try out.appendSlice(allocator, t);
+            try out.append(allocator, '\n');
+        }
+    } else |_| {}
+    var hex: [Oid.len * 2]u8 = undefined;
+    try out.print(allocator, "{s} {s} {s}\n", .{ &key, carrier_hex, tip.toHex(&hex) });
+    try destination.writeFileAtomic(fetched_file, out.items);
+}
+
 pub fn fetchInto(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -186,7 +233,30 @@ pub fn fetchInto(
     destination: *Store,
     destination_ref: []const u8,
 ) !Oid {
-    const fetched = try fetch(allocator, io, remote, branch);
+    var session = Session.init(allocator, io, remote, .configured);
+    defer session.deinit();
+    const smart = session.smart(allocator, remote);
+
+    var carrier_buf: [40]u8 = undefined;
+    const carrier_hex: ?[]const u8 = blk: {
+        const advertisement = smart.discover(.upload_pack) catch break :blk null;
+        defer advertisement.deinit();
+        const native_ref = try apricot.git_forge.branchCarrierRef(allocator, branch);
+        defer allocator.free(native_ref);
+        const carrier = advertisement.findRef(native_ref) orelse
+            advertisement.findRef("refs/apricot/native") orelse break :blk null;
+        break :blk carrier.format(&carrier_buf);
+    };
+    if (carrier_hex) |hex| {
+        if (rememberedTip(destination, allocator, remote, branch, hex)) |tip| {
+            if (destination.has(tip)) {
+                try destination.updateRef(destination_ref, tip);
+                return tip;
+            }
+        }
+    }
+
+    const fetched = try apricot.git_forge.fetch(allocator, smart, branch);
     defer fetched.deinit(allocator);
     const stamp = std.Io.Clock.real.now(io).nanoseconds;
     const temporary_name = try std.fmt.allocPrint(allocator, ".sdt/apricot-fetch-{d}", .{stamp});
@@ -208,7 +278,36 @@ pub fn fetchInto(
     const native_branch = if (restored_store.refExists(branch)) branch else head_branch;
     const tip = try net.fetchSparse(destination, source_store, native_branch, "");
     try destination.updateRef(destination_ref, tip);
+    if (carrier_hex) |hex| rememberTip(destination, allocator, remote, branch, hex, tip) catch {};
     return tip;
+}
+
+test "a remembered carrier tip round-trips through the fetched file" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var st = try Store.init(io, alloc, tmp.dir);
+    defer st.deinit();
+
+    const remote = "https://example.com/plyght/superdetermine.git";
+    const carrier_a = "0123456789abcdef0123456789abcdef01234567";
+    const carrier_b = "89abcdef0123456789abcdef0123456789abcdef";
+    const tip_a = Oid.ofBytes("a");
+    const tip_b = Oid.ofBytes("b");
+
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_a) == null);
+    try rememberTip(&st, alloc, remote, "main", carrier_a, tip_a);
+    try rememberTip(&st, alloc, remote, "dev", carrier_b, tip_b);
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_a).?.eql(tip_a));
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "dev", carrier_b).?.eql(tip_b));
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_b) == null);
+    try std.testing.expect(rememberedTip(&st, alloc, "https://example.com/other.git", "main", carrier_a) == null);
+
+    try rememberTip(&st, alloc, remote, "main", carrier_b, tip_b);
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_a) == null);
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "main", carrier_b).?.eql(tip_b));
+    try std.testing.expect(rememberedTip(&st, alloc, remote, "dev", carrier_b).?.eql(tip_b));
 }
 
 test "credentials are withheld from a cleartext remote" {

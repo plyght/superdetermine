@@ -73,17 +73,23 @@ pub fn syncFile(io: std.Io, file: std.Io.File, barrier: Barrier) !void {
     try file.sync(io);
 }
 
+pub const packed_magic = "\x00sdtobj\x01";
+const packed_header_len = packed_magic.len + 1 + 8;
+const compress_threshold = 256;
+
 pub const Store = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     root: std.Io.Dir, // handle to the `.sdt` directory
     gear: ?cdc.GearTable = null,
     durability: Durability = .strict,
+    compress: ?bool = null,
 
     pub const Error = error{
         NotARepo,
         RepoExists,
         ObjectNotFound,
+        CorruptObject,
         RefNotFound,
         InvalidRef,
     };
@@ -150,6 +156,74 @@ pub const Store = struct {
         try syncFile(self.io, file, barrier);
     }
 
+    fn compressesObjects(self: *Store) bool {
+        if (self.compress) |c| return c;
+        var on = true;
+        if (config.get(self, self.alloc, "store.compress")) |maybe| {
+            if (maybe) |v| {
+                defer self.alloc.free(v);
+                const t = std.mem.trim(u8, v, " \t\r\n");
+                if (std.ascii.eqlIgnoreCase(t, "off") or std.ascii.eqlIgnoreCase(t, "false") or
+                    std.ascii.eqlIgnoreCase(t, "no") or std.mem.eql(u8, t, "0")) on = false;
+            }
+        } else |_| {}
+        self.compress = on;
+        return on;
+    }
+
+    fn packForDisk(self: *Store, content: []const u8) !?[]u8 {
+        const alloc = self.alloc;
+        if (content.len >= compress_threshold and self.compressesObjects()) {
+            var out = try std.Io.Writer.Allocating.initCapacity(alloc, packed_header_len + content.len / 2 + 64);
+            defer out.deinit();
+            try out.writer.writeAll(packed_magic);
+            try out.writer.writeByte(1);
+            var len_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len_bytes, content.len, .little);
+            try out.writer.writeAll(&len_bytes);
+            const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+            defer alloc.free(window);
+            var comp = try std.compress.flate.Compress.init(&out.writer, window, .zlib, .default);
+            try comp.writer.writeAll(content);
+            try comp.finish();
+            if (out.written().len < content.len) return try out.toOwnedSlice();
+        }
+        if (!std.mem.startsWith(u8, content, packed_magic)) return null;
+        const buf = try alloc.alloc(u8, packed_header_len + content.len);
+        @memcpy(buf[0..packed_magic.len], packed_magic);
+        buf[packed_magic.len] = 0;
+        std.mem.writeInt(u64, buf[packed_magic.len + 1 ..][0..8], content.len, .little);
+        @memcpy(buf[packed_header_len..], content);
+        return buf;
+    }
+
+    fn unpackFromDisk(self: *Store, raw: []u8) ![]u8 {
+        if (raw.len < packed_header_len or !std.mem.startsWith(u8, raw, packed_magic)) return raw;
+        defer self.alloc.free(raw);
+        const method = raw[packed_magic.len];
+        const raw_len: usize = @intCast(std.mem.readInt(u64, raw[packed_magic.len + 1 ..][0..8], .little));
+        const payload = raw[packed_header_len..];
+        switch (method) {
+            0 => {
+                if (payload.len != raw_len) return Error.CorruptObject;
+                return self.alloc.dupe(u8, payload);
+            },
+            1 => {
+                var source = std.Io.Reader.fixed(payload);
+                const window = try self.alloc.alloc(u8, std.compress.flate.max_window_len);
+                defer self.alloc.free(window);
+                var inflate = std.compress.flate.Decompress.init(&source, .zlib, window);
+                const data = inflate.reader.readAlloc(self.alloc, raw_len) catch return Error.CorruptObject;
+                errdefer self.alloc.free(data);
+                var probe: [1]u8 = undefined;
+                const extra = inflate.reader.readSliceShort(&probe) catch return Error.CorruptObject;
+                if (extra != 0) return Error.CorruptObject;
+                return data;
+            },
+            else => return Error.CorruptObject,
+        }
+    }
+
     fn loadGear(io: std.Io, root: std.Io.Dir) cdc.GearTable {
         var buf: [cdc.key_len * 2 + 16]u8 = undefined;
         const raw = root.readFile(io, chunk_key_file, &buf) catch return cdc.legacy_gear;
@@ -214,13 +288,15 @@ pub const Store = struct {
         const tp = std.fmt.bufPrint(&tbuf, "objects/{s}/{s}", .{ hex[0..2], name }) catch unreachable;
 
         errdefer self.root.deleteFile(self.io, tp) catch {};
+        const packed_bytes = try self.packForDisk(content);
+        defer if (packed_bytes) |b| self.alloc.free(b);
         // Stage beside the destination, then rename: a reader in another
         // process sees the object whole or not at all, never truncated.
         // An object is written far more often than a name is published, and an
         // object nothing names yet is not worth a device-cache flush of its
         // own: the `full` barrier taken when a ref or a log record finally
         // names it covers every object written before it.
-        try self.writeStaged(tp, content, .ordered);
+        try self.writeStaged(tp, packed_bytes orelse content, .ordered);
         const p = objectPath(o, &buf);
         try self.root.rename(tp, self.root, p, self.io);
         try self.syncDir(shard, .ordered);
@@ -231,8 +307,9 @@ pub const Store = struct {
     pub fn readRaw(self: *Store, o: Oid) ![]u8 {
         var buf: [80]u8 = undefined;
         const p = objectPath(o, &buf);
-        return self.root.readFileAlloc(self.io, p, self.alloc, .unlimited) catch
+        const raw = self.root.readFileAlloc(self.io, p, self.alloc, .unlimited) catch
             return Error.ObjectNotFound;
+        return self.unpackFromDisk(raw);
     }
 
     // --- typed helpers ---
@@ -695,4 +772,56 @@ test "durability is read from config and defaults to strict" {
     var unknown = try Store.open(io, alloc, tmp.dir);
     defer unknown.deinit();
     try testing.expectEqual(Durability.strict, unknown.durability);
+}
+
+test "compressible objects land packed and read back verbatim" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const big = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(big);
+    const phrase = "superdetermine records what worked\n";
+    for (big, 0..) |*b, i| b.* = phrase[i % phrase.len];
+
+    const o = try store.writeRaw(big);
+    try testing.expect(o.eql(Oid.ofBytes(big)));
+    var buf: [80]u8 = undefined;
+    const on_disk = try store.root.readFileAlloc(io, Store.objectPath(o, &buf), alloc, .unlimited);
+    defer alloc.free(on_disk);
+    try testing.expect(on_disk.len < big.len / 4);
+    try testing.expect(std.mem.startsWith(u8, on_disk, packed_magic));
+    const back = try store.readRaw(o);
+    defer alloc.free(back);
+    try testing.expectEqualSlices(u8, big, back);
+
+    const tricky = packed_magic ++ "not a packed object";
+    const t = try store.writeRaw(tricky);
+    const tricky_disk = try store.root.readFileAlloc(io, Store.objectPath(t, &buf), alloc, .unlimited);
+    defer alloc.free(tricky_disk);
+    try testing.expectEqual(packed_header_len + tricky.len, tricky_disk.len);
+    const tricky_back = try store.readRaw(t);
+    defer alloc.free(tricky_back);
+    try testing.expectEqualStrings(tricky, tricky_back);
+
+    const small = "tiny";
+    const s = try store.writeRaw(small);
+    const small_disk = try store.root.readFileAlloc(io, Store.objectPath(s, &buf), alloc, .unlimited);
+    defer alloc.free(small_disk);
+    try testing.expectEqualStrings(small, small_disk);
+
+    try config.set(&store, "store.compress", "off");
+    var plain = try Store.open(io, alloc, tmp.dir);
+    defer plain.deinit();
+    const other = try alloc.dupe(u8, big);
+    defer alloc.free(other);
+    other[0] = 'X';
+    const p = try plain.writeRaw(other);
+    const plain_disk = try plain.root.readFileAlloc(io, Store.objectPath(p, &buf), alloc, .unlimited);
+    defer alloc.free(plain_disk);
+    try testing.expectEqualSlices(u8, other, plain_disk);
 }

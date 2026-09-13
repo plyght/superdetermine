@@ -2,6 +2,7 @@ const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
 const store = @import("store.zig");
+const config = @import("config.zig");
 const Oid = oid.Oid;
 const Store = store.Store;
 
@@ -309,6 +310,20 @@ fn importGraph(st: *Store, alloc: std.mem.Allocator, src: anytype, refs: []const
     }
 
     for (refs) |r| try st.updateRef(r.name, r.target);
+    try adoptHead(st, refs);
+}
+
+fn adoptHead(st: *Store, refs: []const Ref) !void {
+    if (refs.len == 0) return;
+    const head = try st.headBranch();
+    defer st.alloc.free(head);
+    if (st.refExists(head)) return;
+    const preferred = config.defaultBranch(st.io, st.alloc) catch null;
+    defer if (preferred) |p| st.alloc.free(p);
+    if (preferred) |p| {
+        for (refs) |r| if (std.mem.eql(u8, r.name, p)) return st.setHeadBranch(p);
+    }
+    try st.setHeadBranch(refs[0].name);
 }
 
 pub fn encodeUrl(alloc: std.mem.Allocator, base_url: []const u8, s: ShareKey) ![]u8 {
@@ -1213,4 +1228,46 @@ test "http share roundtrip over a live socket" {
         const content = try dst.readFileContent(e.blob);
         alloc.free(content);
     }
+}
+
+test "bundle restore lands on the branch the bundle carries" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var repo = std.testing.tmpDir(.{});
+    defer repo.cleanup();
+    var clone = std.testing.tmpDir(.{});
+    defer clone.cleanup();
+
+    var src = try Store.init(io, alloc, repo.dir);
+    defer src.deinit();
+    try src.setHeadBranch("trunk");
+    const tip = try seedRepo(&src);
+    try src.updateRef("trunk", tip);
+
+    const s: ShareKey = [_]u8{9} ** key_len;
+    const bytes = try buildBundle(&src, alloc, s, &.{});
+    defer alloc.free(bytes);
+
+    var dst = try Store.init(io, alloc, clone.dir);
+    defer dst.deinit();
+    try testing.expect(!dst.refExists("trunk"));
+    try importBundle(&dst, alloc, s, bytes);
+
+    const head = try dst.headBranch();
+    defer alloc.free(head);
+    try testing.expectEqualStrings("trunk", head);
+    try testing.expect((try dst.readRef("trunk")).eql(tip));
+    try testing.expect(!dst.refExists("main"));
+
+    var again = std.testing.tmpDir(.{});
+    defer again.cleanup();
+    var settled = try Store.init(io, alloc, again.dir);
+    defer settled.deinit();
+    try settled.setHeadBranch("release");
+    try settled.updateRef("release", tip);
+    try importBundle(&settled, alloc, s, bytes);
+    const kept = try settled.headBranch();
+    defer alloc.free(kept);
+    try testing.expectEqualStrings("release", kept);
 }

@@ -1,7 +1,8 @@
 const std = @import("std");
 const oid = @import("oid.zig");
 const object = @import("object.zig");
-const Store = @import("store.zig").Store;
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
 const ignore = @import("ignore.zig");
 const idx = @import("index.zig");
 const keyring = @import("keyring.zig");
@@ -70,7 +71,9 @@ fn scan(
     while (try walker.next(io)) |entry| {
         switch (entry.kind) {
             .directory => {
-                if (!ignores.isIgnored(entry.path, true)) try walker.enter(io, entry);
+                if (ignores.isIgnored(entry.path, true)) continue;
+                if (isNestedRepo(io, work_dir, entry.path)) continue;
+                try walker.enter(io, entry);
             },
             .file => {
                 if (plan.isSource(entry.path)) continue;
@@ -107,6 +110,15 @@ fn scan(
     const slice = try entries.toOwnedSlice(alloc);
     std.mem.sort(object.TreeEntry, slice, {}, object.Tree.lessThan);
     return slice;
+}
+
+fn isNestedRepo(io: std.Io, work_dir: std.Io.Dir, rel_path: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    for ([_][]const u8{ ".git", store_mod.dir_name }) |marker| {
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ rel_path, marker }) catch return false;
+        if (work_dir.access(io, p, .{})) |_| return true else |_| {}
+    }
+    return false;
 }
 
 fn freeEntries(alloc: std.mem.Allocator, entries: []object.TreeEntry) void {
@@ -533,4 +545,45 @@ test "restoreFile discards local edits to one file" {
     try testing.expectEqualStrings("original", got);
 
     try testing.expectError(error.PathNotInHead, restoreFile(&store, work, "nope.txt"));
+}
+
+test "a nested repository is never captured" {
+    const io = std.testing.io;
+    const alloc = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    try tmp.dir.createDirPath(io, "work/vendor/lib/src");
+    try tmp.dir.createDirPath(io, "work/scratch/inner");
+    try tmp.dir.createDirPath(io, "work/plain/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/a.txt", .data = "hello" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/vendor/lib/.git", .data = "gitdir: /elsewhere\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/vendor/lib/src/x.c", .data = "int x;" });
+    try tmp.dir.createDirPath(io, "work/scratch/inner/.sdt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/scratch/inner/note.md", .data = "inner" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/scratch/keep.txt", .data = "kept" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/plain/deep/b.txt", .data = "b" });
+
+    var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
+    defer work.close(io);
+
+    const st = try status(&store, work, alloc);
+    defer {
+        for (st) |e| alloc.free(e.path);
+        alloc.free(st);
+    }
+    var saw_keep = false;
+    var saw_deep = false;
+    for (st) |e| {
+        try testing.expect(std.mem.indexOf(u8, e.path, "vendor/lib/") == null);
+        try testing.expect(std.mem.indexOf(u8, e.path, "scratch/inner") == null);
+        if (std.mem.eql(u8, e.path, "scratch/keep.txt")) saw_keep = true;
+        if (std.mem.eql(u8, e.path, "plain/deep/b.txt")) saw_deep = true;
+    }
+    try testing.expect(saw_keep);
+    try testing.expect(saw_deep);
 }
