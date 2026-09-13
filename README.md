@@ -115,6 +115,12 @@ superdetermine does not replace git or GitHub, and adopting it is reversible. It
 
 If superdetermine turns out not to be for you, your git history is right there, untouched.
 
+### The git facade
+
+With `git-sync` on, the colocated `.git` is a live projection of sdt, and it works in both directions. Any app that only speaks git (an editor's source-control panel, a desktop client, an agent that runs `git`) reads the projection as an ordinary repository, and what it writes there becomes sdt truth. A `git commit` is absorbed as an sdt change with the same message. A `git switch` or `git checkout -b` moves or creates the sdt branch. A `git stash` is kept as sdt objects. sdt notices on the next command, on the next background tick (the launchd agent watches `.git` as well as the worktree), or in `sdt watch`. Nothing is configured per app, and no git binary is run: sdt reads and writes the repository through libgit2.
+
+sdt stays the authority. `sdt switch` moves git's HEAD with it. `sdt undo` on an absorbed commit takes it back out of `git log` (it stays in git's reflog). A git branch that diverged from sdt is left alone and reported by `sdt doctor` until you pick a side with `sdt import .` or `sdt sync . --force`.
+
 ## How this differs from DeltaDB
 
 Zed's DeltaDB also records the work between your commits, so the comparison is fair to make.
