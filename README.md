@@ -1,6 +1,6 @@
 # superdetermine (`sdt`)
 
-A version control system that remembers which states of your code actually worked.
+sdt keeps your code in superposition.
 
 ![sdt grading a broken edit red and rewinding to the last state that passed](demo.gif)
 

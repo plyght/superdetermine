@@ -5,6 +5,8 @@ description: Drive the superdetermine VCS (`sdt`, alias `gr`) for history surger
 
 # superdetermine (`sdt`)
 
+sdt keeps your code in superposition.
+
 ## Mental model — read this first
 
 1. **No staging area.** `sdt save` snapshots the *entire* working tree. It takes no path arguments. There is no `add`, no `-p`, no partial staging.
