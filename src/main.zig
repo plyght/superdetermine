@@ -69,7 +69,17 @@ const Store = store.Store;
 
 const version = @import("build_options").version;
 
-const Entry = struct { name: []const u8, alias: []const u8 = "", args: []const u8 = "", desc: []const u8 };
+const Flag = struct { name: []const u8, desc: []const u8 };
+const Example = struct { cmd: []const u8, note: []const u8 = "" };
+const Entry = struct {
+    name: []const u8,
+    alias: []const u8 = "",
+    args: []const u8 = "",
+    desc: []const u8,
+    example: []const u8 = "",
+    flags: []const Flag = &.{},
+    examples: []const Example = &.{},
+};
 const Section = struct { title: []const u8, entries: []const Entry };
 
 const usage_col: usize = blk: {
@@ -83,19 +93,117 @@ const usage_col: usize = blk: {
     break :blk widest + 2;
 };
 
+const repo_url = "https://github.com/plyght/superdetermine";
+
+const everyday = [_][]const []const u8{
+    &.{ "save", "status", "diff", "log", "undo" },
+    &.{ "green", "back", "grade", "probe" },
+    &.{ "new", "switch", "merge" },
+    &.{ "clone", "push", "pull" },
+    &.{"init"},
+};
+
+const short_name_col: usize = 10;
+const short_example_col: usize = blk: {
+    @setEvalBranchQuota(20_000);
+    var widest: usize = 0;
+    for (everyday) |group| {
+        for (group) |name| {
+            const e = findEntry(name) orelse continue;
+            if (e.example.len > widest) widest = e.example.len;
+        }
+    }
+    break :blk widest + 3;
+};
+
+fn findEntry(name: []const u8) ?Entry {
+    for (sections) |section| {
+        for (section.entries) |e| {
+            if (eq(e.name, name)) return e;
+        }
+    }
+    return null;
+}
+
 const sections = [_]Section{
-    .{ .title = "the everyday loop", .entries = &.{
-        .{ .name = "save", .alias = "sv", .args = "[-m msg]", .desc = "checkpoint the working tree" },
-        .{ .name = "status", .alias = "st", .desc = "what changed since the last save" },
-        .{ .name = "diff", .alias = "d", .args = "[<ref> | <a>..<b>]", .desc = "line-level diff vs the last save, or between states" },
+    .{ .title = "everyday", .entries = &.{
+        .{
+            .name = "save",
+            .alias = "sv",
+            .args = "[-m msg]",
+            .desc = "checkpoint the working tree",
+            .example = "-m \"fix parser\"",
+            .flags = &.{
+                .{ .name = "-m, --message <msg>", .desc = "name this change; without it the change is unnamed" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt save", .note = "checkpoint everything, unnamed" },
+                .{ .cmd = "sdt save -m \"fix parser\"", .note = "checkpoint with a name" },
+                .{ .cmd = "sdt describe -m \"fix parser\"", .note = "name it later" },
+            },
+        },
+        .{
+            .name = "status",
+            .alias = "st",
+            .desc = "what changed since the last save",
+            .flags = &.{
+                .{ .name = "--json", .desc = "machine-readable output" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt status" },
+                .{ .cmd = "sdt status --json | jq '.[].path'" },
+            },
+        },
+        .{
+            .name = "diff",
+            .alias = "d",
+            .args = "[<ref> | <a>..<b>]",
+            .desc = "line-level diff vs the last save, or between states",
+            .example = "@green",
+            .examples = &.{
+                .{ .cmd = "sdt diff", .note = "working tree vs the last save" },
+                .{ .cmd = "sdt diff @green", .note = "working tree vs the last state that passed" },
+                .{ .cmd = "sdt diff @2h..@save", .note = "between two states" },
+            },
+        },
         .{ .name = "show", .alias = "sh", .args = "<ref>", .desc = "what one change or moment contains" },
         .{ .name = "cat", .args = "<ref>:<path>", .desc = "one file's content as of any state" },
-        .{ .name = "log", .alias = "l", .desc = "the change history" },
+        .{
+            .name = "log",
+            .alias = "l",
+            .desc = "the change history",
+            .flags = &.{
+                .{ .name = "--json", .desc = "machine-readable output" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt log" },
+                .{ .cmd = "sdt log --json | jq '.[0].id'" },
+            },
+        },
         .{ .name = "describe", .alias = "desc", .args = "-m msg [--at]", .desc = "name or rename any change" },
     } },
-    .{ .title = "moving around", .entries = &.{
-        .{ .name = "new", .alias = "n", .args = "<name>", .desc = "branch off here and switch to it" },
-        .{ .name = "switch", .alias = "sw", .args = "<name>", .desc = "move to another branch (auto-saves)" },
+    .{ .title = "branches and worktrees", .entries = &.{
+        .{
+            .name = "new",
+            .alias = "n",
+            .args = "<name> [@ref]",
+            .desc = "branch off here and switch to it",
+            .example = "fix-parser",
+            .examples = &.{
+                .{ .cmd = "sdt new fix-parser", .note = "branch from here" },
+                .{ .cmd = "sdt new fix-parser @green", .note = "branch from the last state that passed" },
+            },
+        },
+        .{
+            .name = "switch",
+            .alias = "sw",
+            .args = "<name>",
+            .desc = "move to another branch (auto-saves)",
+            .example = "main",
+            .examples = &.{
+                .{ .cmd = "sdt switch main", .note = "unsaved edits are saved first, nothing is lost" },
+            },
+        },
         .{ .name = "branch", .alias = "b", .args = "[-d name]", .desc = "list branches, or delete one" },
         .{ .name = "work", .alias = "wt", .args = "<dir>", .desc = "instant copy-on-write worktree" },
         .{ .name = "work list", .args = "[--all]", .desc = "every worktree, its branch, and what is unsaved" },
@@ -104,7 +212,17 @@ const sections = [_]Section{
         .{ .name = "work remove", .args = "<dir|name> [--force]", .desc = "set a worktree aside (refuses unsaved edits)" },
         .{ .name = "work restore", .args = "<dir|name>", .desc = "put a removed worktree back" },
         .{ .name = "restore", .alias = "rs", .args = "<file>... [--at ref]", .desc = "put one file back, from the last save or any state" },
-        .{ .name = "merge", .alias = "mg", .args = "<branch>", .desc = "merge another branch into this one" },
+        .{
+            .name = "merge",
+            .alias = "mg",
+            .args = "<branch>",
+            .desc = "merge another branch into this one",
+            .example = "fix-parser",
+            .examples = &.{
+                .{ .cmd = "sdt merge fix-parser" },
+                .{ .cmd = "sdt super", .note = "afterwards: paths that hold more than one version" },
+            },
+        },
         .{ .name = "resolve", .alias = "res", .args = "<file>", .desc = "mark a conflict resolved (--abort, --list, --forget <id>)" },
         .{ .name = "revert", .alias = "rev", .desc = "undo a change as a new change" },
         .{ .name = "absorb", .alias = "ab", .args = "[-- <paths>]", .desc = "fold edits into the changes they belong to" },
@@ -128,38 +246,98 @@ const sections = [_]Section{
         .{ .name = "take", .alias = "tk", .args = "<ref>", .desc = "copy a change from another branch onto this one" },
         .{ .name = "move", .alias = "mv", .args = "<ref> <branch>", .desc = "move a change onto another branch" },
     } },
-    .{ .title = "who wrote this", .entries = &.{
+    .{ .title = "authorship", .entries = &.{
         .{ .name = "blame", .alias = "bl", .args = "<file>", .desc = "per-line authorship, incl. agent/prompt" },
         .{ .name = "provenance", .alias = "prov", .desc = "which agent/prompt produced each change" },
         .{ .name = "why", .args = "<file>", .desc = "who last authored a file" },
     } },
-    .{ .title = "undo is never scary", .entries = &.{
-        .{ .name = "undo", .alias = "u", .desc = "revert the last operation, whole repo" },
+    .{ .title = "undo", .entries = &.{
+        .{
+            .name = "undo",
+            .alias = "u",
+            .desc = "revert the last operation, whole repo",
+            .examples = &.{
+                .{ .cmd = "sdt undo", .note = "any operation: a merge, a rebase, a rewind, a purge" },
+                .{ .cmd = "sdt redo", .note = "put it back" },
+            },
+        },
         .{ .name = "redo", .alias = "r", .desc = "reapply what you just undid" },
     } },
-    .{ .title = "history that knows what worked", .entries = &.{
-        .{ .name = "green", .alias = "gn", .desc = "rewind to the last state that passed" },
-        .{ .name = "back", .alias = "bk", .args = "[n]", .desc = "rewind n moments, default 1" },
+    .{ .title = "what worked", .entries = &.{
+        .{
+            .name = "green",
+            .alias = "gn",
+            .desc = "rewind to the last state that passed",
+            .examples = &.{
+                .{ .cmd = "sdt green", .note = "same as sdt rewind @green" },
+                .{ .cmd = "sdt undo", .note = "if that was not the state you wanted" },
+            },
+        },
+        .{
+            .name = "back",
+            .alias = "bk",
+            .args = "[n]",
+            .desc = "rewind n moments, default 1",
+            .example = "2",
+            .examples = &.{
+                .{ .cmd = "sdt back", .note = "one moment back" },
+                .{ .cmd = "sdt back 3", .note = "three moments back" },
+            },
+        },
         .{ .name = "rewind", .alias = "rw", .args = "<ref>", .desc = "rewind to any @ref (--dry-run)" },
         .{ .name = "moments", .alias = "mo", .args = "[-n N] [--path f]", .desc = "captured states, their age and their verdicts" },
-        .{ .name = "grade", .alias = "gd", .args = "[git-ref]", .desc = "grade now, or any git ref; --on automates" },
-        .{ .name = "probe", .alias = "pb", .args = "<ref>[..<ref>] [-- <cmd>]", .desc = "run a command against a state in a clone; a range bisects" },
+        .{
+            .name = "grade",
+            .alias = "gd",
+            .args = "[git-ref]",
+            .desc = "grade now, or any git ref; --on automates",
+            .flags = &.{
+                .{ .name = "--on, --off", .desc = "grade every moment in the background, or stop" },
+                .{ .name = "--once", .desc = "one background pass, then exit" },
+                .{ .name = "--fast, --full", .desc = "pick the fast or the full check when both are configured" },
+                .{ .name = "--install, --uninstall", .desc = "run the background grader as a login service" },
+                .{ .name = "--repo <dir>", .desc = "grade another repo" },
+                .{ .name = "--json", .desc = "machine-readable verdict" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt grade", .note = "run the repo's check on the tree as it is now" },
+                .{ .cmd = "sdt grade --on", .note = "grade every captured moment from now on" },
+                .{ .cmd = "sdt grade HEAD~3", .note = "grade a git ref" },
+            },
+        },
+        .{
+            .name = "probe",
+            .alias = "pb",
+            .args = "<ref>[..<ref>] [-- <cmd>]",
+            .desc = "run a command against a state in a clone; a range bisects",
+            .example = "@green..@save",
+            .flags = &.{
+                .{ .name = "-j, --jobs <n>", .desc = "bisect n states at once" },
+                .{ .name = "--rerun", .desc = "ignore cached verdicts" },
+                .{ .name = "--json", .desc = "machine-readable result" },
+                .{ .name = "-- <cmd>", .desc = "the command to run; defaults to the repo's check" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt probe @2h", .note = "run the check against the state two hours ago" },
+                .{ .cmd = "sdt probe @green..@save -- bun test", .note = "bisect: which moment flipped it" },
+            },
+        },
         .{ .name = "doctor", .alias = "doc", .desc = "what is on, what is degraded, and why" },
         .{ .name = "recap", .alias = "rc", .args = "[@ref..]", .desc = "green and red spans, and what thrashed" },
     } },
-    .{ .title = "conflicts that halt nothing", .entries = &.{
+    .{ .title = "conflicts", .entries = &.{
         .{ .name = "super", .alias = "sp", .args = "[path]", .desc = "paths holding more than one version" },
         .{ .name = "collapse", .alias = "cp", .args = "<path> <A|--greenest>", .desc = "keep one; nothing is deleted" },
         .{ .name = "note", .args = "<f>:<n> <text>", .desc = "annotate a line for whoever has it next" },
         .{ .name = "notes", .desc = "every annotation recorded here" },
     } },
-    .{ .title = "secrets you can actually commit", .entries = &.{
+    .{ .title = "secrets", .entries = &.{
         .{ .name = "seal", .alias = "sl", .args = "<path>", .desc = "seal a .env-style file" },
         .{ .name = "unseal", .alias = "us", .desc = "write the plaintext back out" },
         .{ .name = "key", .alias = "k", .args = "<cmd>", .desc = "new | show | add | remove | list" },
         .{ .name = "rotate", .alias = "rot", .desc = "new repo key, re-wrapped to every member" },
     } },
-    .{ .title = "handing a repo to someone", .entries = &.{
+    .{ .title = "sharing", .entries = &.{
         .{ .name = "send", .alias = "snd", .desc = "peer-to-peer on this network, via a code" },
         .{ .name = "send", .args = "<ref>", .desc = "one exact state, with its check and verdict" },
         .{ .name = "send --file", .args = "<f>", .desc = "one sealed file, no network at all" },
@@ -167,7 +345,7 @@ const sections = [_]Section{
         .{ .name = "get", .alias = "g", .args = "<code|url|file> [--thin]", .desc = "the other side of all three" },
         .{ .name = "relay", .alias = "rv", .desc = "run a meeting point for internet transfers" },
     } },
-    .{ .title = "distributed (no forced server)", .entries = &.{
+    .{ .title = "peers and servers", .entries = &.{
         .{ .name = "mesh", .alias = "mp", .desc = "live multiplayer: every peer a writer, no server" },
         .{ .name = "mesh open", .desc = "start a room here and print its secret" },
         .{ .name = "mesh join", .args = "<secret> [--thin]", .desc = "join the room that secret names" },
@@ -177,18 +355,66 @@ const sections = [_]Section{
         .{ .name = "watch", .desc = "experimental: auto-save on every change" },
         .{ .name = "hook", .args = "[install]", .desc = "tell a coding agent whether its work passed" },
     } },
-    .{ .title = "git, side by side", .entries = &.{
-        .{ .name = "clone", .alias = "cl", .args = "<src> [dir] [--thin]", .desc = "a git repo, a share URL, a bundle, a served host:port, or a repo path" },
+    .{ .title = "git", .entries = &.{
+        .{
+            .name = "clone",
+            .alias = "cl",
+            .args = "<src> [dir] [--thin]",
+            .desc = "a git repo, share URL, bundle, or served host:port",
+            .example = "git@github.com:you/repo",
+            .flags = &.{
+                .{ .name = "--thin", .desc = "hold history whole, fetch file contents on demand" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt clone https://github.com/you/repo.git" },
+                .{ .cmd = "sdt clone --thin https://github.com/you/repo.git", .note = "fast start, contents arrive as needed" },
+                .{ .cmd = "sdt clone host:7777 repo", .note = "from a repo someone is serving" },
+            },
+        },
         .{ .name = "import", .args = "<repo>", .desc = "pull a git repo's HEAD into superdetermine" },
         .{ .name = "export", .args = "<repo> [--force]", .desc = "write superdetermine HEAD out as git commits" },
         .{ .name = "sync", .args = "<dir> [--force]", .desc = "mirror HEAD into the colocated .git" },
-        .{ .name = "push", .alias = "ps", .args = "[remote] [branch]", .desc = "uses your existing git credentials; --require-green holds a red tree back" },
-        .{ .name = "pull", .alias = "pl", .args = "[remote] [branch]", .desc = "fetch and merge from a git remote" },
+        .{
+            .name = "push",
+            .alias = "ps",
+            .args = "[remote] [branch]",
+            .desc = "push to a git remote with your existing git credentials",
+            .flags = &.{
+                .{ .name = "--require-green", .desc = "refuse to push a tree whose last verdict was red" },
+                .{ .name = "--no-require-green", .desc = "push regardless of the verdict" },
+                .{ .name = "-f, --force", .desc = "overwrite the remote branch" },
+                .{ .name = "-v, --verbose", .desc = "show git's own output" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt push", .note = "origin, current branch" },
+                .{ .cmd = "sdt push origin main --require-green" },
+            },
+        },
+        .{
+            .name = "pull",
+            .alias = "pl",
+            .args = "[remote] [branch]",
+            .desc = "fetch and merge from a git remote",
+            .flags = &.{
+                .{ .name = "-v, --verbose", .desc = "show git's own output" },
+            },
+            .examples = &.{
+                .{ .cmd = "sdt pull", .note = "origin, current branch" },
+                .{ .cmd = "sdt pull origin main" },
+            },
+        },
         .{ .name = "attest", .alias = "at", .args = "[ref] [--dry-run]", .desc = "post the warrant as a GitHub commit status" },
         .{ .name = "lfs", .args = "<cmd>", .desc = "git-lfs interop" },
     } },
     .{ .title = "housekeeping", .entries = &.{
-        .{ .name = "init", .desc = "create a superdetermine repo here" },
+        .{
+            .name = "init",
+            .desc = "create a superdetermine repo here",
+            .examples = &.{
+                .{ .cmd = "sdt init", .note = "in an existing git repo too; git keeps working" },
+                .{ .cmd = "sdt setup", .note = "then: three questions, including the check to grade with" },
+            },
+        },
         .{ .name = "gc", .args = "[--dry-run]", .desc = "reclaim unreachable objects" },
         .{ .name = "purge", .args = "<path...>", .desc = "erase a path from all history, then gc" },
         .{ .name = "setup", .desc = "answer three questions and be configured" },
@@ -219,48 +445,137 @@ fn wantsHelp(rest: []const []const u8) bool {
 /// Print one command's usage line. Falls back to the full listing for a name
 /// the table does not carry.
 fn printCommandHelp(w: *std.Io.Writer, cmd: []const u8) !void {
-    for (sections) |section| {
-        for (section.entries) |e| {
-            if (!eq(e.name, cmd)) continue;
-            try w.print("  {s}usage:{s} sdt {s}", .{ ui.on(.dim), ui.off(), e.name });
-            if (e.args.len != 0) try w.print(" {s}", .{e.args});
+    const e = findEntry(cmd) orelse return printShort(w);
+    try w.print("{s}sdt {s}:{s} {s}{s}{s}\n\n", .{ ui.on(.bold), e.name, ui.off(), ui.on(.dim), e.desc, ui.off() });
+    try w.print("{s}Usage:{s} sdt {s}", .{ ui.on(.bold), ui.off(), e.name });
+    if (e.args.len != 0) try w.print(" {s}{s}{s}", .{ ui.on(.dim), e.args, ui.off() });
+    try w.writeAll("\n");
+    if (e.flags.len != 0) {
+        var widest: usize = 0;
+        for (e.flags) |f| widest = @max(widest, f.name.len);
+        try w.print("\n{s}Flags:{s}\n", .{ ui.on(.bold), ui.off() });
+        for (e.flags) |f| {
+            try w.print("  {s}{s}{s}", .{ ui.on(.cyan), f.name, ui.off() });
+            try padTo(w, f.name.len, widest + 3);
+            _ = try writeWrapped(w, f.desc, 2 + widest + 3, 2 + widest + 3);
             try w.writeAll("\n");
-            if (e.desc.len != 0) try w.print("  {s}{s}{s}\n", .{ ui.on(.dim), e.desc, ui.off() });
-            if (e.alias.len != 0) {
-                try w.print("  {s}alias:{s} {s}\n", .{ ui.on(.dim), ui.off(), e.alias });
-            }
-            return;
         }
     }
-    try printUsage(w);
+    if (e.examples.len != 0) {
+        var widest: usize = 0;
+        for (e.examples) |x| widest = @max(widest, x.cmd.len);
+        try w.print("\n{s}Examples:{s}\n", .{ ui.on(.bold), ui.off() });
+        for (e.examples) |x| {
+            try w.print("  {s}", .{x.cmd});
+            if (x.note.len != 0) {
+                try padTo(w, x.cmd.len, widest + 3);
+                try w.writeAll(ui.on(.dim));
+                _ = try writeWrapped(w, x.note, 2 + widest + 3, 2 + widest + 3);
+                try w.writeAll(ui.off());
+            }
+            try w.writeAll("\n");
+        }
+    }
+    if (e.alias.len != 0) try w.print("\n{s}Alias:{s} sdt {s}\n", .{ ui.on(.bold), ui.off(), e.alias });
+}
+
+fn printHeader(w: *std.Io.Writer) !void {
+    try w.print("{s}sdt{s} keeps your code in superposition. {s}({s}){s}\n\n", .{
+        ui.on(.bold), ui.off(), ui.on(.dim), version, ui.off(),
+    });
+    try w.print("{s}Usage:{s} sdt <command> {s}[...flags] [...args]{s}\n", .{ ui.on(.bold), ui.off(), ui.on(.dim), ui.off() });
+}
+
+fn printFooter(w: *std.Io.Writer) !void {
+    try w.print("\nDocs and issues: {s}{s}{s}\n", .{ ui.on(.cyan), repo_url, ui.off() });
+}
+
+fn printAliasTail(w: *std.Io.Writer, alias: []const u8, col: usize, indent: usize) !void {
+    if (alias.len == 0) return;
+    if (col + "(sdt )".len + alias.len + 1 > ui.terminalWidth()) {
+        try w.writeAll("\n");
+        try w.splatByteAll(' ', indent);
+    } else {
+        try w.writeAll(" ");
+    }
+    try w.print("{s}(sdt {s}){s}", .{ ui.on(.dim), alias, ui.off() });
+}
+
+fn printShort(w: *std.Io.Writer) !void {
+    try printHeader(w);
+    try w.print("\n{s}Commands:{s}\n", .{ ui.on(.bold), ui.off() });
+    const with_examples = ui.terminalWidth() >= 2 + short_name_col + short_example_col + 40;
+    const at = 2 + short_name_col + (if (with_examples) short_example_col else 0);
+    for (everyday, 0..) |group, gi| {
+        if (gi != 0) try w.writeAll("\n");
+        for (group) |name| {
+            const e = findEntry(name) orelse continue;
+            try w.print("  {s}{s}{s}", .{ ui.on(.cyan), e.name, ui.off() });
+            try padTo(w, e.name.len, short_name_col);
+            if (with_examples) {
+                try w.print("{s}{s}{s}", .{ ui.on(.dim), e.example, ui.off() });
+                try padTo(w, e.example.len, short_example_col);
+            }
+            const col = try writeWrapped(w, e.desc, at, at);
+            try printAliasTail(w, e.alias, col, at);
+            try w.writeAll("\n");
+        }
+    }
+    try w.writeAll("\n");
+    const foot = @max(at, 2 + "<command> --help".len + 2);
+    try w.print("  {s}<command>{s} {s}--help{s}", .{ ui.on(.dim), ui.off(), ui.on(.cyan), ui.off() });
+    try padTo(w, "<command> --help".len, foot - 2);
+    _ = try writeWrapped(w, "flags and examples for one command", foot, foot);
+    try w.writeAll("\n");
+    try w.print("  {s}help{s} {s}--all{s}", .{ ui.on(.cyan), ui.off(), ui.on(.dim), ui.off() });
+    try padTo(w, "help --all".len, foot - 2);
+    _ = try writeWrapped(w, "every command, grouped", foot, foot);
+    try w.writeAll("\n");
+    try printFooter(w);
 }
 
 fn printUsage(w: *std.Io.Writer) !void {
-    try w.print("{s}sdt{s} {s}superdetermine: a VCS that records what worked, not just what changed{s}\n\n", .{
-        ui.on(.bold), ui.off(), ui.on(.dim), ui.off(),
-    });
-    try w.print("  {s}usage:{s} sdt <command> [args]\n", .{ ui.on(.dim), ui.off() });
-
+    try printHeader(w);
     for (sections) |section| {
-        try w.print("\n  {s}{s}{s}\n", .{ ui.on(.bold), section.title, ui.off() });
+        try w.print("\n{s}{s}{s}\n", .{ ui.on(.bold), section.title, ui.off() });
         for (section.entries) |e| {
-            try w.print("    {s}{s}{s}", .{ ui.on(.cyan), e.name, ui.off() });
+            try w.print("  {s}{s}{s}", .{ ui.on(.cyan), e.name, ui.off() });
             var used = e.name.len;
             if (e.args.len != 0) {
                 try w.print(" {s}{s}{s}", .{ ui.on(.dim), e.args, ui.off() });
                 used += 1 + e.args.len;
             }
             try padTo(w, used, usage_col);
-            if (e.alias.len != 0) {
-                try w.print("{s}{s}{s}", .{ ui.on(.magenta), e.alias, ui.off() });
-                try padTo(w, e.alias.len, 6);
-            } else {
-                try padTo(w, 0, 6);
-            }
-            try w.print("{s}\n", .{e.desc});
+            const col = try writeWrapped(w, e.desc, 2 + usage_col, 2 + usage_col);
+            try printAliasTail(w, e.alias, col, 2 + usage_col);
+            try w.writeAll("\n");
         }
     }
-    try w.print("\n  {s}--json: status, log, moments, stack, probe, work list, resolve --list. NO_COLOR is respected.{s}\n", .{ ui.on(.dim), ui.off() });
+    try w.print("\n{s}--json{s} on status, log, moments, stack, probe, work list, and resolve --list. {s}NO_COLOR{s} is respected.\n", .{
+        ui.on(.cyan), ui.off(), ui.on(.cyan), ui.off(),
+    });
+    try printFooter(w);
+}
+
+fn writeWrapped(w: *std.Io.Writer, text: []const u8, at: usize, indent: usize) !usize {
+    const limit = ui.terminalWidth();
+    var col = at;
+    var first = true;
+    var it = std.mem.splitScalar(u8, text, ' ');
+    while (it.next()) |word| {
+        if (!first and col + 1 + word.len > limit and limit > indent + word.len) {
+            try w.writeAll("\n");
+            try w.splatByteAll(' ', indent);
+            col = indent;
+        } else if (!first) {
+            try w.writeAll(" ");
+            col += 1;
+        }
+        try w.writeAll(word);
+        col += word.len;
+        first = false;
+    }
+    return col;
 }
 
 fn padTo(w: *std.Io.Writer, used: usize, target: usize) !void {
@@ -446,7 +761,7 @@ fn run(init: std.process.Init) !void {
     defer w.flush() catch {};
 
     if (args.len < 2) {
-        try printUsage(w);
+        try printShort(w);
         return;
     }
 
@@ -470,7 +785,15 @@ fn run(init: std.process.Init) !void {
         }
         try update.run(io, alloc, w, version, nightly);
     } else if (eq(cmd, "help")) {
-        try printUsage(w);
+        if (rest.len != 0 and (eq(rest[0], "--all") or eq(rest[0], "-a"))) {
+            try printUsage(w);
+        } else if (rest.len != 0 and !eq(rest[0], "-h") and !eq(rest[0], "--help")) {
+            try printCommandHelp(w, canonical(rest[0]));
+        } else if (eq(args[1], "help")) {
+            try printShort(w);
+        } else {
+            try printUsage(w);
+        }
     } else if (eq(cmd, "init")) {
         try cmdInit(io, alloc, w);
     } else if (eq(cmd, "save")) {
@@ -628,7 +951,7 @@ fn run(init: std.process.Init) !void {
         if (nearestCommand(cmd)) |guess| {
             try w.print("  did you mean {s}sdt {s}{s}?\n", .{ ui.on(.cyan), guess, ui.off() });
         }
-        try w.print("{s}run `sdt help` for the full list{s}\n", .{ ui.on(.dim), ui.off() });
+        try w.print("{s}run `sdt --help` for the full list{s}\n", .{ ui.on(.dim), ui.off() });
     }
 }
 

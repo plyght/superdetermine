@@ -30,6 +30,27 @@ pub const Color = enum {
 pub fn init(io: std.Io, file: std.Io.File) void {
     enabled = decide(io, file);
     tty = decideTty(io, file);
+    columns = decideColumns(file);
+}
+
+var columns: usize = 80;
+
+pub fn terminalWidth() usize {
+    return columns;
+}
+
+fn decideColumns(file: std.Io.File) usize {
+    if (std.c.getenv("COLUMNS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
+            if (n > 0) return n;
+        }
+    }
+    if (@import("builtin").os.tag != .windows) {
+        var ws: std.posix.winsize = undefined;
+        const rc = std.c.ioctl(file.handle, @intCast(std.c.T.IOCGWINSZ), &ws);
+        if (rc == 0 and ws.col > 0) return ws.col;
+    }
+    return 80;
 }
 
 fn decideTty(io: std.Io, file: std.Io.File) bool {
