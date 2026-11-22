@@ -1,4 +1,5 @@
 const std = @import("std");
+const IgnoreList = @import("ignore.zig").IgnoreList;
 const oid = @import("oid.zig");
 const workspace = @import("workspace.zig");
 const moment = @import("moment.zig");
@@ -15,10 +16,6 @@ pub const Options = struct {
     on_change: ?*const fn () void = null,
 };
 
-fn skipDir(name: []const u8) bool {
-    return std.mem.eql(u8, name, ".sdt") or std.mem.eql(u8, name, ".git");
-}
-
 /// Cheap state signature of the working tree: a BLAKE3 over (path, size,
 /// content hash) of every file, skipping `.sdt` and `.git`. Content is folded
 /// in so a change is detected regardless of mtime resolution. A file that
@@ -28,23 +25,31 @@ pub fn signature(store: *Store, work_dir: std.Io.Dir) !Oid {
     const alloc = store.alloc;
 
     var hasher = oid.Hasher.init();
+    var ignores = try IgnoreList.loadMerged(alloc, work_dir, io);
+    defer ignores.deinit();
+    var buf: [32 * 1024]u8 = undefined;
 
     var walker = try work_dir.walkSelectively(alloc);
     defer walker.deinit();
 
-    while (try walker.next(io)) |entry| {
+    entries: while (try walker.next(io)) |entry| {
+        if (ignores.isIgnored(entry.path, entry.kind == .directory)) continue;
         switch (entry.kind) {
             .directory => {
-                if (!skipDir(std.fs.path.basenamePosix(entry.path))) {
-                    walker.enter(io, entry) catch continue;
-                }
+                walker.enter(io, entry) catch continue;
             },
             .file => {
-                const st = work_dir.statFile(io, entry.path, .{}) catch continue;
-                const data = work_dir.readFileAlloc(io, entry.path, alloc, .unlimited) catch continue;
-                defer alloc.free(data);
-                var content: Oid = undefined;
-                oid.Blake3.hash(data, &content.bytes, .{});
+                const file = work_dir.openFile(io, entry.path, .{}) catch continue;
+                defer file.close(io);
+                const st = file.stat(io) catch continue;
+                var hash = oid.Hasher.init();
+                var reader = file.readerStreaming(io, &.{});
+                while (true) {
+                    const n = reader.interface.readSliceShort(&buf) catch continue :entries;
+                    hash.update(buf[0..n]);
+                    if (n < buf.len) break;
+                }
+                const content = hash.finalOid();
 
                 var sz: [8]u8 = undefined;
                 std.mem.writeInt(u64, &sz, st.size, .big);
@@ -54,7 +59,6 @@ pub fn signature(store: *Store, work_dir: std.Io.Dir) !Oid {
                 hasher.update(&content.bytes);
             },
             .sym_link => {
-                var buf: [4096]u8 = undefined;
                 const n = work_dir.readLink(io, entry.path, &buf) catch continue;
                 hasher.update(entry.path);
                 hasher.update(buf[0..n]);
@@ -110,13 +114,14 @@ pub fn live(
         const git_sig = git.facadeFingerprint(store, work_dir);
         const git_moved = !sameFingerprint(last_git, git_sig);
         if (sig.eql(last) and !git_moved) continue;
-        last = sig;
-        last_git = git_sig;
-
         if (!sched.due(store, sset)) continue;
 
         const r = sched.tick(store, work_dir, ctx, mset, sset) catch continue;
-        if (r.skipped != null) continue;
+        if (r.skipped == null or r.captured) {
+            last = sig;
+            last_git = git_sig;
+        }
+        if (r.skipped != null and !r.captured) continue;
 
         if (r.absorbed) |a| {
             if (a.commits != 0) {
@@ -200,12 +205,16 @@ test "signature changes on content change, stable otherwise" {
     try tmp.dir.createDirPath(io, "work");
     try tmp.dir.writeFile(io, .{ .sub_path = "work/a.txt", .data = "hello" });
 
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/.gitignore", .data = "ignored/\n" });
+    try tmp.dir.createDirPath(io, "work/ignored");
     var work = try tmp.dir.openDir(io, "work", .{ .iterate = true });
     defer work.close(io);
 
     const s1 = try signature(&store, work);
     const s1b = try signature(&store, work);
     try testing.expect(s1.eql(s1b));
+    try tmp.dir.writeFile(io, .{ .sub_path = "work/ignored/cache", .data = "ignored output" });
+    try testing.expect(s1.eql(try signature(&store, work)));
 
     try tmp.dir.writeFile(io, .{ .sub_path = "work/a.txt", .data = "hello world!!" });
     const s2 = try signature(&store, work);

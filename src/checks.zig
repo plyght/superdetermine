@@ -44,6 +44,11 @@ pub const scrubbed_env = [_][*:0]const u8{
 extern "c" fn _exit(code: c_int) noreturn;
 
 extern "c" fn setpgid(pid: std.c.pid_t, pgid: std.c.pid_t) c_int;
+extern "c" fn waitid(idtype: c_uint, id: std.c.pid_t, info: *std.c.siginfo_t, options: c_int) c_int;
+
+const wait_pid: c_uint = 1;
+const wait_exited: c_int = if (builtin.os.tag == .macos) 4 else std.c.W.EXITED;
+const wait_nowait: c_int = if (builtin.os.tag == .macos) 0x20 else std.c.W.NOWAIT;
 
 const PRIO_PROCESS: c_int = 0;
 
@@ -537,6 +542,7 @@ pub const Launch = struct {
     /// Deadline for the run. Zero waits forever, which is what the tests that
     /// run `exit 0` want and what nothing in production should ask for.
     timeout_ms: i64 = 0,
+    deadline: ?std.Io.Timestamp = null,
     kill_grace_ms: i64 = default_kill_grace_ms,
     stdio: Stdio = .silent,
 };
@@ -578,14 +584,15 @@ pub fn run(
         env_z[i] = .{ try aa.dupeZ(u8, pair[0]), try aa.dupeZ(u8, pair[1]) };
     }
 
-    const start_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+    const start = std.Io.Clock.now(.awake, io);
+    if (start.nanoseconds >= (launch.deadline orelse infinite_deadline).nanoseconds) return timedOut();
 
     const pid = fork();
     if (pid < 0) return Error.SpawnFailed;
     if (pid == 0) {
         // Its own process group, so a deadline can reach everything the check
         // started and not just the shell that started it.
-        _ = setpgid(0, 0);
+        if (setpgid(0, 0) != 0) _exit(126);
         if (chdir(cwd_z.ptr) != 0) _exit(126);
         // Layer 4 is enforced, not advisory. A grade that competes with the
         // developer's own build is worse than no grade.
@@ -605,6 +612,7 @@ pub fn run(
                 .inherit => {},
                 .stderr_only => _ = std.c.dup2(2, 1),
             }
+            if (devnull > 2) _ = std.c.close(devnull);
         }
         _ = execvp(cargv[0].?, cargv.ptr);
         _exit(127);
@@ -615,23 +623,25 @@ pub fn run(
     // below cannot signal a group that does not exist.
     _ = setpgid(pid, pid);
 
+    const hard_deadline = launch.deadline orelse infinite_deadline;
+    const cutoff = if (launch.timeout_ms > 0)
+        earlier(hard_deadline, start.addDuration(.fromMilliseconds(launch.timeout_ms)))
+    else
+        hard_deadline;
     var status: c_int = 0;
-    var timed_out = false;
-    if (launch.timeout_ms <= 0) {
-        _ = std.c.waitpid(pid, &status, 0);
-    } else if (!reap(io, pid, &status, launch.timeout_ms)) {
-        timed_out = true;
-        // Ask the whole group, then insist. A check that spawned a dev server
-        // or a database is only over when its children are.
+    const timed_out = !try reap(io, pid, &status, cutoff);
+    // Ask the whole group, then insist. A check that spawned a dev server
+    // or a database is only over when its children are.
+    if (timed_out) {
         _ = std.c.kill(-pid, .TERM);
-        if (!reap(io, pid, &status, launch.kill_grace_ms)) {
+        const grace = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(launch.kill_grace_ms));
+        if (!try reap(io, pid, &status, earlier(hard_deadline, grace))) {
             _ = std.c.kill(-pid, .KILL);
-            _ = std.c.waitpid(pid, &status, 0);
+            try finishWait(pid, &status);
         }
     }
 
-    const end_ns = std.Io.Clock.now(.awake, io).nanoseconds;
-    const elapsed_ms: u32 = @intCast(@divTrunc(end_ns - start_ns, 1_000_000));
+    const elapsed_ms: u32 = @intCast(@min(std.math.maxInt(u32), start.durationTo(std.Io.Clock.now(.awake, io)).toMilliseconds()));
 
     return .{
         .exit_code = exitCode(status),
@@ -640,22 +650,51 @@ pub fn run(
     };
 }
 
+const infinite_deadline = std.Io.Timestamp{ .nanoseconds = std.math.maxInt(i96) };
+
+fn earlier(a: std.Io.Timestamp, b: std.Io.Timestamp) std.Io.Timestamp {
+    return if (a.nanoseconds < b.nanoseconds) a else b;
+}
+
+fn timedOut() RunOutcome {
+    return .{ .exit_code = 124, .duration_ms = 0, .outcome = .timeout };
+}
+
+fn errno() std.c.E {
+    return @enumFromInt(std.c._errno().*);
+}
+
+fn finishWait(pid: std.c.pid_t, status: *c_int) !void {
+    while (std.c.waitpid(pid, status, 0) != pid) {
+        if (errno() != .INTR) return Error.SpawnFailed;
+    }
+}
+
 /// Wait up to `budget_ms` for the child. True when it was reaped.
 ///
 /// The clock is `.awake`, so a machine that slept for an hour mid-run does not
 /// come back to a check that has "timed out" without ever having been given the
 /// time. That is the same failure this whole taxonomy exists to stop caching.
-fn reap(io: std.Io, pid: std.c.pid_t, status: *c_int, budget_ms: i64) bool {
-    const start_ns = std.Io.Clock.now(.awake, io).nanoseconds;
+fn reap(io: std.Io, pid: std.c.pid_t, status: *c_int, cutoff: std.Io.Timestamp) !bool {
+    const nonblocking = cutoff.nanoseconds != infinite_deadline.nanoseconds;
+    const opts = wait_exited | wait_nowait | if (nonblocking) @as(c_int, std.c.W.NOHANG) else 0;
     var nap_ms: i64 = 2;
     while (true) {
-        const got = std.c.waitpid(pid, status, @intCast(std.c.W.NOHANG));
-        if (got == pid) return true;
-        if (got < 0) return true;
-        const now_ns = std.Io.Clock.now(.awake, io).nanoseconds;
-        if (@divTrunc(now_ns - start_ns, 1_000_000) >= budget_ms) return false;
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(nap_ms), .awake) catch {};
-        if (nap_ms < 100) nap_ms *= 2;
+        var info = std.mem.zeroes(std.c.siginfo_t);
+        if (waitid(wait_pid, pid, &info, opts) != 0) {
+            if (errno() == .INTR) continue;
+            return Error.SpawnFailed;
+        }
+        if (@intFromEnum(info.signo) != 0) {
+            _ = std.c.kill(-pid, .KILL);
+            try finishWait(pid, status);
+            return true;
+        }
+        const left = std.Io.Clock.now(.awake, io).durationTo(cutoff);
+        if (left.nanoseconds <= 0) return false;
+        const sleep_for = @min(left.nanoseconds, std.Io.Duration.fromMilliseconds(nap_ms).nanoseconds);
+        std.Io.sleep(io, .fromNanoseconds(sleep_for), .awake) catch {};
+        nap_ms = @min(nap_ms * 2, 128);
     }
 }
 
@@ -723,25 +762,30 @@ pub fn gradeEntries(
 
     const command = set.command(opts.tier);
     if (command.len == 0) return Error.NoCheckConfigured;
+    const deadline = opts.launch.deadline orelse infinite_deadline;
+    if (std.Io.Clock.now(.awake, io).nanoseconds >= deadline.nanoseconds) return .{ .outcome = timedOut() };
 
     const src_abs = try work_dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(src_abs);
 
     const parent = opts.scratch_parent orelse std.fs.path.dirname(src_abs) orelse "/tmp";
-    const dst_abs = try std.fmt.allocPrint(alloc, "{s}/.sdt-grade-{s}-{s}", .{
-        parent, label, opts.tier.label(),
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const dst_abs = try std.fmt.allocPrint(alloc, "{s}/.sdt-grade-{s}-{s}-{s}", .{
+        parent, label, opts.tier.label(), &std.fmt.bytesToHex(nonce, .lower),
     });
     defer alloc.free(dst_abs);
 
     // A leftover clone from a killed run must not poison this one.
-    removeTree(io, dst_abs);
-    branches.work(io, src_abs, dst_abs) catch return Error.CloneFailed;
     defer removeTree(io, dst_abs);
+    branches.work(io, src_abs, dst_abs) catch return Error.CloneFailed;
+    if (std.Io.Clock.now(.awake, io).nanoseconds >= deadline.nanoseconds) return .{ .outcome = timedOut() };
 
     var dst = try std.Io.Dir.openDirAbsolute(io, dst_abs, .{ .iterate = true });
     defer dst.close(io);
 
     try reconcile(store, dst, entries);
+    if (std.Io.Clock.now(.awake, io).nanoseconds >= deadline.nanoseconds) return .{ .outcome = timedOut() };
 
     // Arming has to come after both the clone and the reconcile: a clone
     // preserves access times, and reconciling writes files. Arm any earlier and
@@ -905,6 +949,11 @@ test "a check that outruns its deadline is a timeout, and is not cacheable" {
     const ok = try run(alloc, io, abs, "exit 0", .{ .timeout_ms = 30_000 });
     try testing.expectEqual(verdict.Outcome.pass, ok.outcome);
     try testing.expect(ok.cacheable());
+
+    const deadline = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(50));
+    const capped = try run(alloc, io, abs, "sleep 30", .{ .timeout_ms = 30_000, .deadline = deadline });
+    try testing.expectEqual(verdict.Outcome.timeout, capped.outcome);
+    try testing.expect(capped.duration_ms < 2000);
 }
 
 test "a killed check is not cached as a red" {
@@ -943,7 +992,7 @@ test "the deadline reaches the whole process group, leaving no orphan" {
         alloc,
         io,
         abs,
-        "sleep 60 & echo $! > child.pid; sleep 60",
+        "(trap '' TERM; exec sleep 60) & echo $! > child.pid; sleep 60",
         .{ .timeout_ms = 300, .kill_grace_ms = 50 },
     );
     try testing.expectEqual(verdict.Outcome.timeout, r.outcome);
@@ -962,6 +1011,20 @@ test "the deadline reaches the whole process group, leaving no orphan" {
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
     }
     try testing.expect(gone);
+}
+
+test "a successful check stops background work left in its process group" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(abs);
+
+    const r = try run(alloc, io, abs, "(sleep 1; touch leaked) & exit 0", .{});
+    try testing.expectEqual(verdict.Outcome.pass, r.outcome);
+    try std.Io.sleep(io, .fromMilliseconds(1200), .awake);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "leaked", .{}));
 }
 
 test "classify separates the check's own answer from the machine's" {

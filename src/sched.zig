@@ -41,6 +41,7 @@ const Oid = oid.Oid;
 /// because somebody else is already doing it.
 pub const stamp_path = "moments/last-tick";
 pub const lock_path = "moments/tick.lock";
+const grade_lock_path = "moments/grade.lock";
 
 pub const Settings = struct {
     /// Shortest gap between ticks. Three seconds matches the debounce that
@@ -90,12 +91,15 @@ pub const Lock = struct {
 /// Never blocks. Two `sdt` processes noticing the same change must not both
 /// grade it, and the loser has nothing useful to wait for.
 pub fn tryLock(store: *Store) !?Lock {
-    const io = store.io;
-    store.root.createDirPath(io, "moments") catch {};
-    const file = store.root.createFile(io, lock_path, .{
+    store.root.createDirPath(store.io, "moments") catch {};
+    return fileLock(store.io, store.root, lock_path, true);
+}
+
+fn fileLock(io: std.Io, dir: std.Io.Dir, path: []const u8, nonblocking: bool) !?Lock {
+    const file = dir.createFile(io, path, .{
         .truncate = false,
         .lock = .exclusive,
-        .lock_nonblocking = true,
+        .lock_nonblocking = nonblocking,
     }) catch |e| switch (e) {
         error.WouldBlock => return null,
         else => return e,
@@ -186,6 +190,7 @@ fn reap(store: *Store, work_dir: std.Io.Dir) void {
     const io = store.io;
     store.root.deleteFile(io, lock_path) catch {};
     store.root.deleteFile(io, stamp_path) catch {};
+    store.root.deleteFile(io, grade_lock_path) catch {};
     store.root.deleteDir(io, "moments") catch {};
     work_dir.deleteDir(io, store_mod.dir_name) catch {};
 
@@ -238,11 +243,22 @@ fn tickInner(
     mset: moment.Settings,
     set: Settings,
 ) !TickResult {
+    const started = std.Io.Clock.now(.awake, store.io);
+    var out = try captureTick(store, work_dir, mset);
+    if (out.skipped == null) try gradeTick(ctx, set, started, false, &out);
+    return out;
+}
+
+fn captureTick(store: *Store, work_dir: std.Io.Dir, mset: moment.Settings) !TickResult {
+    if (!alive(store)) {
+        reap(store, work_dir);
+        return .{ .skipped = "this repo is being removed" };
+    }
     const alloc = store.alloc;
     const io = store.io;
 
     const lock = (try tryLock(store)) orelse
-        return .{ .skipped = "another sdt process is already grading" };
+        return .{ .skipped = "another sdt process is already capturing" };
     defer lock.release();
 
     // Stamp before the work, not after: a tick that takes two minutes must not
@@ -276,39 +292,64 @@ fn tickInner(
         alloc.free(cap.captured.branch);
     }
 
-    if (!ctx.set.enabled) return out;
+    return out;
+}
+
+fn gradeTick(ctx: grade.Context, set: Settings, awake_started: std.Io.Timestamp, automated: bool, out: *TickResult) !void {
+    const store = ctx.store;
+    const work_dir = ctx.work_dir;
+    const alloc = ctx.alloc;
+    const io = store.io;
+    const started = nowMillis(io);
+    if (!ctx.set.enabled or !alive(store)) return;
+    const lock = (try fileLock(io, store.root, grade_lock_path, !automated)) orelse {
+        out.skipped = "another sdt process is already grading";
+        return;
+    };
+    defer lock.release();
+    if (!alive(store)) return;
     if (!powerOk(alloc, set)) {
         out.skipped = "on battery below the floor, so nothing was graded";
-        return out;
+        return;
     }
 
     const tier: verdict.Tier = if (ctx.set.has(.full)) .full else .fast;
-    if (!ctx.set.has(tier)) return out;
-
-    const all = try moment.readAll(store, alloc);
-    defer moment.freeMoments(alloc, all);
-    if (all.len == 0) return out;
+    if (!ctx.set.has(tier)) return;
 
     // Trigger 1, necessary: the head, now that the tree is quiet.
-    const head = all[all.len - 1];
-    const head_v = grade.gradeState(ctx, head, tier) catch return out;
+    const head = (try moment.last(store, alloc)) orelse return;
+    defer alloc.free(head.branch);
+    const head_v = grade.gradeState(ctx, head, tier) catch return;
     if (head_v.duration_ms != 0) out.graded += 1;
+    if (!head_v.outcome.cacheable()) return;
 
-    if (nowMillis(io) - started > set.budget_ms) return out;
+    var extra = ctx;
+    extra.deadline = awake_started.addDuration(std.Io.Duration.fromMilliseconds(set.budget_ms));
+    if (std.Io.Clock.now(.awake, io).nanoseconds >= extra.deadline.?.nanoseconds) return;
+
+    const fset = flow.settings(store, alloc);
+    defer fset.deinit(alloc);
+    if (automated and head_v.result == .green and fset.cut != .green) return;
 
     var ix = try verdict.Index.load(store, alloc);
     defer ix.deinit();
+    const all = try moment.readAll(store, alloc);
+    defer moment.freeMoments(alloc, all);
+    if (all.len == 0 or !std.mem.eql(u8, &head.id, &all[all.len - 1].id)) return;
 
     // Commitless flow: a red-to-green transition is a boundary worth keeping,
     // so cut a change there. Every change cut this way is verified by
     // construction, which is the property git histories are always claimed to
     // have and never do. Off unless `flow.cut = green`.
     {
-        const fset = flow.settings(store, alloc);
-        defer fset.deinit(alloc);
-        if (fset.cut == .green) {
-            const prev_result = previousResult(ctx, store, alloc, all, tier, head.full_tree);
+        if (head_v.result == .green and fset.cut == .green) {
+            const prev_result = previousResult(ctx, &ix, all, tier, head.full_tree);
             if (flow.shouldCut(fset.cut, prev_result, head_v.result)) {
+                const capture_lock = (try tryLock(store)) orelse return;
+                defer capture_lock.release();
+                const current = (try moment.last(store, alloc)) orelse return;
+                defer alloc.free(current.branch);
+                if (!std.mem.eql(u8, &head.id, &current.id)) return;
                 const author = config.author(store, alloc) catch null;
                 defer if (author) |a| alloc.free(a);
                 const cut = flow.cutAt(
@@ -321,7 +362,12 @@ fn tickInner(
                 ) catch null;
                 if (cut != null) {
                     out.cut = true;
-                    if (facade_path) |p| git.syncColocated(store, p) catch {};
+                    if (git.colocatedSyncOn(store, work_dir)) {
+                        if (work_dir.realPathFileAlloc(io, ".", alloc)) |p| {
+                            defer alloc.free(p);
+                            git.syncColocated(store, p) catch {};
+                        } else |_| {}
+                    }
                 }
             }
         }
@@ -330,25 +376,21 @@ fn tickInner(
     // Trigger 2, on transition: the head just went red, so find where.
     if (grade.headState(ctx, all, &ix, tier)) |hs| {
         if (hs.isTransition()) {
-            const b = try grade.bisect(ctx, all, hs.prior_green.?, hs.head, tier);
+            const b = try grade.bisect(extra, all, hs.prior_green.?, hs.head, tier);
             out.graded += b.runs;
             out.boundary = b;
-            return out;
+            return;
         }
     }
 
-    if (nowMillis(io) - started > set.budget_ms) return out;
+    if (automated or std.Io.Clock.now(.awake, io).nanoseconds >= extra.deadline.?.nanoseconds) return;
 
     // Trigger 3, opportunistic: spare capacity only, and only the single most
     // informative state available.
-    var ix2 = try verdict.Index.load(store, alloc);
-    defer ix2.deinit();
-    if (grade.largestUngradedMidpoint(ctx, all, &ix2, tier)) |mid| {
-        const v = grade.gradeState(ctx, all[mid], tier) catch return out;
+    if (grade.largestUngradedMidpoint(ctx, all, &ix, tier)) |mid| {
+        const v = grade.gradeState(extra, all[mid], tier) catch return;
         if (v.duration_ms != 0) out.graded += 1;
     }
-
-    return out;
 }
 
 /// Take one refs-only look at the remote, if it has been long enough.
@@ -375,14 +417,11 @@ fn freshen(store: *Store, alloc: std.mem.Allocator) !bool {
 /// whether the head is a transition rather than a continuation.
 fn previousResult(
     ctx: grade.Context,
-    store: *Store,
-    alloc: std.mem.Allocator,
+    ix: *const verdict.Index,
     all: []const moment.Moment,
     tier: verdict.Tier,
     tree: Oid,
 ) ?verdict.Result {
-    var ix = verdict.Index.load(store, alloc) catch return null;
-    defer ix.deinit();
     const cmd = verdict.commandHash(ctx.set.command(tier));
 
     var i = all.len;
@@ -392,6 +431,125 @@ fn previousResult(
         if (ix.get(.{ .tree = all[i].full_tree, .tier = tier, .command = cmd })) |v| return v.result;
     }
     return null;
+}
+
+const Queue = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+
+    fn open(io: std.Io, alloc: std.mem.Allocator) !Queue {
+        const home = std.c.getenv("HOME") orelse return error.NoHome;
+        if (!std.fs.path.isAbsolute(std.mem.span(home))) return error.NoHome;
+        const path = try std.fs.path.join(alloc, &.{ std.mem.span(home), ".sdt-grade-queue" });
+        defer alloc.free(path);
+        std.Io.Dir.createDirAbsolute(io, path, .fromMode(0o700)) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+        const dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true, .follow_symlinks = false });
+        errdefer dir.close(io);
+        if ((try dir.stat(io)).permissions.toMode() & 0o077 != 0) return error.InsecureQueue;
+        return .{ .io = io, .dir = dir };
+    }
+
+    fn key(path: []const u8) [Oid.len * 2]u8 {
+        var buf: [Oid.len * 2]u8 = undefined;
+        _ = Oid.ofBytes(path).toHex(&buf);
+        return buf;
+    }
+
+    fn enqueue(self: Queue, path: []const u8, check_path: []const u8) !void {
+        const name = key(path);
+        var f = try self.dir.createFileAtomic(self.io, &name, .{ .replace = true });
+        defer f.deinit(self.io);
+        if (path.len + 1 + check_path.len > 128 * 1024) return error.GradeQueueEntryTooLarge;
+        try f.file.writeStreamingAll(self.io, path);
+        try f.file.writeStreamingAll(self.io, "\x00");
+        try f.file.writeStreamingAll(self.io, check_path);
+        try f.replace(self.io);
+    }
+
+    fn pending(self: Queue) !?[Oid.len * 2]u8 {
+        var it = self.dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .file or entry.name.len != Oid.len * 2) continue;
+            var bytes: [Oid.len]u8 = undefined;
+            _ = std.fmt.hexToBytes(&bytes, entry.name) catch continue;
+            return entry.name[0 .. Oid.len * 2].*;
+        }
+        return null;
+    }
+
+    fn drain(self: Queue, alloc: std.mem.Allocator) !void {
+        while (true) {
+            {
+                const lock = (try fileLock(self.io, self.dir, "worker.lock", true)) orelse return;
+                defer lock.release();
+                while (true) {
+                    const job = self.dir.readFileAlloc(self.io, "running", alloc, .limited(128 * 1024)) catch |e| switch (e) {
+                        error.FileNotFound => {
+                            const name = (try self.pending()) orelse break;
+                            self.dir.rename(&name, self.dir, "running", self.io) catch |err| switch (err) {
+                                error.FileNotFound => {},
+                                else => return err,
+                            };
+                            continue;
+                        },
+                        error.StreamTooLong => {
+                            try self.dir.deleteFile(self.io, "running");
+                            continue;
+                        },
+                        else => return e,
+                    };
+                    defer alloc.free(job);
+                    if (std.mem.indexOfScalar(u8, job, 0)) |sep| {
+                        runQueued(self.io, alloc, job[0..sep], job[sep + 1 ..]) catch |e|
+                            std.log.warn("background grade failed: {s}", .{@errorName(e)});
+                    }
+                    try self.dir.deleteFile(self.io, "running");
+                }
+            }
+            if ((try self.pending()) == null) return;
+        }
+    }
+};
+
+pub fn background(store: *Store, work_dir: std.Io.Dir, mset: moment.Settings) !void {
+    const r = try captureTick(store, work_dir, mset);
+    if (r.skipped != null) return;
+    const io = store.io;
+    const alloc = store.alloc;
+    const set = checks.settings(store, alloc);
+    defer set.deinit(alloc);
+    if (!set.enabled or (!set.has(.full) and !set.has(.fast))) return;
+    const path = try work_dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(path);
+    const queue = try Queue.open(io, alloc);
+    defer queue.dir.close(io);
+    try queue.enqueue(path, installPath());
+    try queue.drain(alloc);
+}
+
+fn runQueued(io: std.Io, alloc: std.mem.Allocator, path: []const u8, check_path: []const u8) !void {
+    if (!std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, check_path, 0) != null) return;
+    var work = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return;
+    defer work.close(io);
+    var store = Store.open(io, alloc, work) catch return;
+    defer store.deinit();
+    if (!alive(&store)) return;
+    const set = checks.settings(&store, alloc);
+    defer set.deinit(alloc);
+    var rules = warrant.pathRules(&store, alloc);
+    defer rules.deinit(alloc);
+    var result: TickResult = .{};
+    try gradeTick(.{
+        .store = &store,
+        .work_dir = work,
+        .alloc = alloc,
+        .set = set,
+        .rules = rules,
+        .check_path = check_path,
+    }, settings(&store, alloc), std.Io.Clock.now(.awake, io), true, &result);
 }
 
 // --- launchd (macOS) ---
@@ -601,6 +759,8 @@ pub fn install(
     const target = try std.fmt.allocPrint(alloc, "gui/{d}", .{uid});
     defer alloc.free(target);
 
+    _ = prune(io, alloc);
+
     // Replace rather than stack: bootout first, ignoring "was not loaded".
     const spec = try std.fmt.allocPrint(alloc, "gui/{d}/{s}", .{ uid, label });
     defer alloc.free(spec);
@@ -720,6 +880,11 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator, repo_abs: []const u8) !vo
     std.Io.Dir.cwd().deleteFile(io, legacy_plist) catch {};
 
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    if (Queue.open(io, alloc)) |queue| {
+        defer queue.dir.close(io);
+        const name = Queue.key(repo_abs);
+        queue.dir.deleteFile(io, &name) catch {};
+    } else |_| {}
 }
 
 // --- tests ---
@@ -741,6 +906,29 @@ test "the tick lock is exclusive and non-blocking" {
 
     const again = (try tryLock(&store)).?;
     again.release();
+}
+
+test "grade queue coalesces each repo and does not wait for the worker" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const queue: Queue = .{ .io = io, .dir = tmp.dir };
+    const work = "/no-sdt-repo";
+    const lock = (try fileLock(io, tmp.dir, "worker.lock", true)).?;
+    {
+        defer lock.release();
+        try queue.enqueue(work, "/old");
+        try queue.enqueue(work, "/new");
+        try queue.drain(alloc);
+        const name = (try queue.pending()).?;
+        try testing.expectEqual(Queue.key(work), name);
+        const data = try tmp.dir.readFileAlloc(io, &name, alloc, .limited(100));
+        defer alloc.free(data);
+        try testing.expectEqualStrings(work ++ "\x00/new", data);
+    }
+    try queue.drain(alloc);
+    try testing.expectEqual(null, try queue.pending());
 }
 
 test "due gates on the stamp, and the stamp is written before work" {

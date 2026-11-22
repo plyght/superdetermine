@@ -5067,7 +5067,7 @@ fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
     try w.flush();
 
     const ctx = gradeContext(alloc, &s, work, set, rules);
-    try watch.live(&s, work, ctx, mset, .{});
+    try watch.live(&s, work, ctx, mset, sched.settings(&s, alloc));
 }
 
 // --- verified history ---
@@ -5677,6 +5677,14 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
             return 0;
         };
     }
+    if (rest.len == 1 and eq(rest[0], "--once")) {
+        var work = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer work.close(io);
+        var s = Store.open(io, alloc, work) catch return 0;
+        defer s.deinit();
+        try sched.background(&s, work, momentSettings(&s, alloc));
+        return 0;
+    }
     var s = (try openRepo(io, alloc, w)) orelse return 0;
     defer s.deinit();
     var work = try openWork(io);
@@ -5747,8 +5755,6 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     const r = try sched.tick(&s, work, ctx, momentSettings(&s, alloc), sched.settings(&s, alloc));
 
     const tier: verdict.Tier = if (set.has(.full)) .full else .fast;
-    const inputs = try grade.currentInputs(ctx);
-    defer inputs.deinit(alloc);
     var report = grade.Report{
         .status = .ungraded,
         .tier = tier,
@@ -5762,10 +5768,10 @@ fn cmdGrade(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer, rest: []con
     if (!set.enabled or !set.has(tier)) {
         report.status = .no_check;
     } else if (r.skipped == null) {
-        const all = try moment.readAll(&s, alloc);
-        defer moment.freeMoments(alloc, all);
-        if (all.len != 0) {
-            const head = all[all.len - 1];
+        if (try moment.last(&s, alloc)) |head| {
+            defer alloc.free(head.branch);
+            const inputs = try grade.currentInputs(ctx);
+            defer inputs.deinit(alloc);
             var ix = try verdict.Index.load(&s, alloc);
             defer ix.deinit();
             if (ix.get(.{

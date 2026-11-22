@@ -47,6 +47,8 @@ pub const Context = struct {
     rules: warrant.PathRules,
     tracer_mode: tracer.Mode = .conservative,
     scratch_parent: ?[]const u8 = null,
+    deadline: ?std.Io.Timestamp = null,
+    check_path: ?[]const u8 = null,
 };
 
 /// The historical key: what the log knows about this tree at this tier under
@@ -70,6 +72,11 @@ fn cacheKey(ctx: Context, tree: Oid, tier: verdict.Tier, inputs: Oid) verdict.Ke
 
 fn nowMillis(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1_000_000));
+}
+
+fn remainingMs(ctx: Context) i64 {
+    const deadline = ctx.deadline orelse return std.math.maxInt(i64);
+    return std.Io.Clock.now(.awake, ctx.store.io).durationTo(deadline).toMilliseconds();
 }
 
 /// What the declared inputs hold right now. Empty when none are declared, which
@@ -211,11 +218,19 @@ fn awaitClaimant(ctx: Context, key: verdict.Key) !?verdict.Verdict {
     );
     if (wait <= 0) return null;
 
-    const deadline = nowMillis(io) + wait;
-    while (nowMillis(io) < deadline) {
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(claim_poll_ms), .awake) catch {};
-        const now = nowMillis(io);
-        if (try verdict.lookupFresh(ctx.store, alloc, key, now, ctx.set.fresh_ms)) |landed| {
+    const deadline = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(wait));
+    var prior_stat: ?std.Io.File.Stat = null;
+    while (true) {
+        const left = @min(remainingMs(ctx), std.Io.Clock.now(.awake, io).durationTo(deadline).toMilliseconds());
+        if (left <= 0) break;
+        std.Io.sleep(io, .fromMilliseconds(@min(left, claim_poll_ms)), .awake) catch return null;
+        const stat = ctx.store.root.statFile(io, verdict.log_path, .{}) catch null;
+        if (stat) |s| if (prior_stat) |p| {
+            if (s.inode == p.inode and s.size == p.size and s.mtime.nanoseconds == p.mtime.nanoseconds and
+                s.ctime.nanoseconds == p.ctime.nanoseconds) continue;
+        };
+        prior_stat = stat;
+        if (try verdict.lookupFresh(ctx.store, alloc, key, nowMillis(io), ctx.set.fresh_ms)) |landed| {
             return landed;
         }
     }
@@ -237,8 +252,13 @@ pub fn gradeState(
     m: Moment,
     tier: verdict.Tier,
 ) !verdict.Verdict {
+    return gradeStateWithHistory(ctx, m, tier, null);
+}
+
+fn gradeStateWithHistory(ctx: Context, m: Moment, tier: verdict.Tier, history: ?[]const Moment) !verdict.Verdict {
     const alloc = ctx.alloc;
     if (!ctx.set.has(tier)) return checks.Error.NoCheckConfigured;
+    if (remainingMs(ctx) <= 0) return error.GradeBudgetExhausted;
 
     const inputs = try currentInputs(ctx);
     defer inputs.deinit(alloc);
@@ -256,17 +276,17 @@ pub fn gradeState(
     // A wait that ended in nothing still consumed wall clock, and everything
     // below dates a run against `now`.
     now = nowMillis(ctx.store.io);
+    if (remainingMs(ctx) <= 0) return error.GradeBudgetExhausted;
 
     const entries = try moment.entriesOf(ctx.store, m);
     defer workspace.freeTreeEntries(alloc, entries);
 
     // The nearest already-graded predecessor, which is what both the read-set
     // shortcut and the warrant's span are measured against.
-    const prev = try nearestGraded(ctx, m, tier);
-    defer if (prev) |p| {
-        alloc.free(p.m.branch);
-        workspace.freeTreeEntries(alloc, p.entries);
-    };
+    const owned_history = if (history == null) try moment.readAll(ctx.store, alloc) else null;
+    defer if (owned_history) |all| moment.freeMoments(alloc, all);
+    const prev = try nearestGraded(ctx, m, key, history orelse owned_history.?);
+    defer if (prev) |p| workspace.freeTreeEntries(alloc, p.entries);
 
     var span = if (prev) |p|
         try warrant.spanBetween(ctx.store, alloc, p.entries, entries, ctx.rules)
@@ -304,13 +324,18 @@ pub fn gradeState(
 
     var id_hex: [16]u8 = undefined;
     _ = m.shortId(&id_hex);
+    const env = [1][2][]const u8{.{ "PATH", ctx.check_path orelse "" }};
     const graded = try checks.gradeEntries(
         ctx.store,
         ctx.work_dir,
         entries,
         id_hex[0..12],
         ctx.set,
-        .{ .tier = tier, .scratch_parent = ctx.scratch_parent },
+        .{
+            .tier = tier,
+            .scratch_parent = ctx.scratch_parent,
+            .launch = .{ .env = if (ctx.check_path != null) &env else &.{}, .deadline = ctx.deadline },
+        },
     );
     defer graded.deinit(alloc);
     const outcome = graded.outcome;
@@ -351,7 +376,7 @@ pub fn gradeState(
     // Discrimination costs one run and is only worth asking when the check
     // itself changed. Memoized through the same verdict cache as everything
     // else, because the hybrid tree is addressed by content like any other.
-    if (v.result == .green and prev != null and warrant.shouldMeasureDiscrimination(span)) {
+    if (v.result == .green and prev != null and remainingMs(ctx) > 0 and warrant.shouldMeasureDiscrimination(span)) {
         v.discrimination = measureDiscrimination(ctx, prev.?.entries, entries, tier, inputs_oid) catch .unknown;
     }
 
@@ -444,40 +469,25 @@ pub fn gradeChange(
 }
 
 const Graded = struct {
-    m: Moment,
     entries: []object.TreeEntry,
     verdict: verdict.Verdict,
 };
 
 /// The most recent moment strictly before `m` that already has a verdict at
 /// this tier. Null when `m` is the first graded state on this branch.
-fn nearestGraded(ctx: Context, m: Moment, tier: verdict.Tier) !?Graded {
-    const alloc = ctx.alloc;
-    const all = try moment.readAll(ctx.store, alloc);
-    defer moment.freeMoments(alloc, all);
-
-    var ix = try verdict.Index.load(ctx.store, alloc);
+fn nearestGraded(ctx: Context, m: Moment, key: verdict.Key, all: []const Moment) !?Graded {
+    var ix = try verdict.Index.load(ctx.store, ctx.alloc);
     defer ix.deinit();
 
+    var prior_key = key;
     var i = all.len;
     while (i > 0) {
         i -= 1;
         if (all[i].ms >= m.ms) continue;
-        const v = ix.get(keyFor(ctx, all[i].full_tree, tier)) orelse continue;
+        prior_key.tree = all[i].full_tree;
+        const v = ix.get(prior_key) orelse continue;
         const entries = moment.entriesOf(ctx.store, all[i]) catch continue;
-        return .{
-            .m = .{
-                .id = all[i].id,
-                .ms = all[i].ms,
-                .full_tree = all[i].full_tree,
-                .repr = all[i].repr,
-                .kind = all[i].kind,
-                .cause = all[i].cause,
-                .branch = try alloc.dupe(u8, all[i].branch),
-            },
-            .entries = entries,
-            .verdict = v,
-        };
+        return .{ .entries = entries, .verdict = v };
     }
     return null;
 }
@@ -510,6 +520,7 @@ fn measureDiscrimination(
 
     var hex: [Oid.len * 2]u8 = undefined;
     _ = hybrid_tree.toHex(&hex);
+    const env = [1][2][]const u8{.{ "PATH", ctx.check_path orelse "" }};
     // No tracing here: this run exists only to answer one yes/no question, and
     // its read-set would never be consulted.
     const graded = try checks.gradeEntries(
@@ -518,7 +529,12 @@ fn measureDiscrimination(
         hybrid,
         hex[0..12],
         ctx.set,
-        .{ .tier = tier, .scratch_parent = ctx.scratch_parent, .trace = false },
+        .{
+            .tier = tier,
+            .scratch_parent = ctx.scratch_parent,
+            .trace = false,
+            .launch = .{ .env = if (ctx.check_path != null) &env else &.{}, .deadline = ctx.deadline },
+        },
     );
     defer graded.deinit(alloc);
 
@@ -574,9 +590,9 @@ pub fn bisect(
     var hi = hi_red;
     var runs: usize = 0;
 
-    while (hi - lo > 1) {
+    while (hi - lo > 1 and remainingMs(ctx) > 0) {
         const mid = lo + (hi - lo) / 2;
-        const v = gradeState(ctx, moments[mid], tier) catch break;
+        const v = gradeStateWithHistory(ctx, moments[mid], tier, moments) catch break;
         if (v.duration_ms != 0) runs += 1;
         // A midpoint that timed out or was killed said nothing about itself, and
         // reading it as red would move the boundary to a state never measured.
@@ -603,8 +619,10 @@ pub fn largestUngradedMidpoint(
     var best_mid: ?usize = null;
 
     var run_start: ?usize = null;
+    var key = keyFor(ctx, Oid.zero(), tier);
     for (moments, 0..) |m, i| {
-        const graded = ix.get(keyFor(ctx, m.full_tree, tier)) != null;
+        key.tree = m.full_tree;
+        const graded = ix.get(key) != null;
         if (!graded) {
             if (run_start == null) run_start = i;
             continue;
@@ -649,14 +667,16 @@ pub fn headState(
 ) ?HeadState {
     if (moments.len == 0) return null;
     const head = moments.len - 1;
-    const head_v = ix.get(keyFor(ctx, moments[head].full_tree, tier));
+    var key = keyFor(ctx, moments[head].full_tree, tier);
+    const head_v = ix.get(key);
 
     var prior_green: ?usize = null;
     if (head_v != null and head_v.?.result == .red) {
         var i = head;
         while (i > 0) {
             i -= 1;
-            const v = ix.get(keyFor(ctx, moments[i].full_tree, tier)) orelse continue;
+            key.tree = moments[i].full_tree;
+            const v = ix.get(key) orelse continue;
             if (v.result == .green) {
                 prior_green = i;
                 break;
@@ -882,6 +902,22 @@ test "a tree is never graded twice" {
     try testing.expectEqual(verdict.Result.green, second.result);
     // A cache hit costs no time at all.
     try testing.expectEqual(first.duration_ms, second.duration_ms);
+}
+
+test "a grading context bounds work and sets only the check's PATH" {
+    const alloc = testing.allocator;
+    var f = try fixture(alloc);
+    defer f.deinit(alloc);
+    const m = try snap(&f, alloc, "a.txt", "one");
+    defer alloc.free(m.branch);
+
+    const set = checks.Settings{ .enabled = true, .full = "test \"$PATH\" = /sdt/test/bin" };
+    var ctx = f.ctx(alloc, set);
+    ctx.check_path = "/sdt/test/bin";
+    ctx.deadline = std.Io.Clock.now(.awake, f.store.io);
+    try testing.expectError(error.GradeBudgetExhausted, gradeState(ctx, m, .full));
+    ctx.deadline = null;
+    try testing.expectEqual(verdict.Result.green, (try gradeState(ctx, m, .full)).result);
 }
 
 test "grading records green and red from the real command" {

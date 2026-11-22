@@ -559,14 +559,7 @@ pub fn readAll(store: *Store, alloc: std.mem.Allocator) ![]Moment {
 /// The most recent moment, or null when nothing has been captured.
 /// Caller frees `.branch`.
 pub fn last(store: *Store, alloc: std.mem.Allocator) !?Moment {
-    const all = try readAll(store, alloc);
-    defer {
-        // Free every branch except the one we hand back.
-        for (all[0..if (all.len == 0) 0 else all.len - 1]) |m| alloc.free(m.branch);
-        alloc.free(all);
-    }
-    if (all.len == 0) return null;
-    return all[all.len - 1];
+    return (try logHead(store, alloc)).prev;
 }
 
 pub fn count(store: *Store, alloc: std.mem.Allocator) !usize {
@@ -694,6 +687,7 @@ fn rebuildHead(store: *Store, alloc: std.mem.Allocator) !Head {
     while (it.next()) |line| {
         if (line.len == 0) continue;
         const m = parseLine(alloc, line) catch continue;
+        // Free every branch except the one we hand back.
         if (prev) |p| alloc.free(p.branch);
         prev = m;
         prev_line = line;
@@ -1427,7 +1421,11 @@ test "a deleted tail sidecar rebuilds from the log" {
 
     // The user is allowed to delete a cache.
     store.root.deleteFile(io, tail_path) catch {};
-    const cold = try logHead(&store, alloc);
+    const latest = (try last(&store, alloc)).?;
+    defer alloc.free(latest.branch);
+    try testing.expectEqualDeep(warm.prev.?, latest);
+
+    const cold = readTail(&store, alloc).?;
     defer if (cold.prev) |p| alloc.free(p.branch);
 
     try testing.expectEqual(warm.total, cold.total);

@@ -12,16 +12,16 @@ pub const Entry = struct {
 
 pub const Index = struct {
     map: std.StringHashMapUnmanaged(Entry),
+    keys: std.heap.ArenaAllocator,
     alloc: std.mem.Allocator,
 
     pub fn empty(alloc: std.mem.Allocator) Index {
-        return .{ .map = .empty, .alloc = alloc };
+        return .{ .map = .empty, .keys = .init(alloc), .alloc = alloc };
     }
 
     pub fn deinit(self: *Index) void {
-        var it = self.map.keyIterator();
-        while (it.next()) |k| self.alloc.free(k.*);
         self.map.deinit(self.alloc);
+        self.keys.deinit();
     }
 
     pub fn load(store: *Store, alloc: std.mem.Allocator) !Index {
@@ -49,31 +49,27 @@ pub const Index = struct {
                 .inode = std.fmt.parseInt(u64, inode_s, 10) catch continue,
                 .blob = Oid.fromHex(blob_s) catch continue,
             };
-            const key = try alloc.dupe(u8, path);
-            errdefer alloc.free(key);
-            try self.map.put(alloc, key, entry);
+            try self.set(path, entry);
         }
         return self;
     }
 
     pub fn save(self: *Index, store: *Store) !void {
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(self.alloc);
+        var out = std.Io.Writer.Allocating.init(self.alloc);
+        defer out.deinit();
         var it = self.map.iterator();
         while (it.next()) |kv| {
             var hex: [Oid.len * 2]u8 = undefined;
             _ = kv.value_ptr.blob.toHex(&hex);
-            const line = try std.fmt.allocPrint(self.alloc, "{d} {d} {d} {s} {s}\n", .{
+            out.writer.print("{d} {d} {d} {s} {s}\n", .{
                 @as(i128, kv.value_ptr.mtime_ns),
                 kv.value_ptr.size,
                 kv.value_ptr.inode,
                 hex,
                 kv.key_ptr.*,
-            });
-            defer self.alloc.free(line);
-            try out.appendSlice(self.alloc, line);
+            }) catch return error.OutOfMemory;
         }
-        try store.writeFileAtomic("index", out.items);
+        try store.writeFileAtomic("index", out.written());
     }
 
     /// Returns the cached blob Oid iff a prior entry for `path` matches the
@@ -88,16 +84,21 @@ pub const Index = struct {
 
     /// Record the current stat + blob for `path`, duplicating the key.
     pub fn put(self: *Index, path: []const u8, st: std.Io.File.Stat, blob: Oid) !void {
-        const gop = try self.map.getOrPut(self.alloc, path);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.alloc.dupe(u8, path);
-        }
-        gop.value_ptr.* = .{
+        try self.set(path, .{
             .mtime_ns = st.mtime.nanoseconds,
             .size = st.size,
             .inode = @intCast(st.inode),
             .blob = blob,
-        };
+        });
+    }
+
+    fn set(self: *Index, path: []const u8, entry: Entry) !void {
+        const gop = try self.map.getOrPut(self.alloc, path);
+        if (!gop.found_existing) {
+            errdefer _ = self.map.remove(path);
+            gop.key_ptr.* = try self.keys.allocator().dupe(u8, path);
+        }
+        gop.value_ptr.* = entry;
     }
 };
 
@@ -147,4 +148,40 @@ test "lookup misses when size changes" {
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "hello world longer" });
     const st2 = try tmp.dir.statFile(io, "f.txt", .{});
     try testing.expect(ix.lookup("f.txt", st2) == null);
+}
+
+test "large stat index roundtrips without per-entry allocations" {
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const count = 2048;
+    const blob = Oid.ofBytes("content");
+    const entry: Entry = .{ .mtime_ns = -1, .size = 7, .inode = 42, .blob = blob };
+    var measured = testing.FailingAllocator.init(alloc, .{});
+    var ix = Index.empty(measured.allocator());
+    defer ix.deinit();
+
+    var buf: [64]u8 = undefined;
+    for (0..count) |i| {
+        const path = try std.fmt.bufPrint(&buf, "src/file {d}.zig", .{i});
+        try ix.set(path, entry);
+    }
+    const after_put = measured.allocations;
+    try ix.save(&store);
+    const after_save = measured.allocations;
+
+    var loaded = try Index.load(&store, measured.allocator());
+    defer loaded.deinit();
+    try testing.expectEqual(count, loaded.map.count());
+    for (0..count) |i| {
+        const path = try std.fmt.bufPrint(&buf, "src/file {d}.zig", .{i});
+        try testing.expectEqual(entry, loaded.map.get(path).?);
+    }
+    try testing.expect(after_put < count / 8);
+    try testing.expect(after_save - after_put < count / 8);
+    try testing.expect(measured.allocations - after_save < count / 8);
 }
