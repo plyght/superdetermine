@@ -94,8 +94,10 @@ pub fn live(
     work_dir: std.Io.Dir,
     ctx: grade.Context,
     mset: moment.Settings,
-    sset: sched.Settings,
+    settings: sched.Settings,
 ) !void {
+    var sset = settings;
+    sset.background_import = true;
     const io = store.io;
 
     var buf: [512]u8 = undefined;
@@ -103,7 +105,7 @@ pub fn live(
     const out = &w.interface;
 
     var last = signature(store, work_dir) catch oid.Oid.zero();
-    var last_git = git.facadeFingerprint(store, work_dir);
+    var last_git: ?Oid = null;
 
     while (true) {
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(mset.interval_ms), .awake) catch {};
@@ -113,7 +115,7 @@ pub fn live(
         const sig = signature(store, work_dir) catch continue;
         const git_sig = git.facadeFingerprint(store, work_dir);
         const git_moved = !sameFingerprint(last_git, git_sig);
-        if (sig.eql(last) and !git_moved) continue;
+        if (sig.eql(last) and !git_moved and !sched.importRetryDue(store)) continue;
         if (!sched.due(store, sset)) continue;
 
         const r = sched.tick(store, work_dir, ctx, mset, sset) catch continue;

@@ -5043,7 +5043,11 @@ fn meshLine(w: *std.Io.Writer, st: mesh.Status) !void {
 }
 
 fn cmdWatch(io: std.Io, alloc: std.mem.Allocator, w: *std.Io.Writer) !void {
-    var s = (try openRepo(io, alloc, w)) orelse return;
+    var s = Store.discover(io, alloc, std.Io.Dir.cwd()) catch {
+        try w.print("{s}{s}{s} not a superdetermine repo\n", .{ ui.on(.red), ui.cross, ui.off() });
+        try ui.hint(w, "run `sdt init` here, or cd into a repo");
+        return;
+    };
     defer s.deinit();
     var work = try openWork(io);
     defer work.close(io);

@@ -42,6 +42,9 @@ const Oid = oid.Oid;
 pub const stamp_path = "moments/last-tick";
 pub const lock_path = "moments/tick.lock";
 const grade_lock_path = "moments/grade.lock";
+const import_retry_path = "moments/git-import-retry";
+const import_slice_ms = 750;
+const import_retry_ms = 30_000;
 
 pub const Settings = struct {
     /// Shortest gap between ticks. Three seconds matches the debounce that
@@ -53,6 +56,7 @@ pub const Settings = struct {
     budget_ms: i64 = 120_000,
     /// Stop grading below this battery percentage on battery power.
     battery_floor: u8 = 30,
+    background_import: bool = false,
 };
 
 pub fn settings(store: *Store, alloc: std.mem.Allocator) Settings {
@@ -111,23 +115,32 @@ fn nowMillis(io: std.Io) i64 {
     return @intCast(@divTrunc(std.Io.Clock.now(.real, io).nanoseconds, 1_000_000));
 }
 
-fn readStamp(store: *Store) i64 {
+fn readStamp(store: *Store, path: []const u8) i64 {
     const alloc = store.alloc;
-    const data = store.root.readFileAlloc(store.io, stamp_path, alloc, .unlimited) catch return 0;
+    const data = store.root.readFileAlloc(store.io, path, alloc, .limited(64)) catch return 0;
     defer alloc.free(data);
     return std.fmt.parseInt(i64, std.mem.trim(u8, data, " \n\t"), 10) catch 0;
 }
 
-fn writeStamp(store: *Store, ms: i64) void {
+fn writeStampAt(store: *Store, path: []const u8, ms: i64) void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}", .{ms}) catch return;
     store.root.createDirPath(store.io, "moments") catch {};
-    store.root.writeFile(store.io, .{ .sub_path = stamp_path, .data = s }) catch {};
+    store.root.writeFile(store.io, .{ .sub_path = path, .data = s }) catch {};
+}
+
+fn writeStamp(store: *Store, ms: i64) void {
+    writeStampAt(store, stamp_path, ms);
 }
 
 /// Is enough time gone since the last tick to bother?
 pub fn due(store: *Store, set: Settings) bool {
-    return nowMillis(store.io) - readStamp(store) >= set.min_interval_ms;
+    return nowMillis(store.io) - readStamp(store, stamp_path) >= set.min_interval_ms;
+}
+
+pub fn importRetryDue(store: *Store) bool {
+    const stamp = readStamp(store, import_retry_path);
+    return stamp != 0 and nowMillis(store.io) - stamp >= import_retry_ms;
 }
 
 /// Refuse to spend the user's battery on speculative work. Absence of an answer
@@ -191,6 +204,7 @@ fn reap(store: *Store, work_dir: std.Io.Dir) void {
     store.root.deleteFile(io, lock_path) catch {};
     store.root.deleteFile(io, stamp_path) catch {};
     store.root.deleteFile(io, grade_lock_path) catch {};
+    store.root.deleteFile(io, import_retry_path) catch {};
     store.root.deleteDir(io, "moments") catch {};
     work_dir.deleteDir(io, store_mod.dir_name) catch {};
 
@@ -244,12 +258,12 @@ fn tickInner(
     set: Settings,
 ) !TickResult {
     const started = std.Io.Clock.now(.awake, store.io);
-    var out = try captureTick(store, work_dir, mset);
+    var out = try captureTick(store, work_dir, mset, set.background_import);
     if (out.skipped == null) try gradeTick(ctx, set, started, false, &out);
     return out;
 }
 
-fn captureTick(store: *Store, work_dir: std.Io.Dir, mset: moment.Settings) !TickResult {
+fn captureTick(store: *Store, work_dir: std.Io.Dir, mset: moment.Settings, background_import: bool) !TickResult {
     if (!alive(store)) {
         reap(store, work_dir);
         return .{ .skipped = "this repo is being removed" };
@@ -284,7 +298,18 @@ fn captureTick(store: *Store, work_dir: std.Io.Dir, mset: moment.Settings) !Tick
     else
         null;
     defer if (facade_path) |p| alloc.free(p);
-    if (facade_path) |p| out.absorbed = git.absorbIfChanged(store, work_dir, p) catch null;
+    if (facade_path) |p| absorb: {
+        if (background_import and started - readStamp(store, import_retry_path) < import_retry_ms) break :absorb;
+        const deadline = if (background_import)
+            std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(import_slice_ms))
+        else
+            null;
+        out.absorbed = git.absorbWithin(store, work_dir, p, deadline) catch {
+            if (background_import) writeStampAt(store, import_retry_path, nowMillis(io));
+            break :absorb;
+        };
+        if (background_import) store.root.deleteFile(io, import_retry_path) catch {};
+    } else if (background_import) store.root.deleteFile(io, import_retry_path) catch {};
 
     const cap = try moment.capture(store, work_dir, .poll, mset);
     if (cap == .captured) {
@@ -515,7 +540,7 @@ const Queue = struct {
 };
 
 pub fn background(store: *Store, work_dir: std.Io.Dir, mset: moment.Settings) !void {
-    const r = try captureTick(store, work_dir, mset);
+    const r = try captureTick(store, work_dir, mset, true);
     if (r.skipped != null) return;
     const io = store.io;
     const alloc = store.alloc;

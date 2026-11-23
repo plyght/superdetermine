@@ -516,7 +516,7 @@ const Gitmap = struct {
                 try buf.append(self.alloc, '\n');
             }
         }
-        try store.root.writeFile(store.io, .{ .sub_path = "gitmap", .data = buf.items });
+        try store.writeFileAtomic("gitmap", buf.items);
     }
 
     fn deinit(self: *Gitmap) void {
@@ -529,12 +529,26 @@ const Gitmap = struct {
     }
 };
 
+const BlobMemo = std.AutoHashMapUnmanaged([20]u8, Oid);
+
+const ImportBatch = struct {
+    blobs: BlobMemo = .empty,
+    deadline: ?std.Io.Timestamp = null,
+
+    fn checkTime(self: *const ImportBatch, io: std.Io) !void {
+        if (self.deadline) |deadline| {
+            if (std.Io.Clock.now(.awake, io).nanoseconds >= deadline.nanoseconds) return error.GitImportDeferred;
+        }
+    }
+};
+
 const WalkCtx = struct {
     store: *Store,
     repo: ?*c.git_repository,
     alloc: std.mem.Allocator,
     entries: *std.ArrayList(object.TreeEntry),
     lfs_session: ?*lfs.Session = null,
+    blobs: *BlobMemo,
 };
 
 fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
@@ -562,8 +576,14 @@ fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
                 ctx.alloc.free(path);
                 continue;
             };
+            const git_id = c.git_tree_entry_id(entry);
+            const key: [20]u8 = git_id.*.id[0..20].*;
+            if (ctx.blobs.get(key)) |blob_oid| {
+                try ctx.entries.append(ctx.alloc, .{ .mode = mode, .path = path, .blob = blob_oid });
+                continue;
+            }
             var blob: ?*c.git_blob = null;
-            try check(c.git_blob_lookup(&blob, ctx.repo, c.git_tree_entry_id(entry)));
+            try check(c.git_blob_lookup(&blob, ctx.repo, git_id));
             defer c.git_blob_free(blob);
             const raw = c.git_blob_rawcontent(blob);
             const size: usize = @intCast(c.git_blob_rawsize(blob));
@@ -577,16 +597,22 @@ fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
             // the content cannot be had (offline, or smudge is off) the pointer
             // is stored verbatim, exactly as git would.
             var smudged: ?[]u8 = null;
+            var cacheable = true;
             defer if (smudged) |s| ctx.alloc.free(s);
             if (ctx.lfs_session) |sess| {
                 if (sess.smudge) {
                     if (lfs.parsePointer(bytes)) |p| {
                         smudged = sess.resolve(p) catch null;
+                        cacheable = smudged != null;
                     }
                 }
             }
             const content: []const u8 = smudged orelse bytes;
             const blob_oid = try ctx.store.writeFileContent(content);
+            if (cacheable) {
+                if (ctx.blobs.count() >= 16384) ctx.blobs.clearRetainingCapacity();
+                try ctx.blobs.put(ctx.alloc, key, blob_oid);
+            }
             try ctx.entries.append(ctx.alloc, .{ .mode = mode, .path = path, .blob = blob_oid });
         } else {
             // skip submodules / gitlinks / anything else
@@ -598,9 +624,13 @@ fn walkTree(ctx: *WalkCtx, tree: ?*c.git_tree, prefix: []const u8) !void {
 /// Import a single git commit (by id) into `store` as a superdetermine change, reusing
 /// the gitmap if already imported. Parents must already be present in `map`
 /// (guaranteed by a topological, oldest-first walk). Returns the gr change Oid.
-fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *const c.git_oid, sess: ?*lfs.Session) !Oid {
+fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *const c.git_oid, sess: ?*lfs.Session, batch: *ImportBatch) !Oid {
     const git_hex = gitOidHex(cid);
-    if (map.lookupGr(&git_hex)) |existing| return existing;
+    const mapped = map.git_to_gr.getPtr(&git_hex);
+    if (mapped) |existing| {
+        if (store.has(existing.*)) return existing.*;
+    }
+    try batch.checkTime(store.io);
 
     const alloc = store.alloc;
 
@@ -617,7 +647,7 @@ fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *con
         for (entries.items) |e| alloc.free(e.path);
         entries.deinit(alloc);
     }
-    var ctx = WalkCtx{ .store = store, .repo = repo, .alloc = alloc, .entries = &entries, .lfs_session = sess };
+    var ctx = WalkCtx{ .store = store, .repo = repo, .alloc = alloc, .entries = &entries, .lfs_session = sess, .blobs = &batch.blobs };
     try walkTree(&ctx, tree, "");
     std.mem.sort(object.TreeEntry, entries.items, {}, object.Tree.lessThan);
     const tree_oid = try store.writeTree(.{ .entries = entries.items });
@@ -658,6 +688,7 @@ fn importCommit(store: *Store, repo: ?*c.git_repository, map: *Gitmap, cid: *con
         .message = message,
     };
     const change_oid = try store.writeChange(change);
+    if (mapped) |slot| slot.* = change_oid;
     try map.insert(&git_hex, cid.*, change_oid);
     return change_oid;
 }
@@ -726,7 +757,9 @@ pub fn importRefChange(store: *Store, git_repo_path: []const u8, git_ref: ?[]con
     var map = try Gitmap.load(store);
     defer map.deinit();
 
-    const tip = try importReachable(store, repo, &map, &head_oid, &.{}, null);
+    var batch: ImportBatch = .{};
+    defer batch.blobs.deinit(alloc);
+    const tip = try importReachable(store, repo, &map, &head_oid, &.{}, null, &batch);
 
     try map.save(store);
 
@@ -740,7 +773,9 @@ fn importReachable(
     head_oid: *const c.git_oid,
     hide: []const c.git_oid,
     imported: ?*usize,
+    batch: *ImportBatch,
 ) !Oid {
+    const initial_count = map.git_to_gr.count();
     var walk: ?*c.git_revwalk = null;
     try check(c.git_revwalk_new(&walk, repo));
     defer c.git_revwalk_free(walk);
@@ -755,21 +790,24 @@ fn importReachable(
         s.deinit();
     };
 
-    var tip: Oid = Oid.zero();
     var woid: c.git_oid = undefined;
-    while (c.git_revwalk_next(&woid, walk) == 0) {
+    while (true) {
+        const next = c.git_revwalk_next(&woid, walk);
+        if (next == c.GIT_ITEROVER) break;
+        try check(next);
         const before = map.git_to_gr.count();
-        tip = try importCommit(store, repo, map, &woid, if (session) |*s| s else null);
+        _ = importCommit(store, repo, map, &woid, if (session) |*s| s else null, batch) catch |err| {
+            if (map.git_to_gr.count() != initial_count) try map.save(store);
+            return err;
+        };
         if (imported) |n| {
             if (map.git_to_gr.count() != before) n.* += 1;
         }
     }
 
-    if (tip.isZero()) {
-        const hex = gitOidHex(head_oid);
-        if (map.lookupGr(&hex)) |known| tip = known;
-    }
-    return tip;
+    const hex = gitOidHex(head_oid);
+    const tip = map.lookupGr(&hex) orelse return Oid.zero();
+    return if (store.has(tip)) tip else Oid.zero();
 }
 
 /// Push every local branch tip and every tag's target commit onto `walk`, so it
@@ -865,8 +903,10 @@ pub fn importAll(store: *Store, git_repo_path: []const u8, progress: ?*Progress)
     var woid: c.git_oid = undefined;
     var imported: u64 = 0;
     errdefer if (progress) |p| p.finish();
+    var batch: ImportBatch = .{};
+    defer batch.blobs.deinit(alloc);
     while (c.git_revwalk_next(&woid, walk) == 0) {
-        _ = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null);
+        _ = try importCommit(store, repo, &map, &woid, if (session) |*s| s else null, &batch);
         imported += 1;
         if (progress) |p| p.update(.importing, imported, total_commits);
     }
@@ -2282,6 +2322,7 @@ pub const FacadeAdapter = struct {
     store: *Store,
     path: []const u8,
     commits: usize = 0,
+    batch: ImportBatch = .{},
     arena: std.heap.ArenaAllocator,
     refs: std.ArrayList(contract.NativeRef) = .empty,
     root: [1]contract.NativeRoot = .{.{ .role = "repository", .id = .{ .scheme = "superdetermine", .bytes = "store" } }},
@@ -2297,6 +2338,7 @@ pub const FacadeAdapter = struct {
     }
 
     pub fn deinit(self: *FacadeAdapter) void {
+        self.batch.blobs.deinit(self.store.alloc);
         self.arena.deinit();
     }
 
@@ -2429,6 +2471,7 @@ pub const FacadeAdapter = struct {
         _ = source;
         const self = cast(context);
         const store = self.store;
+        if (!std.mem.eql(u8, op.kind, facade.OperationKind.head_move)) try self.batch.checkTime(store.io);
         switch (try inspectForeign(context, op)) {
             .importable => {},
             .requires_resolution => |r| return .{ .requires_resolution = .{ .reason = r.reason } },
@@ -2447,16 +2490,21 @@ pub const FacadeAdapter = struct {
         defer hide.deinit(store.alloc);
 
         if (std.mem.eql(u8, op.kind, facade.OperationKind.stash)) {
-            _ = try importReachable(store, repo, &map, &tip, hide.items, null);
+            _ = try importReachable(store, repo, &map, &tip, hide.items, null, &self.batch);
             try map.save(store);
             return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
         }
 
         const native = facade.evidenceField(op.evidence, "native") orelse return .{ .refused = .{ .reason = facade.Reason.unsupported } };
         var imported: usize = 0;
-        const new = try importReachable(store, repo, &map, &tip, hide.items, &imported);
+        const known = map.lookupGr(op.observed_projection);
+        const new = if (known != null and store.has(known.?))
+            known.?
+        else
+            try importReachable(store, repo, &map, &tip, hide.items, &imported, &self.batch);
         if (new.isZero()) return .{ .refused = .{ .reason = facade.Reason.unsupported } };
         const prev = store.readRef(native) catch Oid.zero();
+        if (imported != 0 or known == null or !known.?.eql(new)) try map.save(store);
         try store.updateRef(native, new);
         oplog.record(store, .{
             .kind = .import,
@@ -2465,7 +2513,6 @@ pub const FacadeAdapter = struct {
             .new = new,
             .timestamp = nowSeconds(store),
         }) catch {};
-        try map.save(store);
         self.commits += imported;
         return .{ .imported = .{ .roots = &self.root, .tier = .semantic_lossless } };
     }
@@ -2505,8 +2552,13 @@ pub fn absorbColocated(store: *Store, work_dir_path: []const u8, prev_head: ?[]c
 }
 
 pub fn absorbIfChanged(store: *Store, work_dir: std.Io.Dir, work_dir_path: []const u8) !?Absorbed {
+    return absorbWithin(store, work_dir, work_dir_path, null);
+}
+
+pub fn absorbWithin(store: *Store, work_dir: std.Io.Dir, work_dir_path: []const u8, deadline: ?std.Io.Timestamp) !?Absorbed {
     var fa = FacadeAdapter.init(store, work_dir_path);
     defer fa.deinit();
+    fa.batch.deadline = deadline;
     const r = (try facadeFor(store, work_dir, &fa).absorbIfChanged()) orelse return null;
     return Absorbed.fromFacade(r, fa.commits);
 }
@@ -3348,6 +3400,53 @@ fn commitOnto(
         try check(c.git_commit_create(&commit_oid, repo, branch_ref, sig, sig, null, message, gtree, 0, null));
     }
     return commit_oid;
+}
+
+test "Git import resumes after its deadline and reuses unchanged blobs" {
+    ensureInit();
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_init(&repo, path_z.ptr, 0));
+    defer c.git_repository_free(repo);
+    var store = try Store.init(io, alloc, tmp.dir);
+    defer store.deinit();
+
+    const first = try commitOnto(repo, "refs/heads/main", "a.txt", "same\n", "first", null, 1);
+    const second = try commitOnto(repo, "refs/heads/main", "b.txt", "same\n", "second", &first, 2);
+    var map = try Gitmap.load(&store);
+    defer map.deinit();
+    var batch: ImportBatch = .{};
+    defer batch.blobs.deinit(alloc);
+    const parent = try importCommit(&store, repo, &map, &first, null, &batch);
+    batch.deadline = std.Io.Clock.now(.awake, io);
+    try testing.expectError(error.GitImportDeferred, importReachable(&store, repo, &map, &second, &.{}, null, &batch));
+    try testing.expectEqual(@as(usize, 1), map.git_to_gr.count());
+    try testing.expectEqual(@as(usize, 1), batch.blobs.count());
+    try map.save(&store);
+    var reopened = try Gitmap.load(&store);
+    defer reopened.deinit();
+    batch.deadline = null;
+    const child = try importReachable(&store, repo, &reopened, &second, &.{}, null, &batch);
+    const change = try store.readChange(child);
+    defer object.freeChange(alloc, change);
+    try testing.expectEqualSlices(Oid, &.{parent}, change.parents);
+    const tree = try store.readTree(change.tree);
+    defer object.freeTree(alloc, tree);
+    try testing.expectEqual(@as(usize, 1), tree.entries.len);
+    try testing.expectEqualStrings("b.txt", tree.entries[0].path);
+    const original = try store.readChange(parent);
+    defer object.freeChange(alloc, original);
+    const original_tree = try store.readTree(original.tree);
+    defer object.freeTree(alloc, original_tree);
+    try testing.expect(tree.entries[0].blob.eql(original_tree.entries[0].blob));
+    try testing.expectEqual(@as(usize, 1), batch.blobs.count());
 }
 
 test "importHead brings full history with parent chain" {

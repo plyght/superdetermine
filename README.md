@@ -79,7 +79,7 @@ sdt setup                                 # asks the three questions that matter
 sdt config check "zig build test"         # or set just that one
 ```
 
-`sdt` uses no daemon. On macOS, launchd already runs. Launchd watches the worktree and starts `sdt` only after a file changes. That `sdt` process does its work and stops. Idle CPU use is zero, because no process waits. Automatic grading runs one check at a time across your repos and keeps only the newest pending state for each repo. Edits can still be captured while another repo grades.
+`sdt` uses no daemon. On macOS, launchd already runs. Launchd watches the worktree and starts `sdt` only after a file changes. That `sdt` process does its work and stops. Idle CPU use is zero, because no process waits. Automatic grading runs one check at a time across your repos and keeps only the newest pending state for each repo. Edits can still be captured while another repo grades. Automatic Git history imports work in short batches. On macOS, unfinished imports continue on later file changes. `sdt watch` also retries while the tree is idle, and ordinary SDT commands can still sync Git history on demand.
 
 `sdt watch` does the same work in a terminal, if you prefer to see it.
 
